@@ -14,3 +14,7 @@ Keep the public contract to history, send, resume, and cancel. No custom fronten
 - `packages/chat-contract`: shared endpoints, request schema, and provider interfaces.
 
 Each app has its own package manifest and TypeScript configuration. The root commands coordinate workspace tasks; `.env.local` remains at the root. No application behavior or deployed resource identifiers change in this split.
+
+## Next implementation
+
+See [the direct Codex sandbox plan](docs/codex-sandbox-plan.md). It keeps the existing chat coordinator and runs the full Codex harness inside Cloudflare Sandbox. The OpenAI Agents API is explicitly excluded.
