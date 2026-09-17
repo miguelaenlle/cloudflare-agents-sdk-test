@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-agents-sdk-test",
+  "main": "agent.ts",
+  "compatibility_date": "2026-09-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": { "UI_ORIGIN": "http://localhost:4315" },
+  "ai": { "binding": "AI", "remote": true },
+  "durable_objects": { "bindings": [{ "name": "Chat", "class_name": "Chat" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat"] }],
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@playground/web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:server": "node --env-file=../../.env.local --experimental-strip-types server/server.ts",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "node test/relay.mjs"
+  },
+  "dependencies": {
+    "@playground/chat-contract": "workspace:*",
+    "@ai-sdk/react": "^4.0.105",
+    "agents": "0.23.0",
+    "ai": "^7.0.102",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "vite": "^8.3.0"
+  }
+}
