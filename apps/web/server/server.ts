@@ -1,8 +1,4 @@
-import {
-  createServer,
-  type IncomingMessage,
-  type ServerResponse,
-} from "node:http";
+import express, { type ErrorRequestHandler, type Response } from "express";
 import {
   pipeUIMessageStreamToResponse,
   validateUIMessages,
@@ -18,7 +14,6 @@ import {
 } from "@playground/chat-contract";
 import { createCloudflareProvider } from "./providers/cloudflare.ts";
 
-const MAX_BODY_BYTES = 1_000_000;
 const config = z
   .object({
     AGENT_URL: z
@@ -31,49 +26,23 @@ const config = z
   })
   .parse(process.env);
 const provider = createCloudflareProvider(new URL(config.AGENT_URL));
+const app = express();
+app.disable("x-powered-by");
 
-class RequestError extends Error {
-  readonly status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
+function clientSignal(response: Response) {
+  const controller = new AbortController();
+  response.once("close", () => controller.abort());
+  return controller.signal;
 }
 
-async function readMessages(request: IncomingMessage): Promise<UIMessage[]> {
-  const chunks: Buffer[] = [];
-  let bytes = 0;
-  for await (const chunk of request) {
-    bytes += chunk.length;
-    if (bytes > MAX_BODY_BYTES)
-      throw new RequestError(413, "Chat request is too large.");
-    chunks.push(chunk);
-  }
-
-  try {
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const input = sendRequestSchema.parse(body);
-    return await validateUIMessages({ messages: input.messages });
-  } catch {
-    throw new RequestError(
-      400,
-      "Expected a valid playground chat request with UI messages.",
-    );
-  }
-}
-
-async function streamChat(
-  response: ServerResponse,
-  signal: AbortSignal,
-  messages?: UIMessage[],
-) {
-  const connection = await provider.connect(signal);
+async function streamChat(response: Response, messages?: UIMessage[]) {
+  const connection = await provider.connect(clientSignal(response));
   try {
     const stream = messages
       ? await connection.send(messages)
       : await connection.resume();
     if (!stream) {
-      response.writeHead(204).end();
+      response.status(204).end();
       return;
     }
     await pipeUIMessageStreamToResponse({ response, stream });
@@ -82,52 +51,61 @@ async function streamChat(
   }
 }
 
-async function handleRequest(
-  request: IncomingMessage,
-  response: ServerResponse,
-) {
-  const client = new AbortController();
-  response.once("close", () => client.abort());
-  const path = new URL(request.url ?? "/", "http://localhost").pathname;
+app.get(HISTORY_API, async (_request, response) => {
+  const messages = await provider.getHistory(clientSignal(response));
+  response.setHeader("Cache-Control", "no-store");
+  response.json(messages);
+});
 
-  try {
-    switch (`${request.method} ${path}`) {
-      case `GET ${HISTORY_API}`:
-        response.setHeader("Content-Type", "application/json");
-        response.setHeader("Cache-Control", "no-store");
-        response.end(JSON.stringify(await provider.getHistory(client.signal)));
-        return;
-      case `POST ${CANCEL_API}`:
-        await provider.cancel(client.signal);
-        response.writeHead(204).end();
-        return;
-      case `POST ${CHAT_API}`:
-        await streamChat(response, client.signal, await readMessages(request));
-        return;
-      case `GET ${RESUME_API}`:
-        await streamChat(response, client.signal);
-        return;
-      default:
-        response.writeHead(404).end("Not found");
-    }
-  } catch (error) {
-    if (client.signal.aborted) return;
-    if (!(error instanceof RequestError))
-      console.error("Chat request failed:", error);
-    // Once SSE starts, a broken connection signals retry; plain text would corrupt the stream.
-    if (response.headersSent) {
-      response.destroy();
+app.post(CANCEL_API, async (_request, response) => {
+  await provider.cancel(clientSignal(response));
+  response.status(204).end();
+});
+
+app.post(
+  CHAT_API,
+  express.json({ limit: 1_000_000 }),
+  async (request, response) => {
+    let messages: UIMessage[];
+    try {
+      const input = sendRequestSchema.parse(request.body);
+      messages = await validateUIMessages({ messages: input.messages });
+    } catch {
+      response
+        .status(400)
+        .send("Expected a valid playground chat request with UI messages.");
       return;
     }
-    const status = error instanceof RequestError ? error.status : 502;
-    const message =
-      error instanceof RequestError
-        ? error.message
-        : "Agent unavailable. Check the backend terminal and reconnect.";
-    response.writeHead(status, { "Content-Type": "text/plain" }).end(message);
-  }
-}
+    await streamChat(response, messages);
+  },
+);
 
-createServer(handleRequest).listen(config.PORT, "127.0.0.1", () => {
+app.get(RESUME_API, async (_request, response) => {
+  await streamChat(response);
+});
+
+const handleError: ErrorRequestHandler = (error, _request, response, _next) => {
+  if (response.destroyed) return;
+  // A broken SSE stream signals reconnection; an error body would corrupt it.
+  if (response.headersSent) {
+    response.destroy();
+    return;
+  }
+  if (error.type === "entity.too.large") {
+    response.status(413).send("Chat request is too large.");
+    return;
+  }
+  if (error.type === "entity.parse.failed") {
+    response.status(400).send("Expected valid JSON.");
+    return;
+  }
+  console.error("Chat request failed:", error);
+  response
+    .status(502)
+    .send("Agent unavailable. Check the backend terminal and reconnect.");
+};
+app.use(handleError);
+
+app.listen(config.PORT, "127.0.0.1", () => {
   console.log(`Chat relay listening on http://127.0.0.1:${config.PORT}`);
 });

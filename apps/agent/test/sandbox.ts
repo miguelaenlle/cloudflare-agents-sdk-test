@@ -10,6 +10,8 @@ type State = {
   restores: number;
   keepAlive: boolean;
   failBackup?: boolean;
+  destroyFailures?: number;
+  destroys: number;
   ignoreCancellation?: boolean;
 };
 export class TestSandbox extends DurableObject {
@@ -19,6 +21,7 @@ export class TestSandbox extends DurableObject {
     return (
       (await this.ctx.storage.get<State>("state")) ?? {
         files: {},
+        destroys: 0,
         launches: 0,
         restores: 0,
         keepAlive: false,
@@ -220,14 +223,32 @@ export class TestSandbox extends DurableObject {
   }
   async sleep() {
     const state = await this.state();
-    if (state.keepAlive)
-      throw new Error("Cannot sleep while keepAlive is enabled");
+    state.keepAlive = false;
     state.files = {};
     delete state.process;
     await this.save(state);
   }
+  async failDestroy(attempts: number) {
+    const state = await this.state();
+    state.destroyFailures = attempts;
+    await this.save(state);
+  }
+  async destroy() {
+    const state = await this.state();
+    state.destroys++;
+    if (state.destroyFailures) {
+      state.destroyFailures--;
+      await this.save(state);
+      throw new Error("Fixture destroy unavailable");
+    }
+    state.files = {};
+    delete state.process;
+    state.keepAlive = false;
+    await this.save(state);
+    await Promise.all([...this.listeners].map((notify) => notify()));
+  }
   async inspect() {
-    const { launches, restores, keepAlive } = await this.state();
-    return { launches, restores, keepAlive };
+    const { launches, restores, keepAlive, destroys } = await this.state();
+    return { launches, restores, keepAlive, destroys };
   }
 }

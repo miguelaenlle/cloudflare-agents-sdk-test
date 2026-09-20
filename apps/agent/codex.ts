@@ -9,15 +9,30 @@ import { z } from "zod";
 import { CodexEvents } from "./codex-events.ts";
 
 export type CodexSandbox = ReturnType<typeof getSandbox>;
-export const MAX_RUN_MS = 10 * 60_000;
+export const SANDBOX_IDLE_MS = 10 * 60_000;
+export const SANDBOX_LIFETIME_MS = 6 * 60 * 60_000;
+export type SandboxLifecycle = {
+  id: string;
+  createdAt: number;
+  phase:
+    | "starting"
+    | "waiting_for_agent"
+    | "waiting_for_user"
+    | "suspending"
+    | "destroying"
+    | "cleanup_failed";
+  waitingSince?: number;
+};
 export type Run = {
   id: string;
   messageId: string;
+  sandboxId: string;
   startedAt: number;
-  stopReason?: "cancelled" | "interrupted" | "deadline";
+  stopReason?: "cancelled" | "interrupted" | "expired";
   status: "running" | "completed" | "cancelled" | "failed" | "interrupted";
 };
 export type CodexState = {
+  sandbox?: SandboxLifecycle;
   threadId?: string;
   checkpoint?: { backup: DirectoryBackup; threadId?: string };
   run?: Run;
@@ -50,7 +65,13 @@ export async function prepareSandbox(sandbox: CodexSandbox, state: CodexState) {
 export async function startCodex(
   sandbox: CodexSandbox,
   run: Run,
-  input: { prompt: string; threadId?: string; model?: string; apiKey: string },
+  input: {
+    prompt: string;
+    threadId?: string;
+    model?: string;
+    apiKey: string;
+    expiresAt: number;
+  },
 ) {
   const dir = runDirectory(run.id);
   await sandbox.mkdir(dir, { recursive: true });
@@ -61,13 +82,13 @@ export async function startCodex(
       prompt: input.prompt,
       threadId: input.threadId,
       model: input.model,
-      maxDurationMs: MAX_RUN_MS,
+      expiresAt: input.expiresAt,
     }),
   );
   await sandbox.startProcess(`node /opt/run-codex.mjs ${dir}`, {
     processId: run.id,
     autoCleanup: false,
-    timeout: MAX_RUN_MS + 10_000,
+    timeout: Math.max(1, input.expiresAt - Date.now()),
     env: { CODEX_API_KEY: input.apiKey, CODEX_HOME: "/workspace/codex" },
   });
 }
@@ -148,13 +169,6 @@ export async function stopCodex(sandbox: CodexSandbox, run: Run) {
     await confirmStopped(sandbox, run);
     return;
   }
-  await confirmStopped(sandbox, run);
-}
-
-export async function forceStopCodex(sandbox: CodexSandbox, run: Run) {
-  // Only the durable cleanup deadline uses Cloudflare's process termination.
-  if (isActive(await sandbox.getProcess(run.id)))
-    await sandbox.killProcess(run.id);
   await confirmStopped(sandbox, run);
 }
 

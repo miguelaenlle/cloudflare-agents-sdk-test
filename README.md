@@ -5,7 +5,7 @@ A minimal PrairieLearn-shaped prototype: the official TypeScript Codex SDK runs 
 ```text
 React / AI SDK useChat on localhost:4315
   ↕ HTTP commands + AI SDK message-stream SSE
-Local Node relay on 127.0.0.1:4316
+Local Express relay on 127.0.0.1:4316
   ↕ Cloudflare WebSocket / HTTP adapter
 Cloudflare Chat("playground") / AIChatAgent
   ↕ Sandbox SDK
@@ -25,7 +25,7 @@ The browser and relay have the same provider-independent interface as before. Co
 - `apps/agent/run-codex.mjs`: small container runner; calls `startThread` / `resumeThread` and `runStreamed`, redacts and streams events, and handles cancellation/deadlines.
 - `apps/agent/Dockerfile`: pins Sandbox **0.12.9** and Codex SDK **0.155.0** (which installs its matching native CLI). No credentials in the image.
 - `apps/web/client/`: barebones React UI with standard `useChat` and `DefaultChatTransport`.
-- `apps/web/server/`: stateless HTTP/SSE relay and the Cloudflare-specific adapter.
+- `apps/web/server/`: stateless Express HTTP/SSE relay and the Cloudflare-specific adapter.
 - `packages/chat-contract/`: shared routes, request validation, and provider interface. No Cloudflare dependency.
 
 To replace Cloudflare, change the server's provider adapter and deployed agent. The frontend event format and HTTP interface can stay; stored history still needs migration.
@@ -85,7 +85,8 @@ Open **http://localhost:4315**. Restart the backend after changing `.env.local`.
 2. Ask: **What did you put in hello.txt? Read it again.** This must resume the same native Codex thread.
 3. Click **Run one-minute task**. After command activity appears, stop the local backend and close the page. Restart it after a minute; the completed answer should be in history. Repeat with a restart during the turn to test stream replay.
 4. Click **Stop** during a task. It must stop the sandbox process; closing the page alone must not.
-5. Leave the sandbox idle for over two minutes and confirm it stops in Cloudflare. Ask it to read `hello.txt` again: both workspace and native session should restore from R2.
+5. Leave the conversation in `waiting_for_user` for ten minutes and confirm the sandbox is destroyed in Cloudflare. Ask it to read `hello.txt` again: a new sandbox should restore both workspace and native session from R2. History reads and browser reconnections must not extend the waiting deadline.
+6. Verify the six-hour sandbox lifetime deadline destroys the sandbox even during a turn. A later message should restore the last successful checkpoint without replaying the interrupted prompt.
 
 The live container checks are still necessary. In particular, verify that Codex's `workspace-write` sandbox works inside Cloudflare's runtime. The implementation never silently disables it. Inspect Worker logs with:
 
@@ -100,10 +101,11 @@ SDK events travel over stdout through Cloudflare's buffered process-log stream. 
 - `AIChatAgent` persists the UI transcript. Codex's native session lives in `/workspace/codex`; the working Git repository is `/workspace/repo`.
 - A turn gets a durable run ID before launch. The launcher atomically claims that ID. A Chat Durable Object restart stops any surviving process and saves an interruption message. It never automatically repeats the prompt or reattaches to the old execution.
 - The Worker consumes Cloudflare’s process-log SSE stream, including buffered output from before attachment. There is no observation polling loop or container HTTP service. A disconnected process stream reports failure; it never replays the prompt.
-- Stopped runs (including cancellation or coordinator interruption) are checkpointed before releasing keep-alive, if the workspace is still alive. The container can sleep after two idle minutes. History reads do not wake it.
+- Sandbox state follows `offline → starting → waiting_for_agent → waiting_for_user`. Keep-alive remains enabled between turns. A durable callback transitions `waiting_for_user → suspending → offline` after ten minutes, making a fresh checkpoint before destroying the sandbox. An active turn or a different waiting period invalidates an old idle callback. History reads do not wake the container or extend this deadline.
 - **Stop** writes a cancellation marker watched by the runner, which aborts `runStreamed` through the SDK. The coordinator waits up to five seconds for exit; it never force-kills merely because that wait expires. An unconfirmed stop reports an error and keeps the run active, keep-alive enabled, and new turns blocked. This ends the current turn; the next prompt resumes the native thread.
-- Runs retain a ten-minute SDK abort deadline, a Sandbox process timeout ten seconds later, and a durable cleanup deadline after eleven minutes. Only deadline cleanup force-terminates the process through Cloudflare. If termination cannot be confirmed, cleanup retries. Real child-command termination still needs a container smoke test.
-- Checkpoint failure is reported, and keep-alive is released; only the last successful checkpoint is guaranteed to survive a later container loss.
+- There is no ten-minute turn limit. Each sandbox generation has an absolute six-hour deadline, measured from allocation before startup and unchanged by later turns. The runner and process timeout use the remaining lifetime. The Chat DO schedules destruction at that same deadline and aborts its observer; it does not wait for graceful stop or a new backup. Work since the last checkpoint can be lost. Each new sandbox gets a new ID so stale callbacks cannot destroy its replacement.
+- Cleanup makes at most three attempts, 30 seconds apart. Idle backup failure keeps the workspace for another attempt or user message. Hard-expiry destruction failure records `cleanup_failed`, attempts to disable keep-alive, and does not silently provision another box. A later user message can explicitly retry destruction before restoring. The underlying `sleepAfter: "6h"` is a fallback idle timeout, not the absolute cap. Cloudflare API outages can delay actual destruction; a deadline is not a platform guarantee.
+- A turn-end checkpoint failure is reported while the sandbox remains warm. Idle suspension retries backup before destruction; the hard six-hour cap still takes precedence. Only the last successful checkpoint is guaranteed to survive container loss.
 - A container crash during a turn may lose work since the last checkpoint. The UI reports interruption rather than claiming exactly-once execution.
 - One shared conversation, one sandbox, no authentication or approval UI. This is for a trusted disposable workspace. The runtime API-key environment variable is readable by code inside the container; do not use this prototype for untrusted course code or expose it publicly as a production service.
 - A passive second tab needs **Reconnect / refresh history** to see a turn started elsewhere.
@@ -134,7 +136,7 @@ pnpm format:check
 pnpm test
 ```
 
-Tests require neither credentials nor Docker. They run the real chat coordinator against a deterministic Sandbox substitute, plus native subprocess tests with a fake Codex executable. They cover JSONL chunking, tool mapping, duplicate launch prevention, SDK subprocess cancellation, confirmed Sandbox stop, relay replacement, saved history, cancellation, cold restoration, Worker restart interruption without replay, checkpoint failure followed by warm resume, and consistent live/orphaned deadline outcomes.
+Tests require neither credentials nor Docker. They run the real chat coordinator against a deterministic Sandbox substitute, plus native subprocess tests with a fake Codex executable. They cover JSONL chunking, tool mapping, duplicate launch prevention, SDK subprocess cancellation, confirmed Sandbox stop, relay replacement, saved history, cancellation, cold restoration, Worker restart interruption without replay, checkpoint failure followed by warm resume, ten-minute waiting-state destruction, stale callbacks, active work beyond ten minutes, absolute six-hour expiry, restoration after destruction, and bounded cleanup failures.
 
 `pnpm build:worker` is a deployment dry run that also needs Docker to build the image. To check just Worker bundling without Docker:
 

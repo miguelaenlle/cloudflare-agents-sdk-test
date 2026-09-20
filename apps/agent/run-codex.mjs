@@ -17,7 +17,7 @@ try {
   if (error.code === "EEXIST") process.exit(0);
   throw error;
 }
-const { prompt, threadId, model, maxDurationMs } = JSON.parse(
+const { prompt, threadId, model, expiresAt } = JSON.parse(
   readFileSync(join(runDir, "input.json"), "utf8"),
 );
 const controller = new AbortController();
@@ -35,10 +35,13 @@ const serialize = (value) =>
       : item,
   );
 let timedOut = false;
-const timeout = setTimeout(() => {
-  timedOut = true;
-  controller.abort();
-}, maxDurationMs);
+const timeout = setTimeout(
+  () => {
+    timedOut = true;
+    controller.abort();
+  },
+  Math.max(0, expiresAt - Date.now()),
+);
 process.on("SIGTERM", () => controller.abort());
 process.on("SIGINT", () => controller.abort());
 
@@ -98,7 +101,7 @@ try {
   let status;
   if (timedOut) {
     status = "timed-out";
-    error = "Codex exceeded the ten-minute run limit.";
+    error = "Sandbox reached its six-hour lifetime limit.";
   } else if (controller.signal.aborted) {
     status = "cancelled";
     error = undefined;

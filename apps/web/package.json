@@ -10,15 +10,17 @@
     "test": "node test/relay.mjs"
   },
   "dependencies": {
-    "@playground/chat-contract": "workspace:*",
     "@ai-sdk/react": "^4.0.105",
+    "@playground/chat-contract": "workspace:*",
     "agents": "0.23.0",
     "ai": "^7.0.102",
+    "express": "^5.2.1",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^24.13.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",

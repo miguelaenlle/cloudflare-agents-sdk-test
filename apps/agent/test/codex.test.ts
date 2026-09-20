@@ -10,10 +10,11 @@ import type { UIMessageChunk } from "ai";
 import { CodexEvents } from "../codex-events.ts";
 import {
   checkpointCodex,
-  forceStopCodex,
   observeCodex,
   prepareSandbox,
   stopCodex,
+  startCodex,
+  SANDBOX_LIFETIME_MS,
   type CodexSandbox,
   type Run,
 } from "../codex.ts";
@@ -107,6 +108,7 @@ test("an observer can replay a finished run without launching any process", asyn
   const run: Run = {
     id: crypto.randomUUID(),
     messageId: "user-1",
+    sandboxId: "test-sandbox",
     startedAt: Date.now(),
     status: "running",
   };
@@ -137,6 +139,7 @@ test("a lost container reports interruption instead of relaunching edits", async
     {
       id: crypto.randomUUID(),
       messageId: "user-1",
+      sandboxId: "test-sandbox",
       startedAt: Date.now(),
       status: "running",
     },
@@ -173,7 +176,7 @@ test("cold restore uses the thread paired with the checkpoint; backup errors pro
 async function makeRunner(
   t: { after: (fn: () => Promise<void>) => void },
   prompt: string,
-  maxDurationMs = 5000,
+  expiresAt = Date.now() + 5000,
 ) {
   const dir = await mkdtemp(join(tmpdir(), "codex-runner-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -214,7 +217,7 @@ if (prompt === 'wait') {
   await writeFile(join(bin, "package.json"), '{"type":"module"}');
   await writeFile(
     join(run, "input.json"),
-    JSON.stringify({ prompt, threadId: "saved-thread", maxDurationMs }),
+    JSON.stringify({ prompt, threadId: "saved-thread", expiresAt }),
   );
   const launch = () => {
     const child = spawn(
@@ -266,12 +269,12 @@ test("SDK runner passes prompts safely, resumes explicitly, and claims a run onc
   await assert.rejects(readFile(join(run, "events.jsonl")), { code: "ENOENT" });
 });
 
-test("SDK run deadline aborts the Codex subprocess", async (t) => {
-  const { dir, run, launch } = await makeRunner(t, "wait", 1000);
+test("sandbox lifetime deadline aborts the Codex subprocess", async (t) => {
+  const { dir, run, launch } = await makeRunner(t, "wait", Date.now() + 1000);
   assert.equal((await once(launch(), "exit"))[0], 0);
   const result = JSON.parse(await readFile(join(run, "result.json"), "utf8"));
   assert.equal(result.status, "timed-out");
-  assert.match(result.error, /ten-minute/);
+  assert.match(result.error, /six-hour/);
   const pid = Number(await readFile(join(dir, "child.pid"), "utf8"));
   await delay(100);
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
@@ -295,10 +298,11 @@ test("cancellation discards an incomplete last JSON line and settles pending too
   assert.equal(chunks.at(-1)?.type, "tool-output-error");
 });
 
-test("Stop requests SDK cancellation; only deadline cleanup forces termination", async () => {
+test("Stop requests SDK cancellation without force-killing the process", async () => {
   const run: Run = {
     id: crypto.randomUUID(),
     messageId: "user-1",
+    sandboxId: "test-sandbox",
     startedAt: Date.now(),
     status: "running",
   };
@@ -320,9 +324,9 @@ test("Stop requests SDK cancellation; only deadline cleanup forces termination",
   await assert.rejects(stopCodex(sandbox, run), /has not stopped/);
   assert.equal(kills, 0);
   assert.equal(markers, 1);
-  await forceStopCodex(sandbox, run);
+  status = "completed";
   await stopCodex(sandbox, run);
-  assert.equal(kills, 1);
+  assert.equal(kills, 0);
 });
 
 test("a cancellation marker aborts the SDK subprocess and records a resumable cancelled turn", async (t) => {
@@ -393,6 +397,7 @@ test("a killed runner without a result leaves partial output interrupted", async
     {
       id: crypto.randomUUID(),
       messageId: "user-1",
+      sandboxId: "test-sandbox",
       startedAt: Date.now(),
       status: "running",
     },
@@ -419,6 +424,7 @@ test("a result file cannot finish observation before the process exits", async (
     {
       id: crypto.randomUUID(),
       messageId: "user-1",
+      sandboxId: "test-sandbox",
       startedAt: Date.now(),
       status: "running",
     },
@@ -439,6 +445,7 @@ test("a disconnected output stream cannot masquerade as completion", async () =>
       {
         id: crypto.randomUUID(),
         messageId: "user-1",
+        sandboxId: "test-sandbox",
         startedAt: Date.now(),
         status: "running",
       },
@@ -473,4 +480,32 @@ test("known injected credentials are redacted before stdout and result persisten
     assert.ok(result.includes("[REDACTED]"));
     if (prompt === "secret-output") assert.ok(stdout.includes("[REDACTED]"));
   }
+});
+
+test("new turns use the remaining sandbox lifetime, not a fresh per-turn budget", async () => {
+  const expiresAt = Date.now() + SANDBOX_LIFETIME_MS - 5 * 60 * 60_000;
+  let input: { expiresAt: number } | undefined;
+  let timeout = 0;
+  const sandbox = {
+    mkdir: async () => {},
+    writeFile: async (_path: string, data: string) => {
+      input = JSON.parse(data);
+    },
+    startProcess: async (_command: string, options: { timeout: number }) => {
+      timeout = options.timeout;
+    },
+  } as unknown as CodexSandbox;
+  await startCodex(
+    sandbox,
+    {
+      id: crypto.randomUUID(),
+      messageId: "next",
+      sandboxId: "box",
+      startedAt: Date.now(),
+      status: "running",
+    },
+    { prompt: "Continue", apiKey: "secret", expiresAt },
+  );
+  assert.equal(input!.expiresAt, expiresAt);
+  assert.ok(timeout > 59 * 60_000 && timeout <= 60 * 60_000);
 });
