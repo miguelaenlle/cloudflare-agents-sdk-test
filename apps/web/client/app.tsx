@@ -13,7 +13,7 @@ import "./style.css";
 const transport = new DefaultChatTransport({ api: CHAT_API });
 const RECONNECT_DELAY_MS = 2_000;
 const DEMO_PROMPT =
-  "Run the one-minute task using waitOneMinute, then tell me when it started and finished.";
+  "Create a small hello.txt file, run a shell command that waits 60 seconds, then read the file and report the result.";
 
 async function loadHistory(signal?: AbortSignal): Promise<UIMessage[]> {
   const response = await fetch(HISTORY_API, { signal });
@@ -98,7 +98,7 @@ function App({ initialMessages }: { initialMessages: UIMessage[] }) {
     setCancelling(true);
     try {
       const response = await fetch(CANCEL_API, { method: "POST" });
-      if (!response.ok) throw new Error("Cancellation failed. Try again.");
+      if (!response.ok) throw new Error("Could not confirm Stop. Try again.");
     } catch (error) {
       setCancelError(error instanceof Error ? error.message : String(error));
     } finally {

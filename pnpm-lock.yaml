@@ -20,15 +20,18 @@ importers:
       '@cloudflare/ai-chat':
         specifier: 0.12.0
         version: 0.12.0(@ai-sdk/react@4.0.105(react@19.3.0)(zod@4.6.5))(agents@0.23.0(@ai-sdk/react@4.0.105(react@19.3.0)(zod@4.6.5))(@babel/core@8.0.5)(@babel/runtime@7.29.7)(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(@modelcontextprotocol/server@2.0.0)(ai@7.0.102(zod@4.6.5))(react@19.3.0)(rolldown@1.2.9)(vite@8.3.0(@types/node@24.13.5)(esbuild@0.28.2)(yaml@2.9.1))(zod@4.6.5))(ai@7.0.102(zod@4.6.5))(react@19.3.0)
+      '@cloudflare/sandbox':
+        specifier: 0.12.9
+        version: 0.12.9
+      '@openai/codex-sdk':
+        specifier: 0.155.0
+        version: 0.155.0
       agents:
         specifier: 0.23.0
         version: 0.23.0(@ai-sdk/react@4.0.105(react@19.3.0)(zod@4.6.5))(@babel/core@8.0.5)(@babel/runtime@7.29.7)(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(@modelcontextprotocol/server@2.0.0)(ai@7.0.102(zod@4.6.5))(react@19.3.0)(rolldown@1.2.9)(vite@8.3.0(@types/node@24.13.5)(esbuild@0.28.2)(yaml@2.9.1))(zod@4.6.5)
       ai:
         specifier: ^7.0.102
         version: 7.0.102(zod@4.6.5)
-      workers-ai-provider:
-        specifier: ^4.0.0
-        version: 4.0.0(@ai-sdk/provider@4.0.15)(ai@7.0.102(zod@4.6.5))
       zod:
         specifier: ^4.6.5
         version: 4.6.5
@@ -249,9 +252,26 @@ packages:
       react:
         optional: true
 
+  '@cloudflare/containers@0.3.7':
+    resolution: {integrity: sha512-DM9dm3FnIBSyiSJ1FLavKwl/lk3oAmTaynCzZQ9pZR0ncRPquSxkxd8Nu2MFILxmDDsPkxKsSNEh9mHHMty4Fw==}
+
   '@cloudflare/kv-asset-handler@0.5.0':
     resolution: {integrity: sha512-jxQYkj8dSIzc0cD6cMMNdOc1UVjqSqu8BZdor5s8cGjW2I8BjODt/kWPVdY+u9zj3ms75Q5qaZgnxUad83+eAg==}
     engines: {node: '>=22.0.0'}
+
+  '@cloudflare/sandbox@0.12.9':
+    resolution: {integrity: sha512-JlCQ8adVaHT3TrZO13X6US2LJTyQ4YvoEZpfh5EewRqcxPfMHZNJPB/1dsRdiFqmtzpz+lMxGazSUa2H/g2IKg==}
+    peerDependencies:
+      '@openai/agents': ^0.3.3
+      '@opencode-ai/sdk': ^1.1.40
+      '@xterm/xterm': '>=5.0.0'
+    peerDependenciesMeta:
+      '@openai/agents':
+        optional: true
+      '@opencode-ai/sdk':
+        optional: true
+      '@xterm/xterm':
+        optional: true
 
   '@cloudflare/unenv-preset@2.16.1':
     resolution: {integrity: sha512-ECxObrMfyTl5bhQf/lZCXwo5G6xX9IAUo+nDMKK4SZ8m4Jvvxp52vilxyySSWh2YTZz8+HQ07qGH/2rEom1vDw==}
@@ -820,6 +840,51 @@ packages:
     resolution: {integrity: sha512-YhHWdHfpFMQfd0prsEnxKeS3Qz3ytIGmsS0sth4KDjnacIT7hxk6hXHkJ9KysxlkvTM+WZAtQbbcUhdoP4Hvtw==}
     engines: {node: '>=20'}
 
+  '@openai/codex-sdk@0.155.0':
+    resolution: {integrity: sha512-oD/7iCZnXqDlrnoWWpGkZExrUStpAau1koyUO/fSW3WwkqewRf+MGj3OS41Buw7gNwj0oM6ilI9RHqP5QQWJaQ==}
+    engines: {node: '>=18'}
+
+  '@openai/codex@0.155.0':
+    resolution: {integrity: sha512-35a85Hbwy9WXkDTJumLjTcmMgpR7BMdrTloWBVGjoA+FBCh7jb3+cYp2W+3U4klqGAjAskoIvQZv7/eedmCjHA==}
+    engines: {node: '>=16'}
+    hasBin: true
+
+  '@openai/codex@0.155.0-darwin-arm64':
+    resolution: {integrity: sha512-c0vbt2ZS6XiXq9gQkNictu7PH0deMyq/bw4Ia9bdihU1iJHuGuwC5vD4swU4xhLUKoTs4tMOHwYWKaofFZcVRg==}
+    engines: {node: '>=16'}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@openai/codex@0.155.0-darwin-x64':
+    resolution: {integrity: sha512-Epo33vwukf4uPyxg1c7+7+P4J6YgggdwQrCR/BRGuhjpadZAzoAntfm54CPCNHvW6uSq8BHQX/e9G+f5/0XQ7Q==}
+    engines: {node: '>=16'}
+    cpu: [x64]
+    os: [darwin]
+
+  '@openai/codex@0.155.0-linux-arm64':
+    resolution: {integrity: sha512-iMyMjIYHlBUUDeTEGeEftQozQz0h7nYYCaLDJlZnqDF2Y0+bfdD/ppDS3vsw6mIz/z49haC6TCer11iEWO6fsA==}
+    engines: {node: '>=16'}
+    cpu: [arm64]
+    os: [linux]
+
+  '@openai/codex@0.155.0-linux-x64':
+    resolution: {integrity: sha512-CiXkVTy4ERdFSXXP8n98/iOyVUCOYFPQ8cuwgeOEEbLhe1LnlQbgH/H8ZeuxO9WXKIZLJg0x626UgR9axY2zSA==}
+    engines: {node: '>=16'}
+    cpu: [x64]
+    os: [linux]
+
+  '@openai/codex@0.155.0-win32-arm64':
+    resolution: {integrity: sha512-aFIONQhKxg+XEVsInLRI2OG8S9OUvfK+nzc4sWcbn8DgxlmuPkbVzloSrD5psh1lKnG4s2qd3QK8tCClSgLzJw==}
+    engines: {node: '>=16'}
+    cpu: [arm64]
+    os: [win32]
+
+  '@openai/codex@0.155.0-win32-x64':
+    resolution: {integrity: sha512-yfB9DHAB0YLTy3oD4one21pzGIJ99b+U/PW4htAq6OLccPSZa8OZz5HeN3XVy1a2/BbCqwWmK+w4p/aG/3DCRw==}
+    engines: {node: '>=16'}
+    cpu: [x64]
+    os: [win32]
+
   '@oxc-project/types@0.150.0':
     resolution: {integrity: sha512-rDS5/31E9HfPl/CIzGrn0DOlvBbXFseQ5URJ9sYMfstbKLD/c6Gm9vmRzRGDdAXyOIL4zmO37lc9RIwYqVruZw==}
 
@@ -1178,6 +1243,9 @@ packages:
   ajv@8.20.0:
     resolution: {integrity: sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==}
 
+  aws4fetch@1.0.20:
+    resolution: {integrity: sha512-/djoAN709iY65ETD6LKCtyyEI04XIBP5xVvfmNxsEP0uJB5tyaGBztSryRr4HqMStr9R06PisQE7m9zDTXKu6g==}
+
   baseline-browser-mapping@2.11.24:
     resolution: {integrity: sha512-hYrgxie335U08WqICoGqKRzV1HFXv6zdxwJE4ekCb80CM9a0SVVsN4QPwT67RraRo+9h8IATk6uxHJw7QSkdOg==}
     engines: {node: '>=6.0.0'}
@@ -1212,6 +1280,9 @@ packages:
 
   capnweb@0.12.0:
     resolution: {integrity: sha512-jgZ/LMtMVTi+RVlooIslH78Gg23XbDTdvcLghWx3oz17D6u5GuJARt+uhZk/wcTo+f81eeabfnow4d3zLBj+JQ==}
+
+  capnweb@0.8.0:
+    resolution: {integrity: sha512-BK/TuXUiyfLSKsmjojn70yN7oYG/JJzoURZ3tckjg5Zj2KcygPm0A5jyOlswK7SYB4f0Gh9tt+RZ132b80iLfA==}
 
   content-disposition@1.1.0:
     resolution: {integrity: sha512-5jRCH9Z/+DRP7rkvY83B+yGIGX96OYdJmzngqnw2SBSxqCFPd0w2km3s5iawpGX8krnwSGmF0FW5Nhr0Hfai3g==}
@@ -1902,22 +1973,6 @@ packages:
     engines: {node: '>=16'}
     hasBin: true
 
-  workers-ai-provider@4.0.0:
-    resolution: {integrity: sha512-FkhwMP1EP/MKXR8Jv1o7wLVKfTqu0h/PUaEmhZ7gyDiioib5Wsh3oPAKhG+7+SWfU3roTDHaEWlJpkJjpXu+fQ==}
-    peerDependencies:
-      '@ai-sdk/anthropic': ^4.0.0
-      '@ai-sdk/google': ^4.0.0
-      '@ai-sdk/openai': ^4.0.0
-      '@ai-sdk/provider': ^4.0.0
-      ai: ^7.0.0
-    peerDependenciesMeta:
-      '@ai-sdk/anthropic':
-        optional: true
-      '@ai-sdk/google':
-        optional: true
-      '@ai-sdk/openai':
-        optional: true
-
   wrangler@4.134.0:
     resolution: {integrity: sha512-65JbYVGSt0XpPH8O/y6pNuS0t+AvvwVv+VRPbqYsNI5NMF9oFiJxVoS5GYU47ooamF9ucSXWvGyQ6QnAtXLgRA==}
     engines: {node: '>=22.0.0'}
@@ -2154,7 +2209,16 @@ snapshots:
       '@ai-sdk/react': 4.0.105(react@19.3.0)(zod@4.6.5)
       react: 19.3.0
 
+  '@cloudflare/containers@0.3.7': {}
+
   '@cloudflare/kv-asset-handler@0.5.0': {}
+
+  '@cloudflare/sandbox@0.12.9':
+    dependencies:
+      '@cloudflare/containers': 0.3.7
+      aws4fetch: 1.0.20
+      capnweb: 0.8.0
+      hono: 4.13.8
 
   '@cloudflare/unenv-preset@2.16.1(unenv@2.0.0-rc.24)(workerd@1.20260917.1)':
     dependencies:
@@ -2516,6 +2580,37 @@ snapshots:
       '@modelcontextprotocol/core': 2.0.0
       zod: 4.6.5
 
+  '@openai/codex-sdk@0.155.0':
+    dependencies:
+      '@openai/codex': 0.155.0
+
+  '@openai/codex@0.155.0':
+    optionalDependencies:
+      '@openai/codex-darwin-arm64': '@openai/codex@0.155.0-darwin-arm64'
+      '@openai/codex-darwin-x64': '@openai/codex@0.155.0-darwin-x64'
+      '@openai/codex-linux-arm64': '@openai/codex@0.155.0-linux-arm64'
+      '@openai/codex-linux-x64': '@openai/codex@0.155.0-linux-x64'
+      '@openai/codex-win32-arm64': '@openai/codex@0.155.0-win32-arm64'
+      '@openai/codex-win32-x64': '@openai/codex@0.155.0-win32-x64'
+
+  '@openai/codex@0.155.0-darwin-arm64':
+    optional: true
+
+  '@openai/codex@0.155.0-darwin-x64':
+    optional: true
+
+  '@openai/codex@0.155.0-linux-arm64':
+    optional: true
+
+  '@openai/codex@0.155.0-linux-x64':
+    optional: true
+
+  '@openai/codex@0.155.0-win32-arm64':
+    optional: true
+
+  '@openai/codex@0.155.0-win32-x64':
+    optional: true
+
   '@oxc-project/types@0.150.0': {}
 
   '@poppinss/colors@4.1.6':
@@ -2730,6 +2825,8 @@ snapshots:
       json-schema-traverse: 1.0.0
       require-from-string: 2.0.2
 
+  aws4fetch@1.0.20: {}
+
   baseline-browser-mapping@2.11.24: {}
 
   blake3-wasm@2.1.5: {}
@@ -2771,6 +2868,8 @@ snapshots:
   caniuse-lite@1.0.30001810: {}
 
   capnweb@0.12.0: {}
+
+  capnweb@0.8.0: {}
 
   content-disposition@1.1.0: {}
 
@@ -3461,11 +3560,6 @@ snapshots:
       '@cloudflare/workerd-linux-64': 1.20260917.1
       '@cloudflare/workerd-linux-arm64': 1.20260917.1
       '@cloudflare/workerd-windows-64': 1.20260917.1
-
-  workers-ai-provider@4.0.0(@ai-sdk/provider@4.0.15)(ai@7.0.102(zod@4.6.5)):
-    dependencies:
-      '@ai-sdk/provider': 4.0.15
-      ai: 7.0.102(zod@4.6.5)
 
   wrangler@4.134.0(@cloudflare/workers-types@5.20260917.1)(@types/node@24.13.5):
     dependencies:

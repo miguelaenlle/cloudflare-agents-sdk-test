@@ -1,146 +1,147 @@
-# Persistent agent chat through a local relay
+# Persistent Codex chat through a local relay
 
-A minimal prototype of the intended PrairieLearn topology. The local Node server stands in for an ephemeral PL webserver. No PrairieLearn application files are changed.
-
-```text
-React on localhost:4315
-  AI SDK useChat + DefaultChatTransport
-           │ same-origin HTTP / SSE
-           ▼
-Local Node backend on 127.0.0.1:4316
-  /api/chat: AI SDK UI Message Stream
-           │ Cloudflare WebSocket / HTTP
-           ▼
-Cloudflare Chat("playground")
-  AIChatAgent + durable SQLite history + Workers AI
-```
-
-Vite proxies `/api` to the local backend. The browser has no Cloudflare imports, Worker URL, or Cloudflare connection. There is no custom frontend hook or custom frontend transport.
-
-## Workspace layout
+A minimal PrairieLearn-shaped prototype: the official TypeScript Codex SDK runs native Codex inside a Cloudflare Sandbox; an `AIChatAgent` owns the durable chat. The local webserver can disappear without stopping a turn. No PrairieLearn application files are changed.
 
 ```text
-apps/web/
-  client/                  React + AI SDK
-  server/
-    server.ts              HTTP/SSE endpoints
-    providers/cloudflare.ts
-  test/relay.mjs            End-to-end relay test
-  package.json
-  tsconfig.json
-  vite.config.ts
-apps/agent/
-  agent.ts                 Cloudflare agent implementation
-  test/                    Local deterministic agent fixture
-  package.json
-  tsconfig.json
-  wrangler.jsonc
-packages/chat-contract/
-  src/index.ts             API paths, request schema, provider interfaces
-  package.json
-  tsconfig.json
+React / AI SDK useChat on localhost:4315
+  ↕ HTTP commands + AI SDK message-stream SSE
+Local Node relay on 127.0.0.1:4316
+  ↕ Cloudflare WebSocket / HTTP adapter
+Cloudflare Chat("playground") / AIChatAgent
+  ↕ Sandbox SDK
+Cloudflare Sandbox: official Codex SDK → local Codex + workspace
+  ↕ OpenAI model inference
+
+Completed workspace + native Codex session → R2 checkpoint
 ```
 
-The two apps have separate dependencies, builds, and TypeScript environments. The web app imports the contract through `@playground/chat-contract`; it never imports the Worker implementation. The contract uses AI SDK types and Zod and has no Cloudflare dependency. Root scripts forward to the appropriate app, so run all commands below from the repository root. Keep `.env.local` at the root.
+The browser and relay have the same provider-independent interface as before. Codex owns its tool loop, commands, edits, and native conversation. There is no OpenAI Agents API or custom agent loop. Chat text is emitted when Codex completes a message item, not token by token.
 
-The contract exports TypeScript source directly. Vite bundles it for the browser and Node loads it through the local workspace link; it needs no separate build or publication step. The webserver therefore runs from this workspace checkout.
+## Code map
 
-## Who owns what
+- `apps/agent/agent.ts`: coordinates turns, cancellation, durable cleanup, and UI history through `AIChatAgent`.
+- `apps/agent/codex.ts`: starts/observes/stops Codex and saves/restores the sandbox.
+- `apps/agent/codex-events.ts`: converts streamed SDK events into standard AI SDK text and tool events.
+- `apps/agent/run-codex.mjs`: small container runner; calls `startThread` / `resumeThread` and `runStreamed`, redacts and streams events, and handles cancellation/deadlines.
+- `apps/agent/Dockerfile`: pins Sandbox **0.12.9** and Codex SDK **0.155.0** (which installs its matching native CLI). No credentials in the image.
+- `apps/web/client/`: barebones React UI with standard `useChat` and `DefaultChatTransport`.
+- `apps/web/server/`: stateless HTTP/SSE relay and the Cloudflare-specific adapter.
+- `packages/chat-contract/`: shared routes, request validation, and provider interface. No Cloudflare dependency.
 
-- `packages/chat-contract/src/index.ts`: shared endpoint names, request validation schema, and the provider interface.
-- `apps/web/client/app.tsx`: barebones UI using Vercel AI SDK's `useChat`. Loads history, resumes on mount, retries after stream errors, and sends an explicit Stop request.
-- `apps/web/server/server.ts`: local HTTP endpoints and SSE responses. Holds no conversation history or durable run state.
-- `apps/web/server/providers/cloudflare.ts`: Cloudflare adapter. Uses Cloudflare's `WebSocketChatTransport` to produce standard AI SDK chunks, with the SDK's resume handshake. Each streaming request has its own temporary upstream connection. Opening the socket has a timeout; detaching removes its listeners and closes the connection. The adapter receives its configuration explicitly rather than reading environment variables.
-- `apps/agent/agent.ts`: persistent agent, model selection, simulated one-minute tool, and cancellation endpoint. Cloudflare's SDK owns history and background execution.
+To replace Cloudflare, change the server's provider adapter and deployed agent. The frontend event format and HTTP interface can stay; stored history still needs migration.
 
-To change agent providers, replace `apps/web/server/providers/cloudflare.ts` and the deployed agent implementation. Preserve the local HTTP contract and AI SDK message format. Existing stored history would still need migration if Cloudflare is removed.
+## Cloudflare setup — you perform these steps
 
-## Reading the implementation
+Prerequisites: Node **22.18+**, pnpm **11**, Docker running, Cloudflare Workers Paid/Containers access, and R2. You also need an OpenAI API key with access to the model you intend to use. Container compute, R2, and OpenAI inference incur their respective usage charges.
 
-Start with `packages/chat-contract/src/index.ts` for the public contract. Then read `apps/web/server/server.ts`: configuration is validated at startup, `readMessages` validates request bodies, `handleRequest` selects an endpoint, and `streamChat` owns connection cleanup. Only `apps/web/server/providers/cloudflare.ts` knows Cloudflare's protocol. `apps/web/client/app.tsx` uses the standard AI SDK hook; its message rendering is separated from request and reconnect handling.
-
-Client mistakes return 400 or 413. Upstream failures return 502 before streaming starts. A failure during SSE closes the response so the frontend can reconnect. Disconnecting a client and cancelling the agent remain deliberately separate operations.
-
-## Setup — you perform these steps
-
-Use Node **22.18+** and pnpm **11**. In this repository:
+From the repository root:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm --filter @playground/agent exec wrangler login
+pnpm --filter @playground/agent exec wrangler r2 bucket create codex-playground-backups
+```
+
+Edit `apps/agent/wrangler.jsonc`:
+
+- Replace `vars.CLOUDFLARE_ACCOUNT_ID` with your actual account ID. This is also used by the Sandbox backup API.
+- If you change the bucket name, update both `BACKUP_BUCKET_NAME` and `r2_buckets[].bucket_name`.
+- Optionally add `CODEX_MODEL` to `vars` to select your model. Otherwise the pinned CLI chooses its default.
+
+Create an R2 API token with **Object Read & Write** scoped to this bucket. Store its access-key pair and your OpenAI API key as Worker secrets:
+
+```sh
+pnpm --filter @playground/agent exec wrangler secret put CODEX_API_KEY --config wrangler.jsonc
+pnpm --filter @playground/agent exec wrangler secret put R2_ACCESS_KEY_ID --config wrangler.jsonc
+pnpm --filter @playground/agent exec wrangler secret put R2_SECRET_ACCESS_KEY --config wrangler.jsonc
 pnpm deploy
 ```
 
-Cloudflare needs Workers onboarding, a `workers.dev` subdomain, permission to create SQLite Durable Objects, and Workers AI access. Wrangler creates the declared Durable Object binding and SQLite migration. No separately provisioned database, sandbox, or OpenAI key is required. If necessary, select the account with `CLOUDFLARE_ACCOUNT_ID` before deploying.
+Wrangler builds/uploads the container and deploys the Worker. The original `Chat` SQLite migration is preserved; `v2` adds `Sandbox`. No website is hosted by this Worker. Earlier Workers AI chat history remains visible, but it is not imported into the new native Codex thread.
 
-Deployment uploads only the Worker using `apps/agent/wrangler.jsonc`. The Worker name, Durable Object binding, and migration remain unchanged by the folder split. If you deployed the previous prototype, redeploy this version to add the cancellation endpoint. Existing `playground` history remains under the same Worker and Durable Object binding.
+Backups expire after **30 days**. Configure an R2 lifecycle rule on `backups/` to delete objects older than 31 days; the SDK's expiry does not delete the objects. This is a prototype retention policy, not permanent storage. An expired backup causes an explicit restore error.
 
-Create `.env.local` from `.env.example`, or edit your existing file:
+Set the root `.env.local` (use `.env.example` as a template):
 
 ```dotenv
 AGENT_URL=https://cloudflare-agents-sdk-test.YOUR_SUBDOMAIN.workers.dev
 ```
 
-Use **AGENT_URL**, replacing the previous **VITE_AGENT_URL** setting. This is backend configuration; it is not included in the browser bundle.
-
-Then run these in separate terminals:
+Run the local backend and frontend in separate terminals:
 
 ```sh
-# Terminal 1: local backend
 pnpm dev:server
 ```
 
 ```sh
-# Terminal 2: local frontend
 pnpm dev
 ```
 
-Open **http://localhost:4315**. Both local processes must be running to use the page. Restart the local backend after changing `.env.local`. Real chat requests use your Cloudflare Workers AI allowance.
+Open **http://localhost:4315**. Restart the backend after changing `.env.local`.
 
-The Worker URL does not host the website. The existing `UI_ORIGIN` Worker setting is only a browser-origin restriction; the Node relay's server-to-server requests do not send an Origin header. This is a shared, unauthenticated throwaway conversation, not a production authorization design.
+## Try it
 
-For Worker logs, run:
+1. Ask: **Create hello.txt containing a short greeting and run a command to print it.** Verify tool activity and the reply.
+2. Ask: **What did you put in hello.txt? Read it again.** This must resume the same native Codex thread.
+3. Click **Run one-minute task**. After command activity appears, stop the local backend and close the page. Restart it after a minute; the completed answer should be in history. Repeat with a restart during the turn to test stream replay.
+4. Click **Stop** during a task. It must stop the sandbox process; closing the page alone must not.
+5. Leave the sandbox idle for over two minutes and confirm it stops in Cloudflare. Ask it to read `hello.txt` again: both workspace and native session should restore from R2.
+
+The live container checks are still necessary. In particular, verify that Codex's `workspace-write` sandbox works inside Cloudflare's runtime. The implementation never silently disables it. Inspect Worker logs with:
 
 ```sh
 pnpm --filter @playground/agent exec wrangler tail --config wrangler.jsonc
 ```
 
-Build output is written to `apps/web/dist` and `apps/agent/dist`. Old root `dist` and `.wrangler` directories are no longer used by these builds; any previous local state is left untouched.
+SDK events travel over stdout through Cloudflare's buffered process-log stream. Non-secret input, cancellation markers, thread IDs, and final outcomes live under `/tmp/codex-runs/<run-id>/`, outside checkpoints. The runner determines the Codex outcome; the Worker handles infrastructure interruptions. SDK failures are reported in the chat; inspect the Sandbox process logs for runner startup failures.
 
-## Try it
+## Persistence and limits
 
-1. Send a message, reload, and verify the saved history.
-2. Click **Run one-minute task**. Wait for tool activity, then stop both local processes and close the tab. Restart them after a minute: the completed answer should be in history.
-3. Repeat, restarting the backend after about 15 seconds. Reopen the UI or click **Reconnect / refresh history** to attach to the existing turn. A broken active SSE connection also triggers an automatic retry.
-4. Click **Stop** during the wait. This calls the backend cancellation endpoint. Closing the page or losing an SSE connection only detaches the client; it does not send Stop.
+- `AIChatAgent` persists the UI transcript. Codex's native session lives in `/workspace/codex`; the working Git repository is `/workspace/repo`.
+- A turn gets a durable run ID before launch. The launcher atomically claims that ID. A Chat Durable Object restart stops any surviving process and saves an interruption message. It never automatically repeats the prompt or reattaches to the old execution.
+- The Worker consumes Cloudflare’s process-log SSE stream, including buffered output from before attachment. There is no observation polling loop or container HTTP service. A disconnected process stream reports failure; it never replays the prompt.
+- Stopped runs (including cancellation or coordinator interruption) are checkpointed before releasing keep-alive, if the workspace is still alive. The container can sleep after two idle minutes. History reads do not wake it.
+- **Stop** writes a cancellation marker watched by the runner, which aborts `runStreamed` through the SDK. The coordinator waits up to five seconds for exit; it never force-kills merely because that wait expires. An unconfirmed stop reports an error and keeps the run active, keep-alive enabled, and new turns blocked. This ends the current turn; the next prompt resumes the native thread.
+- Runs retain a ten-minute SDK abort deadline, a Sandbox process timeout ten seconds later, and a durable cleanup deadline after eleven minutes. Only deadline cleanup force-terminates the process through Cloudflare. If termination cannot be confirmed, cleanup retries. Real child-command termination still needs a container smoke test.
+- Checkpoint failure is reported, and keep-alive is released; only the last successful checkpoint is guaranteed to survive a later container loss.
+- A container crash during a turn may lose work since the last checkpoint. The UI reports interruption rather than claiming exactly-once execution.
+- One shared conversation, one sandbox, no authentication or approval UI. This is for a trusted disposable workspace. The runtime API-key environment variable is readable by code inside the container; do not use this prototype for untrusted course code or expose it publicly as a production service.
+- A passive second tab needs **Reconnect / refresh history** to see a turn started elsewhere.
 
-A passive second tab does not continuously subscribe to new turns. Use **Reconnect / refresh history** to load changes and attach to any active turn. This keeps idle clients from polling or holding an extra subscription. All tabs share `playground`; Stop cancels that conversation's current/queued work.
+## Credentials and saved output
 
-## Stable frontend contract
+`CODEX_API_KEY` is injected into the runner environment, then passed to the official SDK. Codex uses memory-only credential storage (`cli_auth_credentials_store = "ephemeral"`). The native process receives only a small environment allowlist; shell tools inherit no environment and get only `PATH` and `HOME` explicitly.
 
-| Endpoint                          | Behavior                                                                                 |
-| --------------------------------- | ---------------------------------------------------------------------------------------- |
-| `GET /api/chat/history`           | Saved `UIMessage[]`                                                                      |
-| `POST /api/chat`                  | AI SDK request with `id: "playground"` and `messages`; response is UI Message Stream SSE |
-| `GET /api/chat/playground/stream` | Replay/attach to the current turn, or return 204 when idle                               |
-| `POST /api/chat/cancel`           | Explicitly cancel the agent's work; return 204                                           |
+The runner redacts the exact injected key from structured event strings and final errors before writing stdout/results. The coordinator also redacts that key from errors it reports or logs. Run artifacts and Codex diagnostic file logs are under `/tmp`. Checkpoints retain `/workspace/repo` and native session state in `/workspace/codex`; they exclude `codex/auth.json`, legacy `codex/log`, and legacy `runs` directories as defense in depth.
 
-Resume uses Cloudflare's durable stream replay, not an in-memory stream buffer in the local backend. A replacement webserver opens a new connection to the same named agent. The prototype does not automatically retry message submission after an ambiguous network failure, since that could duplicate a turn.
+This is not a guarantee that all stored data is secret-free. Native Codex session files are written before our event adapter and may contain sensitive prompts or tool output. Files deliberately written to the repository are also backed up. Environment filtering is not isolation from code that can inspect other processes. Exact-key redaction does not cover encoded keys or unrelated secrets. R2's encryption at rest does not hide content from authorized backup readers, and these changes do not scrub existing backups. Treat native sessions and backups as sensitive data.
 
-Cloudflare may recover interrupted work by retrying it; persistence does not imply exactly-once tool execution. The demonstration wait is harmless to repeat. Authentication, multiple conversations, client-side tools/approvals, and continuous cross-tab synchronization are outside this prototype.
+## Stable web interface
 
-## Validation
+| Endpoint                          | Behavior                                          |
+| --------------------------------- | ------------------------------------------------- |
+| `GET /api/chat/history`           | Saved AI SDK `UIMessage[]`                        |
+| `POST /api/chat`                  | Send a message; receive UI Message Stream SSE     |
+| `GET /api/chat/playground/stream` | Replay/attach to the current turn, or 204 if idle |
+| `POST /api/chat/cancel`           | Explicitly stop the active work                   |
+
+## Local checks
 
 ```sh
 pnpm typecheck
 pnpm build
-pnpm build:worker
 pnpm format:check
 pnpm test
 ```
 
-`build:worker` is a dry run; it does not deploy. `pnpm test` starts an isolated local Worker and relay on ports 8791 and 4318, with an eight-second deterministic response and no AI binding. It verifies malformed requests, byte-based body limits, idle resume, replay after abruptly replacing the relay, tool results, saved history, completion with no relay connected, and explicit cancellation. It cleans up its processes and temporary storage.
+Tests require neither credentials nor Docker. They run the real chat coordinator against a deterministic Sandbox substitute, plus native subprocess tests with a fake Codex executable. They cover JSONL chunking, tool mapping, duplicate launch prevention, SDK subprocess cancellation, confirmed Sandbox stop, relay replacement, saved history, cancellation, cold restoration, Worker restart interruption without replay, checkpoint failure followed by warm resume, and consistent live/orphaned deadline outcomes.
 
-These transport and lifecycle tests passed. Cloud deployment, model replies, and the production one-minute tool remain for you to verify. No cloud resources were deployed and no inference was performed during implementation. Temporary development services have been stopped.
+`pnpm build:worker` is a deployment dry run that also needs Docker to build the image. To check just Worker bundling without Docker:
 
-References: [AI SDK transport](https://ai-sdk.dev/docs/ai-sdk-ui/transport), [UI Message Stream protocol](https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol), [Cloudflare chat client transport](https://developers.cloudflare.com/agents/communication-channels/chat/client-sdk/), [Workers AI setup](https://developers.cloudflare.com/workers-ai/get-started/workers-wrangler/).
+```sh
+pnpm --filter @playground/agent exec wrangler deploy --config wrangler.jsonc --dry-run --containers-rollout=none --outdir dist
+```
+
+No cloud deployment or paid inference is part of these local tests. A passing fixture test is not proof of Cloudflare container compatibility or a real R2 restore.
+
+References: [Codex SDK](https://developers.openai.com/codex/sdk/), [Sandbox processes](https://developers.cloudflare.com/sandbox/guides/background-processes/), [Sandbox backups and R2 setup](https://developers.cloudflare.com/sandbox/guides/backup-restore/).

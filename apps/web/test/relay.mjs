@@ -8,24 +8,28 @@ import { setTimeout as delay } from "node:timers/promises";
 import { DefaultChatTransport, readUIMessageStream } from "ai";
 
 const state = await mkdtemp(join(tmpdir(), "cf-relay-"));
-const worker = spawn(
-  "../agent/node_modules/.bin/wrangler",
-  [
-    "dev",
-    "--config",
-    "../agent/test/wrangler.jsonc",
-    "--port",
-    "8791",
-    "--inspector-port",
-    "0",
-    "--persist-to",
-    state,
-  ],
-  { stdio: "pipe" },
-);
 let logs = "";
-worker.stdout.on("data", (chunk) => (logs += chunk));
-worker.stderr.on("data", (chunk) => (logs += chunk));
+let worker;
+function startWorker() {
+  worker = spawn(
+    "../agent/node_modules/.bin/wrangler",
+    [
+      "dev",
+      "--config",
+      "../agent/test/wrangler.jsonc",
+      "--port",
+      "8791",
+      "--inspector-port",
+      "0",
+      "--persist-to",
+      state,
+    ],
+    { stdio: "pipe" },
+  );
+  worker.stdout.on("data", (chunk) => (logs += chunk));
+  worker.stderr.on("data", (chunk) => (logs += chunk));
+}
+startWorker();
 const api = "http://127.0.0.1:4318/api/chat";
 let server;
 function startServer() {
@@ -120,12 +124,18 @@ try {
   }))
     final = message;
   assert.equal(
-    final.parts.find((p) => p.type === "text").text,
+    final.parts
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join(""),
     "Started. Finished.",
   );
   assert.ok(
     final.parts.some(
-      (p) => p.type === "tool-waitOneMinute" && p.state === "output-available",
+      (p) =>
+        p.type === "dynamic-tool" &&
+        p.toolName === "command_execution" &&
+        p.state === "output-available",
     ),
   );
   assert.equal(
@@ -170,14 +180,168 @@ try {
   console.log(
     "Passed: explicit cancellation stops the agent independently of SSE disconnection.",
   );
+  const fixture = "http://localhost:8791/agents/chat/playground/test";
+  assert.equal(
+    (await fetch(`${fixture}/sleep`, { method: "POST" })).status,
+    204,
+  );
+  for await (const _chunk of await send()) {
+  }
+  const status = await (await fetch(`${fixture}/status`)).json();
+  assert.deepEqual(status, { launches: 4, restores: 1, keepAlive: false });
+  console.log(
+    "Passed: cold restore resumes the native thread and releases keep-alive.",
+  );
+
+  const beforeRecovery = (await history()).filter(
+    (m) => m.role === "assistant",
+  ).length;
+  const interrupted = await firstText(await send());
+  const workerExit = once(worker, "exit");
+  worker.kill("SIGTERM");
+  await workerExit;
+  await interrupted.cancel().catch(() => {});
+  startWorker();
+  await ready("http://localhost:8791/agents/chat/playground/get-messages");
+  let recovered;
+  for (let attempt = 0; attempt < 150; attempt++) {
+    recovered = await history();
+    if (
+      recovered
+        .at(-1)
+        ?.parts.some(
+          (part) =>
+            part.type === "text" && part.text.includes("Task interrupted."),
+        )
+    )
+      break;
+    await delay(200);
+  }
+  assert.equal(
+    recovered.filter((message) => message.role === "assistant").length,
+    beforeRecovery + 1,
+  );
+  assert.equal(
+    recovered
+      .at(-1)
+      .parts.filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join(""),
+    "Task interrupted. It was not automatically repeated. You can send another message to continue.",
+  );
+  assert.deepEqual(await (await fetch(`${fixture}/status`)).json(), {
+    launches: 5,
+    restores: 1,
+    keepAlive: false,
+  });
+  console.log(
+    "Passed: Worker replacement stops surviving work, saves interruption, and never repeats the prompt.",
+  );
+  assert.equal(
+    (await fetch(`${fixture}/fail-backup`, { method: "POST" })).status,
+    204,
+  );
+  for await (const _chunk of await send()) {
+  }
+  const failed = (await history()).at(-1);
+  assert.ok(
+    failed.parts.some(
+      (part) =>
+        part.type === "text" &&
+        part.text.includes("Task failed: Fixture R2 unavailable"),
+    ),
+  );
+  assert.equal(
+    (await (await fetch(`${fixture}/status`)).json()).keepAlive,
+    false,
+  );
+  console.log(
+    "Passed: checkpoint failure is saved in history and releases keep-alive.",
+  );
+  const fresh = "http://localhost:8791/agents/chat/backup-failure/test";
+  assert.equal(
+    (await fetch(`${fresh}/fail-backup`, { method: "POST" })).status,
+    204,
+  );
+  const firstRun = await (
+    await fetch(`${fresh}/run`, { method: "POST" })
+  ).json();
+  assert.equal(firstRun.run.status, "failed");
+  assert.equal(firstRun.threadId, "native-thread");
+  assert.equal(firstRun.checkpoint, undefined);
+  const nextRun = await (
+    await fetch(`${fresh}/run`, { method: "POST" })
+  ).json();
+  assert.equal(nextRun.run.status, "completed");
+  assert.equal(nextRun.checkpoint.threadId, "native-thread");
+  console.log(
+    "Passed: failed first checkpoint preserves the native thread for the next warm turn.",
+  );
+
+  const deadlineReader = await firstText(await send());
+  const liveDeadline = await (
+    await fetch(`${fixture}/expire`, { method: "POST" })
+  ).json();
+  assert.equal(liveDeadline.run.status, "failed");
+  while (!(await deadlineReader.read()).done) {}
+  assert.ok(
+    (await history())
+      .at(-1)
+      .parts.some(
+        (part) =>
+          part.type === "text" && part.text.includes("ten-minute run limit"),
+      ),
+  );
+  const orphanDeadline = await (
+    await fetch(`${fresh}/orphan-deadline`, { method: "POST" })
+  ).json();
+  assert.equal(orphanDeadline.state.run.status, "failed");
+  assert.ok(
+    orphanDeadline.messages
+      .at(-1)
+      .parts.some(
+        (part) =>
+          part.type === "text" && part.text.includes("ten-minute run limit"),
+      ),
+  );
+  console.log(
+    "Passed: live and orphaned deadlines report the same failed outcome.",
+  );
+  await fetch(`${fixture}/ignore-cancel`, { method: "POST" });
+  const stuckReader = await firstText(await send());
+  const cancelResponse = await fetch(`${api}/cancel`, { method: "POST" });
+  assert.equal(cancelResponse.ok, false);
+  const stopping = await (await fetch(`${fixture}/state`)).json();
+  assert.equal(stopping.run.status, "running");
+  assert.equal(stopping.run.stopReason, "cancelled");
+  assert.equal(
+    (await (await fetch(`${fixture}/status`)).json()).keepAlive,
+    true,
+  );
+  const blockedRun = await fetch(`${fixture}/run`, { method: "POST" });
+  assert.equal(blockedRun.ok, false);
+  const cleaned = await (
+    await fetch(`${fixture}/expire`, { method: "POST" })
+  ).json();
+  assert.equal(cleaned.run.status, "failed");
+  while (!(await stuckReader.read()).done) {}
+  assert.equal(
+    (await (await fetch(`${fixture}/status`)).json()).keepAlive,
+    false,
+  );
+  console.log(
+    "Passed: an unconfirmed graceful stop blocks new turns until durable deadline cleanup.",
+  );
 } catch (error) {
   console.error(logs.slice(-12_000));
   throw error;
 } finally {
   if (server && server.exitCode === null && server.signalCode === null)
     await stopServer();
-  const exited = once(worker, "exit");
-  worker.kill("SIGTERM");
-  await exited;
+  if (worker.exitCode === null && worker.signalCode === null) {
+    const exited = once(worker, "exit");
+    worker.kill("SIGTERM");
+    await exited;
+  }
   await rm(state, { recursive: true, force: true });
 }

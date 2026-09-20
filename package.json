@@ -13,7 +13,7 @@
     "build:worker": "pnpm --filter @playground/agent build",
     "deploy": "pnpm --filter @playground/agent deploy",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm --filter @playground/web test",
+    "test": "pnpm --filter @playground/agent test && pnpm --filter @playground/web test",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

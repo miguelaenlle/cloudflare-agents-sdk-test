@@ -5,13 +5,15 @@
   "scripts": {
     "deploy": "wrangler deploy --config wrangler.jsonc",
     "build": "wrangler deploy --config wrangler.jsonc --dry-run --outdir dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import ./test/platform.mjs --experimental-strip-types --test test/codex.test.ts"
   },
   "dependencies": {
     "@cloudflare/ai-chat": "0.12.0",
+    "@cloudflare/sandbox": "0.12.9",
+    "@openai/codex-sdk": "0.155.0",
     "agents": "0.23.0",
     "ai": "^7.0.102",
-    "workers-ai-provider": "^4.0.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
