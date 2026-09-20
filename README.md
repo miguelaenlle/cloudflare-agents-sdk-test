@@ -2,6 +2,8 @@
 
 A minimal PrairieLearn-shaped prototype: the official TypeScript Codex SDK runs native Codex inside a Cloudflare Sandbox; an `AIChatAgent` owns the durable chat. The local webserver can disappear without stopping a turn. No PrairieLearn application files are changed.
 
+See the [technical architecture and global state machine](docs/architecture.md) for the horizontal system diagram, component ownership, protocols, persistence, lifecycle, failure behavior, and path to Course agent MVP.
+
 ```text
 React / AI SDK useChat on localhost:4315
   ↕ HTTP commands + AI SDK message-stream SSE

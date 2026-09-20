@@ -1,5 +1,7 @@
 # Implemented design: warm Sandbox + official Codex SDK
 
+This is the short implementation overview. See [Architecture and lifecycle](architecture.md) for the full system diagram, global state machine, data contracts, and failure behavior.
+
 Implemented locally. Cloudflare deployment and a real Codex/container/R2 smoke test remain user-run; see [setup and acceptance steps](../README.md).
 
 ```mermaid

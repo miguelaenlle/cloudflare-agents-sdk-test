@@ -1,5 +1,7 @@
 # Prototype: replaceable agent behind a PL-style relay
 
+For the detailed current design and the extension sequence toward Course agent MVP, see [Architecture and lifecycle](docs/architecture.md).
+
 1. **Persistent agent:** Cloudflare `AIChatAgent`, one named conversation, official Codex SDK running native Codex in a warm Sandbox. Implemented.
 2. **Provider boundary:** React uses standard AI SDK `useChat` against a local Express backend. That backend converts Cloudflare's WebSocket transport to UI Message Stream SSE through the SDK's existing adapter. Implemented.
 3. **Lifecycle proof:** Replace the local webserver during a turn, resume through a new process, finish with all clients disconnected, and explicitly cancel. Passed with a deterministic local agent using the real Cloudflare runtime and chat persistence. Live deployment/model checks are user-run.
