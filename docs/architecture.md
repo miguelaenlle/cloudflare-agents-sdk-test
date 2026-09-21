@@ -76,13 +76,56 @@ flowchart TB
 
 The Worker routes HTTP requests and WebSocket upgrades; it is not our per-message relay after connection.
 
-**We drive Codex one turn at a time:**
+### One turn: request and response
 
-1. **Chat DO → Sandbox DO:** Sandbox SDK calls write the prompt/thread ID to `input.json` and start `node /opt/run-codex.mjs <run-dir>`.
-2. **Runner → Codex:** the runner reads that file and calls the official SDK’s `startThread`/`resumeThread`, then `runStreamed(prompt)`. The SDK launches the native CLI, writes the prompt to its stdin, and closes stdin. Codex owns all model/tool iterations until the turn ends; the runner then exits.
-3. **Sandbox DO → Chat DO:** the Chat DO calls `streamProcessLogs(run.id)`. The returned stream carries buffered/live stdout in SSE log envelopes; `observeCodex` extracts JSONL and maps events for the UI.
+Read downward through time: requests travel right, results return left. The initial Worker routing is omitted here. **The Chat DO launches and observes one turn; native Codex chooses and executes the model/tool steps.**
 
-There is **no persistent stdin pipe between the DOs**. The input path is SDK file and process calls; stdin is local to the SDK’s native subprocess. The same warm sandbox and native session can span many runner processes.
+```mermaid
+sequenceDiagram
+    participant UI as Browser
+    participant PL as PL backend
+    box rgb(31,41,55) Cloudflare DOs
+        participant Chat as Chat DO
+        participant Sandbox as Sandbox DO
+    end
+    box rgb(31,41,55) Linux container
+        participant Runner as Runner + Codex SDK
+        participant Codex as Native Codex
+    end
+
+    UI->>PL: POST prompt (UI messages)
+    PL->>Chat: Submit via Cloudflare WebSocket transport
+    Chat->>Sandbox: SDK writeFile(input.json): prompt + thread ID
+    Chat->>Sandbox: SDK startProcess(node run-codex.mjs)
+    Sandbox->>Runner: Launch a new runner for this turn
+    Runner->>Runner: Read input; startThread or resumeThread
+    Runner->>Codex: runStreamed: SDK spawns CLI, writes stdin
+    Chat->>Sandbox: SDK streamProcessLogs(run ID)
+
+    loop Codex model/tool iterations
+        Codex->>Codex: Call OpenAI; run tools; update native session
+        Codex-->>Runner: Native stdout JSONL; SDK yields event objects
+        Runner-->>Sandbox: Redacted JSONL on runner stdout
+        Sandbox-->>Chat: Buffered/live process-log SSE
+        Chat->>Chat: Unwrap logs; map to UIMessageChunk
+        Chat-->>PL: AIChatAgent WebSocket chat envelopes
+        PL-->>UI: Standard AI SDK SSE
+    end
+
+    Codex-->>Runner: Native process exits
+    Runner->>Runner: Write result.json; exit
+    Sandbox-->>Chat: Process exit event
+    Chat->>Sandbox: SDK readFile(result.json), then backup
+    Chat->>Chat: Save checkpoint; enter waiting_for_user
+    Chat-->>PL: Final UI events
+    PL-->>UI: Finish response
+```
+
+**Input is file + process launch, not an open stdin connection between DOs.** Only the Codex SDK writes native stdin, then closes it. Each new prompt launches a new runner; the sandbox and native session can stay warm across turns.
+
+**Output has two streams:** native stdout is parsed by the Codex SDK, then our runner emits redacted JSONL to its own stdout. The Sandbox SDK transports that output to the Chat DO; our mapper converts it for the UI. Codex never calls the Chat DO directly. Buffered logs cover output produced before the observer attaches.
+
+Text is emitted on completed assistant items, not token by token. The mapper also handles commands and file changes; its Zod schema validates a subset of native events.
 
 ### Communication ownership
 
@@ -105,50 +148,6 @@ The Sandbox SDK’s `parseSSEStream` helper unwraps process-log events. Our `Cod
 | [Chat coordinator](../apps/agent/agent.ts)                                                                     | Admission, cancellation, lifecycle, checkpoint ordering                     | `AIChatAgent` history/replay; Agents durable scheduling        |
 | [Sandbox bridge](../apps/agent/codex.ts) + [event mapper](../apps/agent/codex-events.ts)                       | Process/file calls and Codex → UI translation                               | Sandbox execution, log streaming, backup/restore               |
 | [Runner](../apps/agent/run-codex.mjs)                                                                          | Input/result files, duplicate-launch claim, cancellation watcher, redaction | Official Codex SDK subprocess handling; native model/tool loop |
-
-### Response path
-
-These are the same runtimes as above. **Process-log SSE and browser SSE are different protocols**; the Chat DO translates between them.
-
-```mermaid
-flowchart TB
-    subgraph container["Linux sandbox container"]
-        Native["Native Codex events"]
-        Runner["Official SDK parses native JSONL<br/>Our runner redacts and serializes events"]
-        Native -->|"stdout JSONL"| Runner
-    end
-    subgraph control["Sandbox Durable Object"]
-        Logs["Sandbox SDK buffers and streams process logs"]
-    end
-    subgraph chat["Chat Durable Object"]
-        Mapper["observeCodex + CodexEvents<br/>Parse events; map text and tools"]
-        Agent["AIChatAgent<br/>Persist UI messages and provide stream replay"]
-        Mapper -->|"UIMessageChunk objects"| Agent
-    end
-    subgraph backend["PL webserver"]
-        Adapter["Cloudflare WebSocketChatTransport<br/>Decode chat envelopes into UIMessageChunk objects"]
-        Relay["AI SDK encodes the HTTP SSE response"]
-        Adapter --> Relay
-    end
-    subgraph browser["Browser"]
-        UI["AI SDK useChat<br/>Assemble messages and render the transcript"]
-    end
-
-    Runner -->|"Redacted JSONL stdout"| Logs
-    Logs -->|"Sandbox SDK: streamProcessLogs<br/>Process-log SSE"| Mapper
-    Agent -->|"Established WebSocket: Cloudflare chat envelopes"| Adapter
-    Relay -->|"Standard AI SDK UI Message Stream SSE"| UI
-
-    classDef default fill:#374151,stroke:#9ca3af,color:#f9fafb
-    style container fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
-    style control fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
-    style chat fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
-    style backend fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
-    style browser fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
-    linkStyle default stroke:#9ca3af
-```
-
-The mapper handles assistant text, commands, and file changes. Text arrives on completed assistant items, not token by token. Its Zod validation covers a subset of native events; the JavaScript runner is not an end-to-end generated typed protocol.
 
 ## Request contract
 
