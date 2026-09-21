@@ -29,7 +29,6 @@ Outside this increment: PL authorization, multiple users/courses, approval-gated
 Read the horizontal diagram from left to right for a request and right to left for results. Each dark-gray region is a distinct runtime or service. The two Durable Objects are separate objects in the same Worker deployment.
 
 ```mermaid
-%%{init: {"theme": "dark"}}%%
 flowchart LR
     subgraph browser["User browser · localhost:4315"]
         UI["React UI<br/>AI SDK useChat + DefaultChatTransport"]
@@ -152,7 +151,6 @@ This is the common lifecycle model across browser, backend, Chat DO, Sandbox DO 
 `offline` means `state.sandbox` is absent. The other states correspond to `SandboxLifecycle.phase` in [codex.ts](../apps/agent/codex.ts). Connection state and run outcome are separate dimensions, described below.
 
 ```mermaid
-%%{init: {"theme": "dark"}}%%
 stateDiagram-v2
     direction LR
     [*] --> offline
