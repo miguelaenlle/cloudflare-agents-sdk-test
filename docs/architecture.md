@@ -98,25 +98,25 @@ sequenceDiagram
     Chat->>Sandbox: SDK writeFile(input.json): prompt + thread ID
     Chat->>Sandbox: SDK startProcess(node run-codex.mjs)
     Sandbox->>Runner: Launch a new runner for this turn
-    Runner->>Runner: Read input; startThread or resumeThread
+    Runner->>Runner: Read input, startThread or resumeThread
     Runner->>Codex: runStreamed: SDK spawns CLI, writes stdin
     Chat->>Sandbox: SDK streamProcessLogs(run ID)
 
     loop Codex model/tool iterations
-        Codex->>Codex: Call OpenAI; run tools; update native session
-        Codex-->>Runner: Native stdout JSONL; SDK yields event objects
+        Codex->>Codex: Call OpenAI, run tools, update native session
+        Codex-->>Runner: Native stdout JSONL, SDK yields event objects
         Runner-->>Sandbox: Redacted JSONL on runner stdout
         Sandbox-->>Chat: Buffered/live process-log SSE
-        Chat->>Chat: Unwrap logs; map to UIMessageChunk
+        Chat->>Chat: Unwrap logs, map to UIMessageChunk
         Chat-->>PL: AIChatAgent WebSocket chat envelopes
         PL-->>UI: Standard AI SDK SSE
     end
 
     Codex-->>Runner: Native process exits
-    Runner->>Runner: Write result.json; exit
+    Runner->>Runner: Write result.json, exit
     Sandbox-->>Chat: Process exit event
     Chat->>Sandbox: SDK readFile(result.json), then backup
-    Chat->>Chat: Save checkpoint; enter waiting_for_user
+    Chat->>Chat: Save checkpoint, enter waiting_for_user
     Chat-->>PL: Final UI events
     PL-->>UI: Finish response
 ```
