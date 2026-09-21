@@ -185,70 +185,44 @@ Stop is an explicit command. The DO writes a cancel marker; the runner's filesys
 
 ## Global state machine
 
-This is the common lifecycle model across browser, backend, Chat DO, Sandbox DO and harness. It is not a separate state-machine framework. **The Chat DO persists and advances this state; other components send commands or report outcomes.**
-
-`offline` means `state.sandbox` is absent. The other states correspond to `SandboxLifecycle.phase` in [codex.ts](../apps/agent/codex.ts). Connection state and run outcome are separate dimensions, described below.
+The **Chat DO** owns this lifecycle. The normal path is below; exceptions are listed separately to keep the diagram readable. Labels in parentheses are the stored sandbox phases. `offline` means no sandbox is allocated.
 
 ```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> offline
-    offline --> allocated: accept a new user message
+flowchart TD
+    Offline["Offline<br/>History and checkpoint retained"]
+    Starting["Starting<br/>(starting)"]
+    Working["Running a turn<br/>(waiting_for_agent)"]
+    Waiting["Waiting for user<br/>(waiting_for_user)"]
+    Saving["Saving before shutdown<br/>(suspending)"]
+    Destroying["Destroying sandbox<br/>(destroying)"]
 
-    state allocated {
-        [*] --> starting
-        starting --> waiting_for_agent: create or restore succeeds
-        starting --> waiting_for_user: setup fails and cleanup confirms no active process
-        waiting_for_agent --> waiting_for_user: completion, failure, or confirmed stop / recovery
-        waiting_for_agent --> waiting_for_agent: stop unconfirmed; refuse another turn
-        waiting_for_user --> waiting_for_agent: accept next message; keep original sandbox age
-        waiting_for_user --> suspending: same waiting period reaches ten minutes
-        suspending --> waiting_for_user: backup fails; bounded retry
-    }
+    Offline -->|"New message"| Starting
+    Starting -->|"Create or restore"| Working
+    Working -->|"Confirm exit; attempt checkpoint"| Waiting
+    Waiting -->|"New message"| Working
+    Waiting -->|"10 minutes waiting"| Saving
+    Saving -->|"Backup succeeds"| Destroying
+    Destroying -->|"Destruction confirmed"| Offline
 
-    suspending --> destroying: checkpoint saved
-    allocated --> destroying: six-hour lifetime reached
-    destroying --> offline: destruction confirmed; retain last checkpoint
-    destroying --> waiting_for_user: idle cleanup fails; bounded retry
-    destroying --> cleanup_failed: lifetime cleanup fails
-    cleanup_failed --> destroying: scheduled retry or explicit new-message retry
-    cleanup_failed --> cleanup_failed: automatic retry budget exhausted
-
-    note right of allocated
-        Browser and relay disconnection do not transition this state.
-        Six-hour expiry applies during startup, active work and suspension.
-    end note
+    classDef default fill:#374151,stroke:#9ca3af,color:#f9fafb
+    linkStyle default stroke:#9ca3af
 ```
 
-`allocated` is a diagram grouping, not a stored phase. The six-hour transition also takes precedence over an idle cleanup already in progress. A failed lifetime cleanup keeps the generation recorded until destruction is confirmed.
+Exceptions:
 
-| State               | Component responsible for advancing it           | Meaning and admission policy                                                                                             |
-| ------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `offline`           | Chat DO, on a new message                        | No allocated sandbox in coordinator state; history and checkpoint remain. Accept a new turn and provision a generation.  |
-| `starting`          | Chat DO via Sandbox SDK                          | Keep-alive/startup/restore is underway. New turns are rejected.                                                          |
-| `waiting_for_agent` | Codex produces results; Chat DO finalizes        | One turn is active or its stop is unconfirmed. Model/tool work and turn-end cleanup belong here. New turns are rejected. |
-| `waiting_for_user`  | User sends a message, or Chat DO deadline fires  | No active process after confirmed cleanup. Workspace remains warm. A new message invalidates the old waiting period.     |
-| `suspending`        | Chat DO via backup API                           | Idle checkpoint is being created. New turns are rejected until backup/cleanup finishes or fails.                         |
-| `destroying`        | Chat DO via Sandbox SDK                          | Destruction is in progress; no more work or checkpoint updates should be admitted for that generation.                   |
-| `cleanup_failed`    | Chat DO bounded retry or subsequent user request | Lifetime destruction was not confirmed. Do not silently allocate a replacement.                                          |
+- **Six-hour lifetime:** any allocated state goes to `destroying`, without waiting for a fresh backup.
+- **Stop:** remain in `waiting_for_agent` until process exit is confirmed. An unconfirmed stop blocks new turns. A failed end-of-turn checkpoint is reported, but the stopped sandbox can still enter `waiting_for_user`.
+- **Idle cleanup fails:** return to `waiting_for_user`. **Lifetime destruction fails:** enter `cleanup_failed` and block replacement. Cleanup has at most three attempts; a later message can retry lifetime cleanup.
+- **Startup fails:** enter `waiting_for_user` only if cleanup confirms no active process. **Browser or relay disconnects:** no lifecycle change.
 
-### State invariants and identifiers
+Only `offline` and `waiting_for_user` normally admit a new turn. Turn outcome (`completed`, `cancelled`, `failed`, or `interrupted`) is separate from sandbox state.
 
-| Identifier/state                                   | Lifetime                                           | Purpose                                                                                                                     |
-| -------------------------------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| Conversation name `playground`                     | Across connections, turns and sandbox replacements | Selects the stable Chat DO and UI history.                                                                                  |
-| Sandbox `id`, `createdAt`, `phase`, `waitingSince` | One logical sandbox allocation                     | Fences stale callbacks and defines lifecycle policy. Allocation time precedes container startup.                            |
-| Run `id`, `messageId`, `sandboxId`, `startedAt`    | One attempted user turn                            | Associates launch, process, output and cancellation with one attempt. Only the latest run record is kept by this prototype. |
-| Run `status`                                       | Outcome of that attempt                            | `running`, `completed`, `cancelled`, `failed`, or `interrupted`. A failed run can coexist with a usable warm sandbox.       |
-| Run `stopReason`                                   | During/after interruption                          | `cancelled`, `interrupted`, or `expired`; distinguishes user Stop, recovery, and lifetime expiry.                           |
-| Native `threadId`                                  | Across turns while native session files survive    | Tells Codex which session to resume. It is not sufficient without the corresponding filesystem.                             |
-| Checkpoint `{ backup, threadId }`                  | Across sandbox replacements, until backup expiry   | Pairs an opaque restore handle with the native thread represented by that snapshot.                                         |
+### Identity and recovery
 
-There is no separately persisted `stopping` phase: the run remains active with a stop reason until exit is confirmed. The in-memory `runFinished` and interruption promises coordinate concurrent handlers; persisted state and scheduled callbacks are what remain after a DO restart.
-
-The generation UUID changes after intentional destruction. An unexpected cold restart may restore into the currently recorded generation; it does not extend that generation's absolute deadline. An idle callback includes both the generation ID and `waitingSince`. It acts only if both still match and the phase is still `waiting_for_user`.
-
-The launch claim is local to a surviving run directory. Together with admission guards it prevents common duplicate launches, but it is not a distributed exactly-once guarantee or a durable ledger of every historical request. Tools can have side effects that are not undone by restoring a snapshot.
+- **Conversation ID:** stable across connections and sandbox replacements; selects the Chat DO and UI history.
+- **Sandbox generation ID:** changes after intentional destruction. Timers check it, and idle timers also check `waitingSince`, so stale callbacks cannot affect a new sandbox or waiting period. Unexpected cold restarts do not reset the recorded lifetime.
+- **Run ID:** one attempted user turn. Admission checks and the runner's local launch claim prevent common duplicate launches, not arbitrary exactly-once side effects.
+- **Checkpoint + native thread ID:** restore together. A thread ID alone cannot recover a lost filesystem; UI history is stored separately.
 
 ## Sandbox lifecycle
 
