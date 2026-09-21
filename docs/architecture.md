@@ -53,7 +53,7 @@ flowchart TB
     UI -->|"HTTP: send / history / resume / cancel"| Relay
     Relay -->|"HTTP requests / WebSocket upgrade"| Router
     Router -->|"Route to named conversation"| Coordinator
-    Coordinator -->|"DO RPC: writeFile + startProcess"| SandboxAPI
+    Coordinator -->|"Sandbox SDK: writeFile / startProcess"| SandboxAPI
     Coordinator --- SQLite
     SandboxAPI -->|"Write input.json; run node /opt/run-codex.mjs"| Runner
     SandboxAPI <-->|"Backup / restore"| Backup
@@ -78,11 +78,23 @@ The Worker routes HTTP requests and WebSocket upgrades; it is not our per-messag
 
 **We drive Codex one turn at a time:**
 
-1. **Chat DO → Sandbox DO:** Sandbox SDK RPC calls write the prompt/thread ID to `input.json` and start `node /opt/run-codex.mjs <run-dir>`.
+1. **Chat DO → Sandbox DO:** Sandbox SDK calls write the prompt/thread ID to `input.json` and start `node /opt/run-codex.mjs <run-dir>`.
 2. **Runner → Codex:** the runner reads that file and calls the official SDK’s `startThread`/`resumeThread`, then `runStreamed(prompt)`. The SDK launches the native CLI, writes the prompt to its stdin, and closes stdin. Codex owns all model/tool iterations until the turn ends; the runner then exits.
 3. **Sandbox DO → Chat DO:** the Chat DO calls `streamProcessLogs(run.id)`. The returned stream carries buffered/live stdout in SSE log envelopes; `observeCodex` extracts JSONL and maps events for the UI.
 
-There is **no persistent stdin pipe between the DOs**. The input path is file + process RPC; stdin is local to the SDK’s native subprocess. The same warm sandbox and native session can span many runner processes.
+There is **no persistent stdin pipe between the DOs**. The input path is SDK file and process calls; stdin is local to the SDK’s native subprocess. The same warm sandbox and native session can span many runner processes.
+
+### Communication ownership
+
+| Connection                     | We implement                                                                                                               | Library / platform handles                                                                      |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Browser ↔ PL backend           | Express endpoints and AI SDK configuration                                                                                 | AI SDK HTTP requests and SSE encoding/decoding                                                  |
+| PL backend ↔ Chat DO           | Adapter opens the WebSocket, manages connection lifetime, forwards resume controls, and sends history/cancel HTTP requests | Cloudflare `WebSocketChatTransport` chat envelopes and chunk decoding                           |
+| Worker entry → Chat DO         | Call `routeAgentRequest`                                                                                                   | Cloudflare routing to the named DO                                                              |
+| Chat DO ↔ Sandbox DO/container | Call Sandbox SDK methods; consume returned log events                                                                      | SDK-managed communication, process control, files, and backups; no custom HTTP/socket transport |
+| Runner ↔ native Codex          | Call Codex SDK thread and streaming methods                                                                                | SDK-managed subprocess and stdin/stdout protocol                                                |
+
+The Sandbox SDK’s `parseSSEStream` helper unwraps process-log events. Our `CodexEvents` mapper translates their JSONL payload into AI SDK UI events. **We own the event translation, not the sandbox transport.**
 
 ### Code ownership
 
@@ -123,7 +135,7 @@ flowchart TB
     end
 
     Runner -->|"Redacted JSONL stdout"| Logs
-    Logs -->|"streamProcessLogs RPC returns process-log SSE"| Mapper
+    Logs -->|"Sandbox SDK: streamProcessLogs<br/>Process-log SSE"| Mapper
     Agent -->|"Established WebSocket: Cloudflare chat envelopes"| Adapter
     Relay -->|"Standard AI SDK UI Message Stream SSE"| UI
 
