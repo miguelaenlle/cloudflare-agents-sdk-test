@@ -16,7 +16,7 @@ This documents the current implementation: keep-alive, ten-minute waiting-state 
 
 ## Architecture
 
-Read top to bottom. **3, 4, and 5 are deployed together:** the Worker module exports the entry point, our `Chat` class, and the SDK’s `Sandbox` class; Wrangler registers their DO bindings and migrations. Each DO instance has its own identity, state, and lifetime. The grouping is a deployment boundary, not one process. The Linux container is a separate runtime.
+**One Worker deployment contains the entry point, Chat DO class, and Sandbox DO class.** DO instances have independent state and lifetimes; the Linux container runs separately.
 
 ```mermaid
 flowchart TB
@@ -78,7 +78,7 @@ The Worker routes HTTP requests and WebSocket upgrades; it is not our per-messag
 
 ### One turn: request and response
 
-Read downward through time: requests travel right, results return left. The initial Worker routing is omitted here. **The Chat DO launches and observes one turn; native Codex chooses and executes the model/tool steps.**
+**The Chat DO launches and observes each turn. Native Codex owns the model/tool loop.**
 
 ```mermaid
 sequenceDiagram
