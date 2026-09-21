@@ -16,17 +16,17 @@ This documents the current implementation: keep-alive, ten-minute waiting-state 
 
 ## Architecture
 
-Read top to bottom. The Worker entry point and both DO classes share a deployment, but have distinct runtime responsibilities.
+Read top to bottom. **3, 4, and 5 are deployed together:** the Worker module exports the entry point, our `Chat` class, and the SDK’s `Sandbox` class; Wrangler registers their DO bindings and migrations. Each DO instance has its own identity, state, and lifetime. The grouping is a deployment boundary, not one process. The Linux container is a separate runtime.
 
 ```mermaid
 flowchart TB
-    subgraph browser["1 · Browser — localhost:4315"]
+    subgraph browser["1 · Browser"]
         UI["React UI<br/>useChat + DefaultChatTransport"]
     end
-    subgraph backend["2 · PL webserver — localhost:4316"]
+    subgraph backend["2 · PL webserver"]
         Relay["Express HTTP endpoints<br/>Cloudflare provider adapter"]
     end
-    subgraph cloudflare["Cloudflare Worker deployment"]
+    subgraph cloudflare["One Worker deployment · separate runtime instances"]
         subgraph entry["3 · Worker entry point"]
             Router["Origin check + routeAgentRequest<br/>Routes HTTP requests and WebSocket upgrades"]
         end
@@ -39,7 +39,7 @@ flowchart TB
         end
     end
     subgraph container["6 · Linux sandbox container"]
-        Runner["Our per-turn Node runner<br/>Official Codex SDK: start / resume / runStreamed"]
+        Runner["New Node runner for each prompt<br/>Codex SDK: startThread / resumeThread<br/>then runStreamed(prompt)"]
         Codex["Native Codex harness<br/>Reasoning and tool loop"]
         Files[("/workspace<br/>Repository + native session")]
     end
@@ -53,11 +53,11 @@ flowchart TB
     UI -->|"HTTP: send / history / resume / cancel"| Relay
     Relay -->|"HTTP requests / WebSocket upgrade"| Router
     Router -->|"Route to named conversation"| Coordinator
-    Coordinator -->|"Sandbox SDK calls"| SandboxAPI
+    Coordinator -->|"DO RPC: writeFile + startProcess"| SandboxAPI
     Coordinator --- SQLite
-    SandboxAPI -->|"Prepare workspace and start runner"| Runner
+    SandboxAPI -->|"Write input.json; run node /opt/run-codex.mjs"| Runner
     SandboxAPI <-->|"Backup / restore"| Backup
-    Runner -->|"Launch native process; send prompt"| Codex
+    Runner -->|"SDK launches CLI and writes prompt to stdin"| Codex
     Codex <-->|"Read / edit / execute"| Files
     Codex <-->|"HTTPS model requests and responses"| Inference
 
@@ -74,7 +74,15 @@ flowchart TB
     linkStyle default stroke:#9ca3af
 ```
 
-The Worker routes HTTP requests and WebSocket upgrades; it is not our per-message relay after connection. The Chat DO calls the separate Sandbox DO through the Sandbox SDK. Model requests and tools run inside native Codex in the container.
+The Worker routes HTTP requests and WebSocket upgrades; it is not our per-message relay after connection.
+
+**We drive Codex one turn at a time:**
+
+1. **Chat DO → Sandbox DO:** Sandbox SDK RPC calls write the prompt/thread ID to `input.json` and start `node /opt/run-codex.mjs <run-dir>`.
+2. **Runner → Codex:** the runner reads that file and calls the official SDK’s `startThread`/`resumeThread`, then `runStreamed(prompt)`. The SDK launches the native CLI, writes the prompt to its stdin, and closes stdin. Codex owns all model/tool iterations until the turn ends; the runner then exits.
+3. **Sandbox DO → Chat DO:** the Chat DO calls `streamProcessLogs(run.id)`. The returned stream carries buffered/live stdout in SSE log envelopes; `observeCodex` extracts JSONL and maps events for the UI.
+
+There is **no persistent stdin pipe between the DOs**. The input path is file + process RPC; stdin is local to the SDK’s native subprocess. The same warm sandbox and native session can span many runner processes.
 
 ### Code ownership
 
@@ -115,7 +123,7 @@ flowchart TB
     end
 
     Runner -->|"Redacted JSONL stdout"| Logs
-    Logs -->|"Buffered and live process-log SSE"| Mapper
+    Logs -->|"streamProcessLogs RPC returns process-log SSE"| Mapper
     Agent -->|"Established WebSocket: Cloudflare chat envelopes"| Adapter
     Relay -->|"Standard AI SDK UI Message Stream SSE"| UI
 
