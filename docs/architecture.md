@@ -26,9 +26,10 @@ Outside this increment: PL authorization, multiple users/courses, approval-gated
 
 ## Architecture
 
-Read the horizontal diagram from left to right for a request and right to left for results. Each light-gray region is a distinct runtime or service. The two Durable Objects are separate objects in the same Worker deployment.
+Read the horizontal diagram from left to right for a request and right to left for results. Each dark-gray region is a distinct runtime or service. The two Durable Objects are separate objects in the same Worker deployment.
 
 ```mermaid
+%%{init: {"theme": "dark"}}%%
 flowchart LR
     subgraph browser["User browser · localhost:4315"]
         UI["React UI<br/>AI SDK useChat + DefaultChatTransport"]
@@ -79,14 +80,14 @@ flowchart LR
     Coordinator <--> SQLite
     SandboxAPI <-->|"backup / restore / opaque handle"| Backup
 
-    style browser fill:#f3f4f6,stroke:#9ca3af,color:#111827
-    style backend fill:#f3f4f6,stroke:#9ca3af,color:#111827
-    style entry fill:#f3f4f6,stroke:#9ca3af,color:#111827
-    style chat fill:#f3f4f6,stroke:#9ca3af,color:#111827
-    style control fill:#f3f4f6,stroke:#9ca3af,color:#111827
-    style container fill:#f3f4f6,stroke:#9ca3af,color:#111827
-    style model fill:#f3f4f6,stroke:#9ca3af,color:#111827
-    style storage fill:#f3f4f6,stroke:#9ca3af,color:#111827
+    style browser fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style backend fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style entry fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style chat fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style control fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style container fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style model fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style storage fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
 ```
 
 The browser only calls the PL-style backend. In local development, Vite proxies `/api` from port 4315 to Express on port 4316. Cloudflare does not serve the page.
@@ -151,6 +152,7 @@ This is the common lifecycle model across browser, backend, Chat DO, Sandbox DO 
 `offline` means `state.sandbox` is absent. The other states correspond to `SandboxLifecycle.phase` in [codex.ts](../apps/agent/codex.ts). Connection state and run outcome are separate dimensions, described below.
 
 ```mermaid
+%%{init: {"theme": "dark"}}%%
 stateDiagram-v2
     direction LR
     [*] --> offline

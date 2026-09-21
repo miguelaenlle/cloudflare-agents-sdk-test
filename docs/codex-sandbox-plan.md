@@ -5,6 +5,7 @@ This is the short implementation overview. See [Architecture and lifecycle](arch
 Implemented locally. Cloudflare deployment and a real Codex/container/R2 smoke test remain user-run; see [setup and acceptance steps](../README.md).
 
 ```mermaid
+%%{init: {"theme": "dark"}}%%
 flowchart TD
     UI[Local React UI: AI SDK useChat] <-->|HTTP + standard AI SDK SSE| PL[Ephemeral PL-style Express relay]
     PL <-->|Cloudflare provider adapter| Entry[Worker: routing]
