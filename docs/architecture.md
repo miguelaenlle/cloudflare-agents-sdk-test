@@ -26,59 +26,55 @@ Outside this increment: PL authorization, multiple users/courses, approval-gated
 
 ## Architecture
 
-Read the horizontal diagram from left to right for a request and right to left for results. Each dark-gray region is a distinct runtime or service. The two Durable Objects are separate objects in the same Worker deployment.
+### 1. Components and execution
+
+Read from top to bottom. Each dark-gray region is a runtime or service; the Worker entry point and both Durable Objects belong to one Cloudflare Worker deployment. Storage branches sit beside the components that use them. The response conversion pipeline is shown separately below.
 
 ```mermaid
-flowchart LR
-    subgraph browser["User browser · localhost:4315"]
-        UI["React UI<br/>AI SDK useChat + DefaultChatTransport"]
+flowchart TB
+    subgraph browser["1 · Browser — localhost:4315"]
+        UI["React UI<br/>useChat + DefaultChatTransport"]
     end
-    subgraph backend["PL-style webserver · localhost:4316"]
-        Relay["Express routes<br/>request validation + SSE response"]
-        Adapter["Cloudflare provider adapter<br/>WebSocketChatTransport"]
+    subgraph backend["2 · PL webserver — localhost:4316"]
+        Relay["Express HTTP endpoints<br/>Cloudflare provider adapter"]
     end
-    subgraph entry["Public Cloudflare Worker"]
-        Router["fetch entry point<br/>origin check + routeAgentRequest"]
+    subgraph cloudflare["Cloudflare Worker deployment"]
+        subgraph entry["3 · Worker entry point"]
+            Router["Origin check + routeAgentRequest<br/>Routes HTTP requests and WebSocket upgrades"]
+        end
+        subgraph chat["4 · Chat Durable Object — conversation ID"]
+            Coordinator["AIChatAgent + our coordinator<br/>Admit turns, stop, checkpoint, manage lifecycle"]
+            SQLite[("DO SQLite<br/>History, run state, replay, schedules")]
+        end
+        subgraph control["5 · Sandbox Durable Object — generation ID"]
+            SandboxAPI["Sandbox SDK<br/>Process, filesystem and container control"]
+        end
     end
-    subgraph chat["Chat Durable Object · playground"]
-        Coordinator["AIChatAgent + our Chat class<br/>turn admission, stop, lifecycle"]
-        Mapper["observeCodex + CodexEvents<br/>process output → AI SDK chunks"]
-        SQLite[("Per-object SQLite<br/>UI history, coordinator state,<br/>stream replay and schedules")]
+    subgraph container["6 · Linux sandbox container"]
+        Runner["Our per-turn Node runner<br/>Official Codex SDK: start / resume / runStreamed"]
+        Codex["Native Codex harness<br/>Reasoning and tool loop"]
+        Files[("/workspace<br/>Repository + native session")]
     end
-    subgraph control["Sandbox Durable Object · generation UUID"]
-        SandboxAPI["Cloudflare Sandbox SDK<br/>container, process, file and backup APIs"]
-    end
-    subgraph container["Linux sandbox container"]
-        Runner["Our Node runner<br/>official Codex SDK"]
-        Codex["Native Codex harness<br/>model ↔ tool loop"]
-        Files[("Workspace + native session<br/>/workspace")]
-    end
-    subgraph model["OpenAI"]
-        Inference["Model inference API"]
+    subgraph model["7 · OpenAI"]
+        Inference["Model inference"]
     end
     subgraph storage["Cloudflare R2"]
-        Backup[("Workspace backup archives")]
+        Backup[("Workspace checkpoints")]
     end
 
-    UI -->|"1 · POST JSON / history / resume / cancel"| Relay
-    Relay --> Adapter
-    Adapter -->|"2 · WS upgrade or HTTP request"| Router
-    Router -->|"3 · route by class and conversation name"| Coordinator
-    Coordinator -->|"4 · prepare, launch, stop, checkpoint"| SandboxAPI
-    SandboxAPI -->|"5 · process + file operations"| Runner
-    Runner -->|"6 · startThread / resumeThread + runStreamed"| Codex
-    Codex <-->|"7 · HTTPS model requests and responses"| Inference
-    Codex <-->|"local tools + native session writes"| Files
-    Codex -->|"native JSONL, parsed by SDK"| Runner
-    Runner -->|"8 · redacted JSONL stdout"| SandboxAPI
-    SandboxAPI -->|"9 · buffered/live process-log SSE"| Mapper
-    Mapper -->|"10 · UIMessageChunk objects"| Coordinator
-    Coordinator -->|"11 · established WebSocket: chat envelopes"| Adapter
-    Adapter -->|"12 · UIMessageChunk stream"| Relay
-    Relay -->|"13 · AI SDK UI Message Stream SSE"| UI
-    Coordinator <--> SQLite
-    SandboxAPI <-->|"backup / restore / opaque handle"| Backup
+    UI -->|"HTTP: send / history / resume / cancel"| Relay
+    Relay -->|"HTTP requests / WebSocket upgrade"| Router
+    Router -->|"Route to named conversation"| Coordinator
+    Coordinator -->|"Sandbox SDK calls"| SandboxAPI
+    Coordinator --- SQLite
+    SandboxAPI -->|"Prepare workspace and start runner"| Runner
+    SandboxAPI <-->|"Backup / restore"| Backup
+    Runner -->|"Launch native process; send prompt"| Codex
+    Codex <-->|"Read / edit / execute"| Files
+    Codex <-->|"HTTPS model requests and responses"| Inference
 
+    classDef default fill:#374151,stroke:#9ca3af,color:#f9fafb
+    style cloudflare fill:#111827,stroke:#6b7280,color:#f3f4f6
     style browser fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
     style backend fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
     style entry fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
@@ -87,6 +83,49 @@ flowchart LR
     style container fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
     style model fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
     style storage fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    linkStyle default stroke:#9ca3af
+```
+
+### 2. Results back to the browser
+
+This is the return path through the same components, not a second set of services. The public Worker entry point is omitted because it does not run our per-message forwarding loop after the WebSocket is established.
+
+```mermaid
+flowchart TB
+    subgraph container["Linux sandbox container"]
+        Native["Native Codex events"]
+        Runner["Official SDK parses native JSONL<br/>Our runner redacts and serializes events"]
+        Native -->|"stdout JSONL"| Runner
+    end
+    subgraph control["Sandbox Durable Object"]
+        Logs["Sandbox SDK buffers and streams process logs"]
+    end
+    subgraph chat["Chat Durable Object"]
+        Mapper["observeCodex + CodexEvents<br/>Parse events; map text and tools"]
+        Agent["AIChatAgent<br/>Persist UI messages and provide stream replay"]
+        Mapper -->|"UIMessageChunk objects"| Agent
+    end
+    subgraph backend["PL webserver"]
+        Adapter["Cloudflare WebSocketChatTransport<br/>Decode chat envelopes into UIMessageChunk objects"]
+        Relay["AI SDK encodes the HTTP SSE response"]
+        Adapter --> Relay
+    end
+    subgraph browser["Browser"]
+        UI["AI SDK useChat<br/>Assemble messages and render the transcript"]
+    end
+
+    Runner -->|"Redacted JSONL stdout"| Logs
+    Logs -->|"Buffered and live process-log SSE"| Mapper
+    Agent -->|"Established WebSocket: Cloudflare chat envelopes"| Adapter
+    Relay -->|"Standard AI SDK UI Message Stream SSE"| UI
+
+    classDef default fill:#374151,stroke:#9ca3af,color:#f9fafb
+    style container fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style control fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style chat fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style backend fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    style browser fill:#1f2937,stroke:#9ca3af,color:#f3f4f6
+    linkStyle default stroke:#9ca3af
 ```
 
 The browser only calls the PL-style backend. In local development, Vite proxies `/api` from port 4315 to Express on port 4316. Cloudflare does not serve the page.
