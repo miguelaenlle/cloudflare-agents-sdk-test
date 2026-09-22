@@ -4,7 +4,6 @@ import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, validateUIMessages, type UIMessage } from "ai";
 import {
   CANCEL_API,
-  STEER_API,
   CHAT_API,
   CONVERSATION_ID,
   HISTORY_API,
@@ -28,25 +27,7 @@ async function loadHistory(signal?: AbortSignal): Promise<UIMessage[]> {
   return validateUIMessages({ messages });
 }
 
-type SteeringNote = { id: string; runId: string; text: string };
-
-function runIdOf(message: UIMessage | undefined) {
-  const metadata = message?.metadata;
-  return metadata &&
-    typeof metadata === "object" &&
-    "runId" in metadata &&
-    typeof metadata.runId === "string"
-    ? metadata.runId
-    : undefined;
-}
-
-function Transcript({
-  messages,
-  steeringNotes,
-}: {
-  messages: UIMessage[];
-  steeringNotes: SteeringNote[];
-}) {
+function Transcript({ messages }: { messages: UIMessage[] }) {
   return (
     <section aria-label="Conversation">
       {messages.length === 0 && <p>No messages yet.</p>}
@@ -71,13 +52,6 @@ function Transcript({
             }
             return null;
           })}
-          {steeringNotes
-            .filter((note) => note.runId === runIdOf(message))
-            .map((note) => (
-              <p key={note.id}>
-                <strong>Steering:</strong> {note.text}
-              </p>
-            ))}
         </article>
       ))}
     </section>
@@ -87,16 +61,15 @@ function Transcript({
 function App({ initialMessages }: { initialMessages: UIMessage[] }) {
   const [input, setInput] = useState("");
   const [cancelError, setCancelError] = useState("");
-  const [steering, setSteering] = useState(false);
-  const [steeringNotes, setSteeringNotes] = useState<SteeringNote[]>([]);
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState("");
   const [cancelling, setCancelling] = useState(false);
-  const { messages, sendMessage, status, error, setMessages, resumeStream } =
-    useChat({
-      id: CONVERSATION_ID,
-      messages: initialMessages,
-      transport,
-      resume: true,
-    });
+  const { messages, stop, status, error, setMessages, resumeStream } = useChat({
+    id: CONVERSATION_ID,
+    messages: initialMessages,
+    transport,
+    resume: true,
+  });
   const busy = status === "submitted" || status === "streaming";
   // Reattach through a replacement webserver after a broken SSE connection.
   useEffect(() => {
@@ -134,41 +107,40 @@ function App({ initialMessages }: { initialMessages: UIMessage[] }) {
     }
   }
 
-  const runId = runIdOf(
-    messages.findLast((message) => message.role === "assistant"),
-  );
-
-  async function steerTurn() {
-    if (!runId || !input.trim()) return;
-    const text = input.trim();
-    const note = { id: crypto.randomUUID(), runId, text };
-    setSteering(true);
-    setCancelError("");
+  async function send(text: string) {
+    if (!text.trim() || sending) return;
+    setSending(true);
+    setSendError("");
+    // Replace this subscriber, not the agent turn. Replay also picks up messages from other tabs.
+    await stop();
     try {
-      const response = await fetch(STEER_API, {
+      const response = await fetch(CHAT_API, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(note),
+        body: JSON.stringify({ id: crypto.randomUUID(), text }),
       });
       if (!response.ok)
         throw new Error(
-          "Steering was not confirmed. Reconnect to check history before retrying.",
+          "Message acceptance was not confirmed. Check history before retrying.",
         );
-      setSteeringNotes((notes) => [...notes, note]);
       setInput("");
     } catch (error) {
-      setCancelError(error instanceof Error ? error.message : String(error));
+      setSendError(error instanceof Error ? error.message : String(error));
     } finally {
-      setSteering(false);
+      try {
+        setMessages(await loadHistory());
+        // Submission is complete; stream consumption continues independently.
+        void resumeStream();
+      } catch (error) {
+        setSendError(error instanceof Error ? error.message : String(error));
+      }
+      setSending(false);
     }
   }
 
   function submitMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const text = input.trim();
-    if (!text || busy) return;
-    void sendMessage({ text });
-    setInput("");
+    void send(input.trim());
   }
 
   return (
@@ -181,10 +153,11 @@ function App({ initialMessages }: { initialMessages: UIMessage[] }) {
         {status === "error" ? "Reconnecting…" : busy ? "Working…" : "Ready"}
       </p>
 
-      <Transcript messages={messages} steeringNotes={steeringNotes} />
+      <Transcript messages={messages} />
 
       {error && <p role="alert">{error.message}</p>}
       {cancelError && <p role="alert">{cancelError}</p>}
+      {sendError && <p role="alert">{sendError}</p>}
       <form onSubmit={submitMessage}>
         <label htmlFor="message">Message</label>
         <textarea
@@ -197,14 +170,7 @@ function App({ initialMessages }: { initialMessages: UIMessage[] }) {
           <button type="button" onClick={() => window.location.reload()}>
             Reconnect / refresh history
           </button>
-          <button disabled={busy || !input.trim()}>Send</button>
-          <button
-            type="button"
-            disabled={!busy || !runId || steering || !input.trim()}
-            onClick={() => void steerTurn()}
-          >
-            Steer current turn
-          </button>
+          <button disabled={sending || !input.trim()}>Send</button>
           <button
             type="button"
             disabled={cancelling}
@@ -214,12 +180,8 @@ function App({ initialMessages }: { initialMessages: UIMessage[] }) {
           </button>
           <button
             type="button"
-            disabled={busy}
-            onClick={() =>
-              void sendMessage({
-                text: DEMO_PROMPT,
-              })
-            }
+            disabled={sending}
+            onClick={() => void send(DEMO_PROMPT)}
           >
             Run one-minute task
           </button>

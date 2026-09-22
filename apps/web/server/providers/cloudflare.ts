@@ -55,8 +55,8 @@ export function createCloudflareProvider(workerUrl: URL): ChatProvider {
       if (Array.isArray(messages) && messages.length === 0) return [];
       return validateUIMessages({ messages });
     },
-    async steer(input, signal) {
-      await request("steer", "POST", signal, input);
+    async send(input, signal) {
+      await request("message", "POST", signal, input);
     },
     async cancel(signal) {
       await request("cancel", "POST", signal);
@@ -145,18 +145,6 @@ async function connectToAgent(
 
   return {
     close,
-    async send(messages) {
-      const stream = await transport.sendMessages({
-        chatId: CONVERSATION_ID,
-        messages,
-        trigger: "submit-message",
-        abortSignal: lifetime.signal,
-      });
-      // End the HTTP stream when its upstream socket disappears, so the UI can resume.
-      return stream.pipeThrough(new TransformStream(), {
-        signal: lifetime.signal,
-      });
-    },
     async resume() {
       const stream = await transport.reconnectToStream({
         chatId: CONVERSATION_ID,
