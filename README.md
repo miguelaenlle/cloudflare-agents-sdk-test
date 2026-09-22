@@ -29,7 +29,7 @@ Workspace + native session → R2 checkpoints
 | `apps/agent/sandbox.ts`, `outbound.ts` | Network allowlist and OpenAI credential injection                          |
 | `apps/agent/protocol.ts`               | Generated types from pinned Codex 0.155.0; do not hand-edit                |
 | `apps/web/`                            | Barebones UI, stateless relay, replaceable provider adapter                |
-| `packages/chat-contract/`              | Provider-independent routes, types, steering validation                    |
+| `packages/chat-contract/`              | Provider-independent routes, types, message validation                     |
 
 The per-turn runner and Codex TypeScript SDK are removed. Prompts/steering/interrupts use app-server RPC; chat delivery no longer parses stdout. Process logs are diagnostic only.
 
@@ -87,7 +87,7 @@ Open **http://localhost:4315**. Restart the backend after changing `.env.local`.
 1. Ask **Create hello.txt containing a greeting, then print it with a shell command.** Verify streamed text and tool output.
 2. Ask **What did you put in hello.txt?** The same sandbox process and native thread should be reused.
 3. Click **Run one-minute task**. After work starts, restart the local backend or close the browser. Reconnect to see the saved/live result.
-4. During a turn, enter a correction and click **Steer current turn**. It adds input to that native turn; it does not restart the process. Reopen history to verify the accepted correction was saved.
+4. During a turn, enter a correction and click **Send** again. The DO steers the active turn, or starts a new turn if it just finished. No run ID or separate steering action is required. Verify the correction in history.
 5. Click **Stop**. Wait for interruption confirmation; the app-server stays running and the next prompt resumes the thread. Closing the page alone never cancels work.
 6. Wait ten minutes in `waiting_for_user`, then send another prompt. Confirm destruction and restoration of both `hello.txt` and native context from R2.
 7. Verify the sliding six-hour user-interaction deadline. An accepted prompt/steer/active-turn Stop resets it; model/tool output and reconnects do not. There is no absolute sandbox-age cap.
@@ -121,13 +121,16 @@ On upgrade from the old runner, stop old work first; the runtime does not migrat
 
 ## Web interface
 
-| Endpoint                          | Behavior                                          |
-| --------------------------------- | ------------------------------------------------- |
-| `POST /api/chat`                  | Submit messages; AI SDK UI Message Stream SSE     |
-| `GET /api/chat/history`           | Saved `UIMessage[]`                               |
-| `GET /api/chat/playground/stream` | Replay/attach to current output, or 204           |
-| `POST /api/chat/cancel`           | Explicit interruption                             |
-| `POST /api/chat/steer`            | `{ id, runId, text }`; steer only that active run |
+| Endpoint                          | Behavior                                           |
+| --------------------------------- | -------------------------------------------------- |
+| `POST /api/chat`                  | `{ id, text }`; start or steer; 204 acknowledgment |
+| `GET /api/chat/history`           | Saved `UIMessage[]`                                |
+| `GET /api/chat/playground/stream` | Replay/attach to current output, or 204            |
+| `POST /api/chat/cancel`           | Explicit interruption                              |
+
+Send submits one message through HTTP; output is attached separately through the existing AI SDK resume stream. The UI detaches its previous subscription, sends, reloads history, and reattaches. Detaching never stops Codex. This deliberately replays output on each Send instead of maintaining two competing streams or a separate steering transcript.
+
+The DO serializes message/Stop commands and chooses start versus steer from authoritative state. A confirmed RPC rejection after the turn ends falls back to a new turn. A timeout or lost acknowledgment never does: acceptance may already have happened. Retrying an already persisted message ID does not execute it again; uncertain, unpersisted steering still requires checking history/native state before a manual retry.
 
 Replacing Cloudflare changes the provider adapter and agent deployment; these browser routes/events can stay. Persistent data needs migration.
 
@@ -141,7 +144,7 @@ pnpm --filter @playground/agent test:native
 pnpm format:check
 ```
 
-`pnpm test` uses real AIChatAgent/Worker and relay code against a simulated sandbox. It covers reconnection, detached completion, native-process reuse, steering persistence, Stop, lost start acknowledgment, restore, stale alarms, sliding deadlines, and cleanup failures. `test:native` runs the pinned native app-server with a fake local Responses endpoint; it needs no API key, Docker, or paid inference.
+`pnpm test` uses real AIChatAgent/Worker and relay code against a simulated sandbox. It covers reconnection, detached completion, native-process reuse, unified send, steering persistence, completion-race fallback, lost steering acknowledgment without replay, Stop, lost start acknowledgment, restore, stale alarms, sliding deadlines, and cleanup failures. `test:native` runs the pinned native app-server with a fake local Responses endpoint; it needs no API key, Docker, or paid inference.
 
 Regenerate protocol types after intentionally updating the Codex pin:
 

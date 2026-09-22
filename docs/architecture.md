@@ -43,7 +43,7 @@ flowchart TB
     UI <-->|"HTTP requests / Vercel AI SDK SSE and JSON"| Relay
     Relay <-->|"HTTP requests / WebSocket upgrade"| Router
     Router <-->|"Cloudflare routing / upgrade response"| Coordinator
-    Relay <-->|"Established WebSocket: prompts / UI events"| Coordinator
+    Relay <-->|"Established WebSocket: resume / UI events"| Coordinator
     Coordinator <-->|"Cloudflare Sandbox SDK: operations + WebSocket connection"| SandboxAPI
     SandboxAPI <-->|"Cloudflare routing: app-server commands / events"| Codex
     Coordinator <-->|"Persist / load"| SQLite
@@ -65,7 +65,7 @@ flowchart TB
     linkStyle default stroke:#9ca3af
 ```
 
-Wrangler registers the exported DO classes and bindings. PL connects to `/agents/chat/playground`; `routeAgentRequest` selects that named Chat DO, and Cloudflare instantiates it as needed. `AIChatAgent` receives chat messages, persists history/replay in the DO's SQLite, and invokes our `onChatMessage`. The Worker routes the initial request/upgrade; we do not relay every WebSocket frame through another Worker handler.
+Wrangler registers the exported DO classes and bindings. PL connects to `/agents/chat/playground`; `routeAgentRequest` selects that named Chat DO, and Cloudflare instantiates it as needed. Our HTTP message handler chooses start versus steer. For a new turn it calls `AIChatAgent.saveMessages`, which persists history/replay in the DO's SQLite and invokes our `onChatMessage`. The Worker routes the initial request/upgrade; we do not relay every WebSocket frame through another Worker handler.
 
 ### One turn: commands and responses
 
@@ -81,13 +81,17 @@ sequenceDiagram
     participant Auth as Sandbox outbound handler
     participant Model as OpenAI
 
-    UI->>PL: POST prompt: UIMessage[]
-    PL->>Chat: Cloudflare chat WebSocket transport
+    UI->>PL: POST /api/chat: message id + text
+    PL->>Chat: HTTP /message: decide start or steer
     Chat->>Sandbox: CF Sandbox SDK: restore and startProcess if cold
     Chat->>Sandbox: CF Sandbox SDK: wsConnect on private port 4500
     Sandbox-->>Chat: Cloudflare-routed WebSocket to app-server
     Chat->>Codex: JSON-RPC initialize, then initialized
     Chat->>Codex: thread/start or thread/resume, then turn/start
+    Chat-->>PL: Accepted after native start acknowledgment
+    PL-->>UI: HTTP 204
+    UI->>PL: GET history, then GET resume stream
+    PL->>Chat: Cloudflare WebSocket resume transport
     loop Native model and tool iterations
         Codex->>Auth: HTTPS Responses request without API key
         Auth->>Model: Inject Worker-secret Authorization
@@ -98,10 +102,16 @@ sequenceDiagram
         Chat-->>PL: AIChatAgent chat envelopes
         PL-->>UI: Standard AI SDK SSE
     end
-    opt User steers or stops
-        UI->>PL: POST steer or cancel
-        PL->>Chat: HTTP control request
-        Chat->>Codex: turn/steer or turn/interrupt
+    opt User sends another message while working
+        UI->>PL: Same POST /api/chat: message id + text
+        PL->>Chat: Same HTTP /message
+        Chat->>Codex: turn/steer with current native turn ID
+        Chat-->>UI: Acknowledge through PL; UI reloads history and reattaches
+    end
+    opt User stops
+        UI->>PL: POST /api/chat/cancel
+        PL->>Chat: HTTP /cancel
+        Chat->>Codex: turn/interrupt
     end
     Codex-->>Chat: turn/completed with terminal status
     Chat->>Sandbox: CF Sandbox SDK: checkpoint workspace
@@ -114,12 +124,24 @@ The diagram's Chat ↔ Codex arrows use the socket returned by Cloudflare's Sand
 
 | Surface                                                                                           | Our code                                                       | Delegated                                                        |
 | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------- |
-| [Browser](../apps/web/client/app.tsx)                                                             | Small UI, history/reconnect, Stop/steer                        | AI SDK message state and SSE                                     |
+| [Browser](../apps/web/client/app.tsx)                                                             | Small UI, submit/reattach, history/reconnect, Stop             | AI SDK message state and SSE                                     |
 | [PL relay](../apps/web/server/server.ts) / [provider](../apps/web/server/providers/cloudflare.ts) | Routes, validation, connection lifetime                        | Express, Cloudflare chat transport, AI SDK SSE                   |
 | [Chat DO](../apps/agent/agent.ts)                                                                 | Turn admission, durable deadlines, checkpoints, reconciliation | AIChatAgent history/replay, Agents scheduling                    |
 | [Sandbox bridge](../apps/agent/codex.ts)                                                          | Start/reuse process, connect, backup/restore calls             | Cloudflare Sandbox SDK                                           |
 | [App-server client](../apps/agent/app-server.ts) / [mapper](../apps/agent/codex-events.ts)        | Request IDs, notifications → UI events                         | Generated native protocol types; Codex thread/turn and tool loop |
 | [Sandbox policy](../apps/agent/sandbox.ts) / [outbound handler](../apps/agent/outbound.ts)        | Allowed hosts and credential injection                         | Cloudflare outbound interception                                 |
+
+## Unified message submission
+
+`POST /api/chat` accepts `{ id, text }` and acknowledges with 204. The message ID is client-generated; the client does not supply a run ID or choose start versus steer. Express forwards it to the Chat DO's HTTP `/message` route. The DO serializes these control operations with Stop, independently of the long-running response.
+
+- With a live nonterminal turn, deliver `turn/steer` and persist the accepted user message.
+- With no active turn, call `saveMessages` to run a new library-managed response; acknowledge once Codex accepts `turn/start`.
+- If steering is explicitly rejected and the native turn is confirmed terminal, wait for the old turn's checkpoint/transcript finalization and start a new turn with that message.
+- A disconnect or timeout is an uncertain result, not evidence of rejection. Do not fall back to `turn/start` or automatically resend.
+- An already persisted message ID is acknowledged without executing again. This is not an exactly-once guarantee across native acceptance and DO persistence; an uncertain steering request needs reconciliation before a manual retry.
+
+Output uses `GET /api/chat/playground/stream` and the existing Cloudflare WebSocket resume adapter. The frontend still uses `useChat`/`DefaultChatTransport` to assemble AI SDK events, but owns the small HTTP submit action. On Send, it detaches its current subscriber, submits, reloads history, and resumes the stream. Codex keeps working during detachment. Replaying on each Send avoids maintaining separate steering notes or simultaneous streams that update the same assistant message.
 
 ## Commands we run
 
@@ -207,7 +229,7 @@ No OpenAI-key redaction pipeline is needed because the key is never sent into th
 
 ## Scope and verification
 
-Two deployments: `apps/web` and `apps/agent`; the shared chat contract is source code, not a service. Preserve history/send/resume/cancel/steer and AI SDK events when replacing Cloudflare; replace the provider adapter and migrate state.
+Two deployments: `apps/web` and `apps/agent`; the shared chat contract is source code, not a service. Preserve history/send/resume/cancel and AI SDK events when replacing Cloudflare; replace the provider adapter and migrate state.
 
 - Trusted disposable prototype: one shared conversation, no user authentication/approval UI. Origin checks are not authorization.
 - Two-window synchronization remains a gap. Course checkout/push_sync, previews, usage accounting, and checkpoint-frequency optimization are deferred.

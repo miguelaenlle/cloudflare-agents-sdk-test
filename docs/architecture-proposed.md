@@ -5,7 +5,7 @@ The proposal is now implemented in this branch. [Current architecture and diagra
 | Proposed change                       | Implementation                                                                                                         |
 | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | One Codex app-server per warm sandbox | Pinned native CLI, private CF Sandbox SDK WebSocket; process survives turns and socket disconnects                     |
-| Steering and Stop                     | `turn/steer` / `turn/interrupt`, correlated with native IDs; small controls in the existing UI                         |
+| Steering and Stop                     | One Send operation selects `turn/start` or `turn/steer` in the DO; Stop remains explicit via `turn/interrupt`          |
 | No OpenAI key in the container        | Sandbox outbound handler injects the Worker secret for allowed HTTPS Responses requests                                |
 | Remove runner and stdout transport    | Removed per-turn Node runner, SDK runtime dependency, input/result files, cancel watcher, and redaction pipeline       |
 | `keepAlive: false`                    | Set with CF `sleepAfter: "6h"`; control socket closes between turns                                                    |
