@@ -12,7 +12,8 @@
     "build": "pnpm --filter @playground/web build",
     "typecheck": "pnpm -r typecheck",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "test": "pnpm --filter @playground/agent test"
   },
   "devDependencies": {
     "prettier": "^3.9.7",
