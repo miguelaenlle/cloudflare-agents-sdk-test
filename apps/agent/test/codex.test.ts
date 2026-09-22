@@ -177,7 +177,7 @@ test("local backup uses the SDK binding path without changing production default
       dir: "/workspace",
       localBucket,
       ttl: 30 * 24 * 60 * 60,
-      excludes: ["codex/auth.json", "codex/log", "runs"],
+      excludes: ["auth.json"],
     })),
   );
 });
