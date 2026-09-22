@@ -6,8 +6,8 @@ import {
   createUIMessageStreamResponse,
   type UIMessageChunk,
 } from "ai";
-import { steerRequestSchema } from "@playground/chat-contract";
-import { AppServer, within } from "./app-server.ts";
+import { sendRequestSchema, type SendRequest } from "@playground/chat-contract";
+import { AppServer, AppServerError, within } from "./app-server.ts";
 import { Sandbox } from "./sandbox.ts";
 import { CodexEvents } from "./codex-events.ts";
 import {
@@ -45,9 +45,15 @@ const interruptedMessage =
 
 export class Chat extends AIChatAgent<Env, CodexState> {
   initialState: CodexState = {};
-  private active?: { client: AppServer; completed: Promise<Turn> };
+  private active?: {
+    client: AppServer;
+    completed: Promise<Turn>;
+    terminal: boolean;
+  };
+  private controlTail: Promise<unknown> = Promise.resolve();
+  private chatTask?: Promise<void>;
+  private acceptance?: { resolve(): void; reject(error: unknown): void };
   private turnInProgress = false;
-  private controlPending = false;
   private recovery?: Promise<void>;
 
   protected now() {
@@ -99,88 +105,124 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     const path = new URL(request.url).pathname;
     if (
       request.method !== "POST" ||
-      (!path.endsWith("/cancel") && !path.endsWith("/steer"))
+      (!path.endsWith("/cancel") && !path.endsWith("/message"))
     )
       return super.onRequest(request);
-    if (this.controlPending)
-      return Response.json(
-        { error: "A control request is already pending." },
-        { status: 409 },
+    let input: SendRequest | undefined;
+    if (path.endsWith("/message")) {
+      const parsed = sendRequestSchema.safeParse(
+        await request.json().catch(() => null),
       );
-    this.controlPending = true;
+      if (!parsed.success)
+        return Response.json(
+          { error: "Expected a message ID and nonempty text." },
+          { status: 400 },
+        );
+      input = parsed.data;
+    }
+    // Serialize short control operations, not whole agent turns. The DO decides start vs. steer.
+    const operation = this.controlTail.then(() =>
+      input ? this.send(input) : this.cancel(),
+    );
+    this.controlTail = operation.catch(() => {});
     try {
-      const run = this.state.run;
-      if (path.endsWith("/steer")) {
-        const parsed = steerRequestSchema.safeParse(await request.json());
-        if (!parsed.success)
-          return Response.json(
-            { error: "Invalid steering request." },
-            { status: 400 },
-          );
-        const input = parsed.data;
-        if (
-          run?.status !== "running" ||
-          run.id !== input.runId ||
-          !run.turnId ||
-          !run.threadId ||
-          !this.active
-        ) {
-          return Response.json(
-            {
-              error:
-                "That turn is no longer available for steering. Send a new message.",
-            },
-            { status: 409 },
-          );
-        }
-        if (this.messages.some((message) => message.id === input.id))
-          return new Response(null, { status: 204 });
-        this.ensureUsable(run.sandboxId);
-        await this.active.client.request("turn/steer", {
+      await operation;
+      return new Response(null, { status: 204 });
+    } catch (error) {
+      return Response.json({ error: messageOf(error) }, { status: 503 });
+    }
+  }
+
+  private async send(input: SendRequest) {
+    if (this.messages.some((message) => message.id === input.id)) return;
+    const message = {
+      id: input.id,
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: input.text }],
+    };
+    const run = this.state.run;
+    const active = this.active;
+    if (active && !active.terminal && run?.threadId && run.turnId) {
+      this.ensureUsable(run.sandboxId);
+      let steered = false;
+      try {
+        await active.client.request("turn/steer", {
           threadId: run.threadId,
           expectedTurnId: run.turnId,
           clientUserMessageId: input.id,
           input: [{ type: "text", text: input.text, text_elements: [] }],
         });
-        await this.interaction();
-        await this.persistMessages([
-          ...this.messages,
-          {
-            id: input.id,
-            role: "user",
-            parts: [{ type: "text", text: input.text }],
-          },
-        ]);
-        return new Response(null, { status: 204 });
-      }
-      if (run?.status === "running") {
-        this.ensureUsable(run.sandboxId);
-        const active = this.active;
-        if (active && run.threadId && run.turnId) {
-          await active.client.request("turn/interrupt", {
+        steered = true;
+      } catch (error) {
+        // Only a rejected RPC plus a confirmed terminal turn allows start instead.
+        // A timeout/disconnect can hide acceptance and must never resubmit the message.
+        if (!(error instanceof AppServerError)) throw error;
+        if (!active.terminal) {
+          const { thread } = await active.client.request("thread/read", {
             threadId: run.threadId,
-            turnId: run.turnId,
+            includeTurns: true,
           });
-          await this.interaction();
-          await within(
-            active.completed,
-            5_000,
-            "Stop is unconfirmed. Another turn remains blocked.",
-          );
-        } else if (this.turnInProgress) {
-          return Response.json(
-            { error: "Codex is still starting. Try Stop again shortly." },
-            { status: 409 },
-          );
-        } else {
-          await this.reconcile();
+          const turn = thread.turns.find((turn) => turn.id === run.turnId);
+          if (!turn || turn.status === "inProgress") throw error;
         }
       }
-      return new Response(null, { status: 204 });
-    } catch (error) {
-      return Response.json({ error: messageOf(error) }, { status: 503 });
+      if (steered) {
+        await this.persistMessages([...this.messages, message]);
+        await this.interaction();
+        return;
+      }
+    }
+    // Finish checkpoint/transcript persistence before the next turn can own the stream.
+    await this.chatTask;
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const accepted = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    this.acceptance = { resolve, reject };
+    const task = this.saveMessages((messages) => [...messages, message])
+      .then((result) => {
+        reject(
+          new Error(result.error ?? "Turn ended before startup was confirmed."),
+        );
+      })
+      .catch((error: unknown) => {
+        reject(error);
+      });
+    this.chatTask = task;
+    this.ctx.waitUntil(task);
+    try {
+      await within(
+        accepted,
+        25_000,
+        "Message acceptance is unconfirmed. Check history before retrying.",
+      );
     } finally {
-      this.controlPending = false;
+      this.acceptance = undefined;
+    }
+  }
+
+  private async cancel() {
+    const run = this.state.run;
+    if (run?.status !== "running") return;
+    this.ensureUsable(run.sandboxId);
+    const active = this.active;
+    if (active && run.threadId && run.turnId) {
+      await active.client.request("turn/interrupt", {
+        threadId: run.threadId,
+        turnId: run.turnId,
+      });
+      await this.interaction();
+      await within(
+        active.completed,
+        5_000,
+        "Stop is unconfirmed. Another turn remains blocked.",
+      );
+    } else if (this.turnInProgress) {
+      throw new Error("Codex is still starting. Try Stop again shortly.");
+    } else {
+      await this.reconcile();
     }
   }
 
@@ -448,6 +490,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
   }
 
   override async onChatMessage() {
+    const acceptance = this.acceptance;
     const message = this.messages.findLast(
       (message) => message.role === "user",
     );
@@ -456,7 +499,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       .map((part) => part.text)
       .join("\n");
     if (!message || !prompt) throw new Error("Send a text prompt to Codex.");
-    if (this.turnInProgress || this.controlPending)
+    if (this.turnInProgress)
       throw new Error("The previous Codex run is still active.");
     if (this.state.run?.messageId === message.id)
       throw new Error("This prompt was already attempted. Send a new message.");
@@ -563,7 +606,8 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             });
             const completed = Promise.race([result, client.disconnected]);
             void completed.catch(() => {});
-            this.active = { client, completed };
+            const active = { client, completed, terminal: false };
+            this.active = active;
             unsubscribe = client.subscribe((event) => {
               if (event.params.threadId !== thread.id) return;
               if (event.method === "turn/started") {
@@ -575,8 +619,10 @@ export class Chat extends AIChatAgent<Env, CodexState> {
                 if (
                   !this.state.run?.turnId ||
                   event.params.turn.id === this.state.run.turnId
-                )
+                ) {
+                  active.terminal = true;
                   resolve(event.params.turn);
+                }
               } else if (event.params.turnId === this.state.run?.turnId)
                 events.accept(event);
             });
@@ -587,6 +633,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               input: [{ type: "text", text: prompt, text_elements: [] }],
             });
             this.setRun({ ...this.state.run!, turnId: started.turn.id });
+            acceptance?.resolve();
             const turn = await completed;
             terminal = true;
             for (const item of turn.items) events.item(item);
@@ -600,6 +647,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               failure = new Error(turn.error?.message ?? "Codex turn failed.");
             if (this.usable(run.sandboxId)) await this.finishRun(run, status);
           } catch (error) {
+            acceptance?.reject(error);
             failure = error;
             // Failed submission/transport may still have started work. Leave it running in durable state for reconciliation.
             if (!this.state.run?.submitted && this.usable(run.sandboxId)) {
