@@ -12,7 +12,7 @@ PL-style Express relay
 Chat Durable Object: history, coordinator, protocol/event adapter
   ↕ Private app-server WebSocket via Cloudflare Sandbox SDK
 Sandbox: persistent native Codex app-server + workspace
-  ↕ HTTPS Responses through outbound credential injection
+  ↕ HTTP to private handler → authenticated HTTPS to OpenAI
 OpenAI
 
 Workspace + native session → R2 checkpoints
@@ -34,6 +34,12 @@ Workspace + native session → R2 checkpoints
 | `packages/chat-contract/`              | Provider-independent routes, types, message validation                     |
 
 The per-turn runner and Codex TypeScript SDK are removed. Prompts/steering/interrupts use app-server RPC; chat delivery no longer parses stdout. Process logs are diagnostic only.
+
+## Real local development
+
+Start Docker, put `CODEX_API_KEY=...` in ignored `apps/agent/.dev.vars`, then run `pnpm dev:agent`, `pnpm dev:server:local`, and `pnpm dev` in separate terminals. Open http://localhost:4315. This executes real prompts with local Worker/DOs, a real Docker sandbox, and Wrangler's local R2 storage; only inference uses the cloud.
+
+See [local development and reset instructions](docs/testing.md#real-local-development-actual-prompts). No R2 secrets or Cloudflare deployment are needed for this path. Do not set `LOCAL_DEV` in production.
 
 ## Cloudflare setup — you perform these steps
 
@@ -94,7 +100,7 @@ Open **http://localhost:4315**. Restart the backend after changing `.env.local`.
 6. Wait ten minutes in `waiting_for_user`, then send another prompt. Confirm destruction and restoration of both `hello.txt` and native context from R2.
 7. Verify the sliding six-hour user-interaction deadline. An accepted prompt/steer/active-turn Stop resets it; model/tool output and reconnects do not. There is no absolute sandbox-age cap.
 
-Live acceptance must verify outbound HTTPS interception/TLS trust, private socket authentication, Codex `workspace-write` tool execution, and real R2 restoration. No cloud deployment or paid inference has been run by the implementation tests. Use Worker logs for diagnostics:
+Live acceptance must verify outbound credential injection and upstream HTTPS, private socket authentication, Codex `workspace-write` tool execution, and real R2 restoration. The automated tests use a fake model. A separate local Docker smoke test reached real OpenAI inference, but tool execution hit a nested Bubblewrap limitation on the tested Mac; see the local testing guide. No cloud deployment has been performed. Use Worker logs for diagnostics:
 
 ```sh
 pnpm --filter @playground/agent exec wrangler tail --config wrangler.jsonc
@@ -113,11 +119,11 @@ pnpm --filter @playground/agent exec wrangler tail --config wrangler.jsonc
 
 ## Credentials and network
 
-`CODEX_API_KEY` stays a Worker secret. The Sandbox outbound handler injects it only into HTTPS POSTs to OpenAI Responses/compaction. It rejects redirects and overwrites caller authorization. Codex is configured for HTTP Responses without local authentication or model WebSockets.
+`CODEX_API_KEY` stays a Worker secret. The Sandbox outbound handler accepts private HTTP requests at `openai.internal` and injects it only into HTTPS POSTs to the fixed OpenAI Responses/compaction endpoints. It rejects redirects and overwrites caller authorization. Codex is configured for HTTP Responses without local authentication or model WebSockets.
 
-The container also permits the configured R2 account host for SDK presigned backup transfers. Other internet hosts—including Git/package registries—are blocked until explicitly allowed. The permanent R2 keys also stay in Workers; presigned URLs are short-lived scoped capabilities available during transfers.
+In production, the container also permits the configured R2 account host for SDK presigned backup transfers. Other internet hosts—including direct OpenAI access and Git/package registries—are blocked until explicitly allowed. The permanent R2 keys also stay in Workers; presigned URLs are short-lived scoped capabilities available during transfers.
 
-The private app-server socket has its own capability token in `/tmp`, separate from the OpenAI key. No OpenAI credential is passed in the container environment, auth file, or prompt; no runner redaction remains. Prompts, files, and native sessions can still contain unrelated sensitive information. Legacy credential paths remain excluded from backups; existing backups are not retroactively cleaned.
+The private app-server socket has its own capability token in `/tmp`, separate from the OpenAI key. No OpenAI credential is passed in the container environment, auth file, or prompt; no runner redaction remains. Prompts, files, and native sessions can still contain unrelated sensitive information. Files named `auth.json` remain excluded from backups; existing backups are not retroactively cleaned.
 
 On upgrade from the old runner, stop old work first; the runtime does not migrate an actively executing runner into an app-server turn.
 

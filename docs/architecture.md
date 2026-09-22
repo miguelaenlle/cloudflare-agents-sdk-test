@@ -2,7 +2,7 @@
 
 React/AI SDK → stateless PL relay → Chat Durable Object → Codex app-server in a Cloudflare Sandbox. Native Codex owns the model/tool loop. The Chat DO owns admission, UI history, lifecycle, and recovery.
 
-**Implemented locally.** Tests cover the real app-server with a fake model endpoint and the real Cloudflare chat runtime with a simulated sandbox. Live outbound credential injection, container isolation, and R2 restore still need deployment verification. [Local testing and manual deployment](testing.md).
+**Implemented locally.** Tests cover the real app-server with a fake model endpoint and the real Cloudflare chat runtime with a simulated sandbox. Deployed outbound credential injection, container isolation, and R2 restore still need deployment verification. [Local testing and manual deployment](testing.md).
 
 ## Components and boundaries
 
@@ -49,7 +49,7 @@ flowchart TB
     Coordinator <-->|"Persist / load"| SQLite
     SandboxAPI <-->|"Backup / restore"| Backup
     Codex <-->|"Read / edit / execute"| Files
-    Codex <-->|"Intercepted model requests / responses"| Auth
+    Codex <-->|"Internal HTTP requests / responses"| Auth
     Auth <-->|"Authenticated model requests / responses"| Inference
 
     classDef default fill:#374151,stroke:#9ca3af,color:#f9fafb
@@ -93,8 +93,8 @@ sequenceDiagram
     UI->>PL: GET history, then GET resume stream
     PL->>Chat: Cloudflare WebSocket resume transport
     loop Native model and tool iterations
-        Codex->>Auth: HTTPS Responses request without API key
-        Auth->>Model: Inject Worker-secret Authorization
+        Codex->>Auth: HTTP openai.internal request without API key
+        Auth->>Model: Forward over HTTPS with Worker-secret Authorization
         Model-->>Codex: HTTP response stream through handler
         Codex->>Codex: Run tools, edit files, save native session
         Codex-->>Chat: JSON-RPC item notifications over WebSocket
@@ -233,9 +233,9 @@ Run outcomes (`completed`, `cancelled`, `failed`, `interrupted`) are separate fr
 
 Checkpoints happen only immediately before planned destruction. Completion, steering, Stop, and recovery do not back up a sandbox being retained. Idle cleanup requires a successful checkpoint; the six-hour inactivity deadline attempts one even when the sandbox is already idle, but proceeds with destruction if backup fails or times out. They save files, not a live process. Native app-server remains running; backup consistency with its background metadata writes still needs live verification. UI history and backups are not atomic; history may describe work missing from a restored checkpoint. Unexpected loss can discard all workspace/native-session changes since the last successful pre-destruction checkpoint. Before the first checkpoint, cold startup creates a fresh workspace/thread. Infrastructure shutdown is not a guaranteed application backup hook. Backups expire after 30 days; configure R2 deletion separately.
 
-The Sandbox subclass allows `api.openai.com` and the configured R2 account host. For OpenAI it permits only HTTPS POSTs to `/v1/responses` and `/v1/responses/compact`, replaces Authorization, strips container-supplied project/organization headers, and rejects redirects. Codex uses HTTP Responses with model WebSockets disabled. Cloudflare's SDK uses presigned URLs for R2 transfer; permanent R2 keys remain Worker secrets. Other internet destinations are blocked, including package/Git hosts until explicitly added.
+The Sandbox subclass allows `openai.internal` and, in production, the configured R2 account host. The private handler accepts only HTTP POSTs to `/v1/responses` and `/v1/responses/compact`, forwards them to the fixed `https://api.openai.com` origin, replaces Authorization, strips container-supplied project/organization headers, and rejects redirects. Codex uses HTTP Responses with model WebSockets disabled. Cloudflare's SDK uses presigned URLs for R2 transfer; permanent R2 keys remain Worker secrets. Other internet destinations are blocked, including package/Git hosts until explicitly added.
 
-No OpenAI-key redaction pipeline is needed because the key is never sent into the container. This does not sanitize unrelated secrets in prompts/files or impose spending limits. Legacy credential paths remain excluded from backups; previous backups are not scrubbed retroactively. The app-server control token is container-readable and protects the private socket, not the model account.
+No OpenAI-key redaction pipeline is needed because the key is never sent into the container. This does not sanitize unrelated secrets in prompts/files or impose spending limits. Files named `auth.json` remain excluded from backups; previous backups are not scrubbed retroactively. The app-server control token is container-readable and protects the private socket, not the model account.
 
 ## Scope and verification
 
@@ -244,6 +244,6 @@ Two deployments: `apps/web` and `apps/agent`; the shared chat contract is source
 - Trusted disposable prototype: one shared conversation, no user authentication/approval UI. Origin checks are not authorization.
 - Two-window synchronization remains a gap. Course checkout/push_sync, previews, and usage accounting are deferred.
 - Unit tests cover protocol matching, mapper behavior, and outbound policy. Integration tests exercise real AIChatAgent/relay behavior against a simulated sandbox. The native test runs pinned app-server against a fake local model endpoint.
-- Live acceptance still requires Cloudflare HTTPS interception/TLS trust, workspace sandbox/tool execution, private socket authentication, and real R2 backup/restore. No deployment or paid inference is included in local checks.
+- Live acceptance still requires outbound credential injection/upstream HTTPS, workspace sandbox/tool execution, private socket authentication, and real R2 backup/restore. The automated suite uses a fake model; real local development uses paid inference.
 
 References: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [Cloudflare WebSockets](https://developers.cloudflare.com/sandbox/guides/websocket-connections/), [outbound handlers](https://developers.cloudflare.com/sandbox/guides/outbound-traffic/), [backups](https://developers.cloudflare.com/sandbox/guides/backup-restore/).

@@ -6,7 +6,7 @@ The proposal is now implemented in this branch. [Current architecture and diagra
 | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | One Codex app-server per warm sandbox | Pinned native CLI, private CF Sandbox SDK WebSocket; process survives turns and socket disconnects                     |
 | Steering and Stop                     | One Send operation selects `turn/start` or `turn/steer` in the DO; Stop remains explicit via `turn/interrupt`          |
-| No OpenAI key in the container        | Sandbox outbound handler injects the Worker secret for allowed HTTPS Responses requests                                |
+| No OpenAI key in the container        | Sandbox outbound handler accepts private HTTP requests and injects the secret into fixed upstream HTTPS requests       |
 | Remove runner and stdout transport    | Removed per-turn Node runner, SDK runtime dependency, input/result files, cancel watcher, and redaction pipeline       |
 | `keepAlive: false`                    | Set with CF `sleepAfter: "6h"`; control socket closes between turns                                                    |
 | Remove absolute sandbox-age TTL       | Durable sliding deadline: six hours after accepted prompt, steer, or active-turn Stop                                  |
@@ -19,7 +19,7 @@ Browser/PL HTTP/SSE, the provider adapter, Chat DO history/replay, and R2 checkp
 
 ## Remaining validation and follow-ups
 
-- Verify the complete deployed path: outbound HTTPS interception/TLS trust, private WebSocket authentication, tool sandboxing, and R2 checkpoint/restore.
+- Verify the complete deployed path: outbound credential injection and upstream HTTPS, private WebSocket authentication, tool sandboxing, and R2 checkpoint/restore.
 - Verify backup consistency while the idle app-server remains alive: it may write session metadata in the background. Unexpected container loss can discard everything since the last pre-destruction backup; DO chat history does not reconstruct workspace files.
 - Add `push_sync` later with a separate destination-specific credential policy. Current internet access is limited to OpenAI and the configured R2 account host.
 - Keep multi-window synchronization, course sync/publishing, previews, and usage accounting outside this prototype.
