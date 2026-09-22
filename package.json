@@ -10,6 +10,8 @@
     "dev": "pnpm --filter @playground/web dev",
     "dev:server": "pnpm --filter @playground/web dev:server",
     "build": "pnpm --filter @playground/web build",
+    "build:worker": "pnpm --filter @playground/agent build",
+    "deploy": "pnpm --filter @playground/agent deploy",
     "typecheck": "pnpm -r typecheck",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
