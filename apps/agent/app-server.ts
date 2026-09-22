@@ -40,8 +40,17 @@ const envelope = z.object({
   method: z.string().optional(),
   params: z.unknown().optional(),
   result: z.unknown().optional(),
-  error: z.object({ message: z.string() }).optional(),
+  error: z.object({ code: z.number(), message: z.string() }).optional(),
 });
+// A rejected RPC is distinct from an uncertain transport failure.
+export class AppServerError extends Error {
+  readonly code: number;
+  constructor(code: number, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
 export interface Socket {
   send(data: string): void;
   close(code?: number, reason?: string): void;
@@ -117,7 +126,10 @@ export class AppServer {
           const pending = this.pending.get(frame.id);
           if (!pending) return;
           this.pending.delete(frame.id);
-          if (frame.error) pending.reject(new Error(frame.error.message));
+          if (frame.error)
+            pending.reject(
+              new AppServerError(frame.error.code, frame.error.message),
+            );
           else pending.resolve(frame.result);
         }
       } catch {
