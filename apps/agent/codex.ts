@@ -132,6 +132,7 @@ export function checkpointCodex(sandbox: CodexSandbox, localBucket = false) {
     dir: "/workspace",
     localBucket,
     ttl: 30 * 24 * 60 * 60,
-    excludes: ["codex/auth.json", "codex/log", "runs"],
+    // SDK 0.12.9 expands slash-containing patterns in a way that excludes the parent.
+    excludes: ["auth.json"],
   });
 }
