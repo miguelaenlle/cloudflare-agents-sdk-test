@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AppServer, type Socket } from "../app-server.ts";
+import { AppServer, AppServerError, type Socket } from "../app-server.ts";
 class FakeSocket implements Socket {
   private listeners = new Map<string, ((event: { data: unknown }) => void)[]>();
   addEventListener(type: string, listener: (event: { data: unknown }) => void) {
@@ -68,4 +68,20 @@ test("malformed frames close the connection and reject pending requests", async 
   const result = client.request("thread/read", { threadId: "thread" });
   socket.receive({ id: [] });
   await assert.rejects(result, /Invalid Codex/);
+});
+
+test("RPC rejections remain distinguishable from uncertain disconnects", async () => {
+  const socket = new FakeSocket();
+  const client = new AppServer(socket);
+  const result = client.request("turn/steer", {
+    threadId: "thread",
+    expectedTurnId: "turn",
+    input: [],
+  });
+  socket.receive({ id: 1, error: { code: -32600, message: "No active turn" } });
+  await assert.rejects(
+    result,
+    (error) => error instanceof AppServerError && error.code === -32600,
+  );
+  client.close();
 });
