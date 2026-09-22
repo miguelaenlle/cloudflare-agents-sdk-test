@@ -1,0 +1,20 @@
+{
+  "name": "@playground/agent",
+  "private": true,
+  "type": "module",
+  "scripts": {},
+  "dependencies": {
+    "@cloudflare/ai-chat": "0.12.0",
+    "@cloudflare/sandbox": "0.12.9",
+    "@playground/chat-contract": "workspace:*",
+    "agents": "0.23.0",
+    "ai": "^7.0.102",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260917.1",
+    "@openai/codex": "0.155.0",
+    "@types/node": "^24.13.5",
+    "wrangler": "^4.134.0"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "cloudflare-agents-sdk-test",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @playground/web dev",
+    "dev:server": "pnpm --filter @playground/web dev:server",
+    "build": "pnpm --filter @playground/web build",
+    "typecheck": "pnpm -r typecheck",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "^3.9.7",
+    "typescript": "7.0.2"
+  }
+}
