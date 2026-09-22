@@ -26,34 +26,58 @@ try {
   ]);
   const files = new Set();
   const definitions = [];
-  function visit(file) {
+  function visit(file, methods) {
     if (files.has(file)) return;
     files.add(file);
     let source = readFileSync(file, "utf8");
+    if (methods) {
+      // The pinned generator emits flat method variants whose payloads are named types.
+      const variants = [
+        ...source.matchAll(/\{ "method": "([^"]+)",[^{}]*\}/g),
+      ].filter((match) => methods.includes(match[1]));
+      if (variants.length !== methods.length)
+        throw new Error(`Unexpected generated method union in ${file}`);
+      const body = variants.map((match) => match[0]).join(" | ");
+      const imports = [
+        ...source.matchAll(/^import type \{ (\w+) \} from ".+?";$/gm),
+      ]
+        .filter((match) => new RegExp(`\\b${match[1]}\\b`).test(body))
+        .map((match) => match[0]);
+      const name = source.match(/export type (\w+)\s*=/)[1];
+      source = imports.join("\n") + `\nexport type ${name} = ${body};\n`;
+    }
     source = source.replace(/^import type .*? from "(.+?)";\n/gm, (_, path) => {
       visit(resolve(dirname(file), path + ".ts"));
       return "";
     });
     definitions.push(source.replace(/^\/\/.*\n/gm, "").trim());
   }
+  visit(join(output, "ClientRequest.ts"), [
+    "initialize",
+    "thread/start",
+    "thread/resume",
+    "thread/read",
+    "turn/start",
+    "turn/steer",
+    "turn/interrupt",
+  ]);
+  visit(join(output, "ServerNotification.ts"), [
+    "turn/started",
+    "turn/completed",
+    "item/started",
+    "item/completed",
+    "item/agentMessage/delta",
+  ]);
   for (const name of [
-    "InitializeParams",
-    "v2/ThreadStartParams",
-    "v2/ThreadResumeParams",
-    "v2/ThreadReadParams",
-    "v2/TurnStartParams",
-    "v2/TurnSteerParams",
-    "v2/TurnInterruptParams",
-    "v2/Thread",
-    "v2/Turn",
-    "v2/ItemStartedNotification",
-    "v2/ItemCompletedNotification",
-    "v2/AgentMessageDeltaNotification",
-    "v2/TurnStartedNotification",
-    "v2/TurnCompletedNotification",
-  ]) {
+    "InitializeResponse",
+    "v2/ThreadStartResponse",
+    "v2/ThreadResumeResponse",
+    "v2/ThreadReadResponse",
+    "v2/TurnStartResponse",
+    "v2/TurnSteerResponse",
+    "v2/TurnInterruptResponse",
+  ])
     visit(join(output, name + ".ts"));
-  }
   const target = new URL("../protocol.ts", import.meta.url);
   writeFileSync(
     target,
