@@ -1,6 +1,5 @@
 import type { UIMessageChunk } from "ai";
-import type { Notification } from "./app-server.ts";
-import type { ThreadItem } from "./protocol.ts";
+import type { ServerNotification, ThreadItem } from "./protocol.ts";
 
 export class CodexEvents {
   private text = new Map<string, string>();
@@ -15,7 +14,7 @@ export class CodexEvents {
     this.namespace = namespace;
   }
 
-  accept(event: Notification) {
+  accept(event: ServerNotification) {
     if (event.method === "item/agentMessage/delta") {
       this.delta(event.params.itemId, event.params.delta);
     } else if (
