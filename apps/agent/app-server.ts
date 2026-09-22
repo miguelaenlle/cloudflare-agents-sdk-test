@@ -1,39 +1,24 @@
 import { z } from "zod";
 import type {
-  InitializeParams,
-  ThreadStartParams,
-  ThreadResumeParams,
-  ThreadReadParams,
-  TurnStartParams,
-  TurnSteerParams,
-  TurnInterruptParams,
-  Thread,
-  Turn,
-  ItemStartedNotification,
-  ItemCompletedNotification,
-  AgentMessageDeltaNotification,
-  TurnStartedNotification,
-  TurnCompletedNotification,
+  ClientRequest,
+  ServerNotification,
+  InitializeResponse,
+  ThreadStartResponse,
+  ThreadResumeResponse,
+  ThreadReadResponse,
+  TurnStartResponse,
+  TurnSteerResponse,
+  TurnInterruptResponse,
 } from "./protocol.ts";
 
-export type Notification =
-  | { method: "turn/started"; params: TurnStartedNotification }
-  | { method: "turn/completed"; params: TurnCompletedNotification }
-  | { method: "item/started"; params: ItemStartedNotification }
-  | { method: "item/completed"; params: ItemCompletedNotification }
-  | {
-      method: "item/agentMessage/delta";
-      params: AgentMessageDeltaNotification;
-    };
-
-type Methods = {
-  initialize: [InitializeParams, unknown];
-  "thread/start": [ThreadStartParams, { thread: Thread }];
-  "thread/resume": [ThreadResumeParams, { thread: Thread }];
-  "thread/read": [ThreadReadParams, { thread: Thread }];
-  "turn/start": [TurnStartParams, { turn: Turn }];
-  "turn/steer": [TurnSteerParams, { turnId: string }];
-  "turn/interrupt": [TurnInterruptParams, unknown];
+type Results = {
+  initialize: InitializeResponse;
+  "thread/start": ThreadStartResponse;
+  "thread/resume": ThreadResumeResponse;
+  "thread/read": ThreadReadResponse;
+  "turn/start": TurnStartResponse;
+  "turn/steer": TurnSteerResponse;
+  "turn/interrupt": TurnInterruptResponse;
 };
 const envelope = z.object({
   id: z.union([z.number(), z.string()]).optional(),
@@ -83,7 +68,7 @@ export class AppServer {
     number,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
   >();
-  private subscribers = new Set<(event: Notification) => void>();
+  private subscribers = new Set<(event: ServerNotification) => void>();
   private closed = false;
   readonly disconnected: Promise<never>;
   private rejectDisconnected!: (error: Error) => void;
@@ -119,7 +104,7 @@ export class AppServer {
             ].includes(frame.method)
           ) {
             // Authenticated, version-pinned protocol; generated types describe the payload.
-            const notification = frame as Notification;
+            const notification = frame as ServerNotification;
             for (const subscriber of this.subscribers) subscriber(notification);
           }
         } else if (typeof frame.id === "number") {
@@ -161,10 +146,10 @@ export class AppServer {
     this.fail(new Error("Codex client closed."));
   }
 
-  async request<M extends keyof Methods>(
+  async request<M extends keyof Results>(
     method: M,
-    params: Methods[M][0],
-  ): Promise<Methods[M][1]> {
+    params: Extract<ClientRequest, { method: M }>["params"],
+  ): Promise<Results[M]> {
     if (this.closed) throw new Error("Codex connection is closed.");
     const id = ++this.nextId;
     const response = new Promise<unknown>((resolve, reject) => {
@@ -181,7 +166,7 @@ export class AppServer {
         response,
         15_000,
         `Codex ${method} acknowledgment timed out.`,
-      )) as Methods[M][1];
+      )) as Results[M];
     } finally {
       this.pending.delete(id);
     }
@@ -199,7 +184,7 @@ export class AppServer {
     this.socket.send(JSON.stringify({ method: "initialized" }));
   }
 
-  subscribe(listener: (event: Notification) => void) {
+  subscribe(listener: (event: ServerNotification) => void) {
     this.subscribers.add(listener);
     return () => this.subscribers.delete(listener);
   }
