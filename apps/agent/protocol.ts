@@ -49,6 +49,19 @@ export type InitializeParams = {
   capabilities: InitializeCapabilities | null;
 };
 
+export type RequestId = string | number;
+
+export type ThreadReadParams = {
+  threadId: string;
+  /**
+   * When true, include turns and their items from rollout history.
+   * Full-history hydration is deprecated for paginated threads; prefer a
+   * metadata-only read and page with `thread/turns/list` and
+   * `thread/items/list`.
+   */
+  includeTurns?: boolean;
+};
+
 export type Personality = "none" | "friendly" | "pragmatic";
 
 /**
@@ -76,33 +89,6 @@ export type AskForApproval =
 
 export type SandboxMode =
   "read-only" | "workspace-write" | "danger-full-access";
-
-export type ThreadSource = string;
-
-export type ThreadStartSource = "startup" | "clear";
-
-export type ThreadStartParams = {
-  model?: string | null;
-  modelProvider?: string | null;
-  serviceTier?: string | null | null;
-  cwd?: string | null;
-  approvalPolicy?: AskForApproval | null; /**
-   * Override where approval requests are routed for review on this thread
-   * and subsequent turns.
-   */
-  approvalsReviewer?: ApprovalsReviewer | null;
-  sandbox?: SandboxMode | null;
-  config?: { [key in string]?: JsonValue } | null;
-  serviceName?: string | null;
-  baseInstructions?: string | null;
-  developerInstructions?: string | null;
-  personality?: Personality | null;
-  ephemeral?: boolean | null;
-  sessionStartSource?: ThreadStartSource | null; /**
-   * Optional client-supplied analytics source classification for this thread.
-   */
-  threadSource?: ThreadSource | null;
-};
 
 /**
  * There are three ways to resume a thread:
@@ -147,16 +133,34 @@ export type ThreadResumeParams = {
   excludeTurns?: boolean;
 };
 
-export type ThreadReadParams = {
-  threadId: string;
-  /**
-   * When true, include turns and their items from rollout history.
-   * Full-history hydration is deprecated for paginated threads; prefer a
-   * metadata-only read and page with `thread/turns/list` and
-   * `thread/items/list`.
+export type ThreadSource = string;
+
+export type ThreadStartSource = "startup" | "clear";
+
+export type ThreadStartParams = {
+  model?: string | null;
+  modelProvider?: string | null;
+  serviceTier?: string | null | null;
+  cwd?: string | null;
+  approvalPolicy?: AskForApproval | null; /**
+   * Override where approval requests are routed for review on this thread
+   * and subsequent turns.
    */
-  includeTurns?: boolean;
+  approvalsReviewer?: ApprovalsReviewer | null;
+  sandbox?: SandboxMode | null;
+  config?: { [key in string]?: JsonValue } | null;
+  serviceName?: string | null;
+  baseInstructions?: string | null;
+  developerInstructions?: string | null;
+  personality?: Personality | null;
+  ephemeral?: boolean | null;
+  sessionStartSource?: ThreadStartSource | null; /**
+   * Optional client-supplied analytics source classification for this thread.
+   */
+  threadSource?: ThreadSource | null;
 };
+
+export type TurnInterruptParams = { threadId: string; turnId: string };
 
 /**
  * See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
@@ -303,82 +307,21 @@ export type TurnSteerParams = {
   expectedTurnId: string;
 };
 
-export type TurnInterruptParams = { threadId: string; turnId: string };
+export type ClientRequest =
+  | { method: "initialize"; id: RequestId; params: InitializeParams }
+  | { method: "thread/start"; id: RequestId; params: ThreadStartParams }
+  | { method: "thread/resume"; id: RequestId; params: ThreadResumeParams }
+  | { method: "thread/read"; id: RequestId; params: ThreadReadParams }
+  | { method: "turn/start"; id: RequestId; params: TurnStartParams }
+  | { method: "turn/steer"; id: RequestId; params: TurnSteerParams }
+  | { method: "turn/interrupt"; id: RequestId; params: TurnInterruptParams };
 
-export type GitInfo = {
-  sha: string | null;
-  branch: string | null;
-  originUrl: string | null;
+export type AgentMessageDeltaNotification = {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  delta: string;
 };
-
-export type AgentPath = string;
-
-/**
- * Identifier for a Codex thread.
- *
- * Codex-generated thread IDs are UUIDv7, and some use cases rely on that.
- */
-export type ThreadId = string;
-
-export type SubAgentSource =
-  | "review"
-  | "compact"
-  | {
-      thread_spawn: {
-        parent_thread_id: ThreadId;
-        depth: number;
-        agent_path: AgentPath | null;
-        agent_nickname: string | null;
-        agent_role: string | null;
-      };
-    }
-  | "memory_consolidation"
-  | { other: string };
-
-export type SessionSource =
-  | "cli"
-  | "vscode"
-  | "exec"
-  | "appServer"
-  | { custom: string }
-  | { subAgent: SubAgentSource }
-  | "unknown";
-
-export type ThreadHistoryMode = "legacy" | "paginated";
-
-/**
- * Extensible visual presentation for a custom thread section.
- */
-export type ThreadSectionAppearance = {
-  icon: string | null;
-  color: string | null;
-};
-
-/**
- * An independently persisted, user-visible thread section.
- */
-export type ThreadSection = {
-  /**
-   * Opaque UUIDv7 identity that remains stable when the section is renamed.
-   */
-  id: string;
-  /**
-   * The current user-visible section name.
-   */
-  name: string;
-  /**
-   * Optional appearance synchronized across clients.
-   */
-  appearance: ThreadSectionAppearance | null;
-};
-
-export type ThreadActiveFlag = "waitingOnApproval" | "waitingOnUserInput";
-
-export type ThreadStatus =
-  | { type: "notLoaded" }
-  | { type: "idle" }
-  | { type: "systemError" }
-  | { type: "active"; activeFlags: Array<ThreadActiveFlag> };
 
 export type ImageGenerationFailure = {
   type: "usageLimitExceeded";
@@ -731,6 +674,26 @@ export type ThreadItem =
   | { type: "exitedReviewMode"; id: string; review: string }
   | { type: "contextCompaction"; id: string };
 
+export type ItemCompletedNotification = {
+  item: ThreadItem;
+  threadId: string;
+  turnId: string;
+  /**
+   * Unix timestamp (in milliseconds) when this item lifecycle completed.
+   */
+  completedAtMs: number;
+};
+
+export type ItemStartedNotification = {
+  item: ThreadItem;
+  threadId: string;
+  turnId: string;
+  /**
+   * Unix timestamp (in milliseconds) when this item lifecycle started.
+   */
+  startedAtMs: number;
+};
+
 export type NonSteerableTurnKind = "review" | "compact";
 
 /**
@@ -821,6 +784,113 @@ export type Turn = {
    */
   durationMs: number | null;
 };
+
+export type TurnCompletedNotification = { threadId: string; turn: Turn };
+
+export type TurnStartedNotification = { threadId: string; turn: Turn };
+
+export type ServerNotification =
+  | { method: "turn/started"; params: TurnStartedNotification }
+  | { method: "turn/completed"; params: TurnCompletedNotification }
+  | { method: "item/started"; params: ItemStartedNotification }
+  | { method: "item/completed"; params: ItemCompletedNotification }
+  | {
+      method: "item/agentMessage/delta";
+      params: AgentMessageDeltaNotification;
+    };
+
+export type InitializeResponse = {
+  userAgent: string;
+  /**
+   * Absolute path to the server's $CODEX_HOME directory.
+   */
+  codexHome: AbsolutePathBuf;
+  /**
+   * Platform family for the running app-server target, for example
+   * `"unix"` or `"windows"`.
+   */
+  platformFamily: string;
+  /**
+   * Operating system for the running app-server target, for example
+   * `"macos"`, `"linux"`, or `"windows"`.
+   */
+  platformOs: string;
+};
+
+export type GitInfo = {
+  sha: string | null;
+  branch: string | null;
+  originUrl: string | null;
+};
+
+export type AgentPath = string;
+
+/**
+ * Identifier for a Codex thread.
+ *
+ * Codex-generated thread IDs are UUIDv7, and some use cases rely on that.
+ */
+export type ThreadId = string;
+
+export type SubAgentSource =
+  | "review"
+  | "compact"
+  | {
+      thread_spawn: {
+        parent_thread_id: ThreadId;
+        depth: number;
+        agent_path: AgentPath | null;
+        agent_nickname: string | null;
+        agent_role: string | null;
+      };
+    }
+  | "memory_consolidation"
+  | { other: string };
+
+export type SessionSource =
+  | "cli"
+  | "vscode"
+  | "exec"
+  | "appServer"
+  | { custom: string }
+  | { subAgent: SubAgentSource }
+  | "unknown";
+
+export type ThreadHistoryMode = "legacy" | "paginated";
+
+/**
+ * Extensible visual presentation for a custom thread section.
+ */
+export type ThreadSectionAppearance = {
+  icon: string | null;
+  color: string | null;
+};
+
+/**
+ * An independently persisted, user-visible thread section.
+ */
+export type ThreadSection = {
+  /**
+   * Opaque UUIDv7 identity that remains stable when the section is renamed.
+   */
+  id: string;
+  /**
+   * The current user-visible section name.
+   */
+  name: string;
+  /**
+   * Optional appearance synchronized across clients.
+   */
+  appearance: ThreadSectionAppearance | null;
+};
+
+export type ThreadActiveFlag = "waitingOnApproval" | "waitingOnUserInput";
+
+export type ThreadStatus =
+  | { type: "notLoaded" }
+  | { type: "idle" }
+  | { type: "systemError" }
+  | { type: "active"; activeFlags: Array<ThreadActiveFlag> };
 
 export type Thread = {
   /**
@@ -916,33 +986,62 @@ export type Thread = {
   turns: Array<Turn>;
 };
 
-export type ItemStartedNotification = {
-  item: ThreadItem;
-  threadId: string;
-  turnId: string;
-  /**
-   * Unix timestamp (in milliseconds) when this item lifecycle started.
+export type ThreadStartResponse = {
+  thread: Thread;
+  model: string;
+  modelProvider: string;
+  serviceTier: string | null;
+  cwd: AbsolutePathBuf; /**
+   * Environment-native paths to instruction source files currently loaded for this thread.
    */
-  startedAtMs: number;
-};
-
-export type ItemCompletedNotification = {
-  item: ThreadItem;
-  threadId: string;
-  turnId: string;
-  /**
-   * Unix timestamp (in milliseconds) when this item lifecycle completed.
+  instructionSources: Array<LegacyAppPathString>;
+  approvalPolicy: AskForApproval; /**
+   * Reviewer currently used for approval requests on this thread.
    */
-  completedAtMs: number;
+  approvalsReviewer: ApprovalsReviewer; /**
+   * Legacy sandbox policy retained for compatibility. Experimental clients
+   * should prefer `activePermissionProfile` for profile provenance.
+   */
+  sandbox: SandboxPolicy;
+  reasoningEffort: ReasoningEffort | null;
 };
 
-export type AgentMessageDeltaNotification = {
-  threadId: string;
-  turnId: string;
-  itemId: string;
-  delta: string;
+export type ThreadResumeResponse = {
+  thread: Thread;
+  model: string;
+  modelProvider: string;
+  serviceTier: string | null;
+  cwd: AbsolutePathBuf; /**
+   * Environment-native paths to instruction source files currently loaded for this thread.
+   */
+  instructionSources: Array<LegacyAppPathString>;
+  approvalPolicy: AskForApproval; /**
+   * Reviewer currently used for approval requests on this thread.
+   */
+  approvalsReviewer: ApprovalsReviewer; /**
+   * Legacy sandbox policy retained for compatibility. Experimental clients
+   * should prefer `activePermissionProfile` for profile provenance.
+   */
+  sandbox: SandboxPolicy;
+  reasoningEffort: ReasoningEffort | null; /**
+   * Opaque cursor for hydrating paginated turns backwards.
+   *
+   * Pass this as `cursor` to `thread/turns/list` with
+   * `sortDirection: "desc"`. The first page includes the turn identified by the cursor.
+   */
+  turnsBackwardsCursor: string | null; /**
+   * Opaque cursor for hydrating paginated items backwards.
+   *
+   * Pass this as `cursor` to `thread/items/list` with
+   * `sortDirection: "desc"`. The first page includes the item identified by the cursor.
+   */
+  itemsBackwardsCursor: string | null;
 };
 
-export type TurnStartedNotification = { threadId: string; turn: Turn };
+export type ThreadReadResponse = { thread: Thread };
 
-export type TurnCompletedNotification = { threadId: string; turn: Turn };
+export type TurnStartResponse = { turn: Turn };
+
+export type TurnSteerResponse = { turnId: string };
+
+export type TurnInterruptResponse = Record<string, never>;
