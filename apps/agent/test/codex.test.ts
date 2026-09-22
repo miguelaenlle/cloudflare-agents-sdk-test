@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { UIMessageChunk } from "ai";
 import { CodexEvents } from "../codex-events.ts";
-import { connectCodex, ContainerLost, type CodexSandbox } from "../codex.ts";
+import {
+  checkpointCodex,
+  connectCodex,
+  ContainerLost,
+  type CodexSandbox,
+} from "../codex.ts";
 import { forwardOpenAI } from "../outbound.ts";
 import type { ThreadItem } from "../protocol.ts";
 
@@ -73,13 +78,14 @@ test("credential handler injects only into allowed OpenAI requests", async () =>
       request.headers.get("Authorization"),
       "Bearer private-test-key",
     );
+    assert.equal(request.url, "https://api.openai.com/v1/responses");
     assert.equal(request.headers.has("OpenAI-Project"), false);
-    assert.equal(request.redirect, "error");
+    assert.equal(request.redirect, "manual");
     assert.equal(await request.text(), '{"model":"test"}');
     return new Response("stream");
   };
   const env = { CODEX_API_KEY: "private-test-key" };
-  const request = new Request("https://api.openai.com/v1/responses", {
+  const request = new Request("http://openai.internal/v1/responses", {
     method: "POST",
     body: '{"model":"test"}',
     headers: {
@@ -92,10 +98,10 @@ test("credential handler injects only into allowed OpenAI requests", async () =>
     "stream",
   );
   for (const url of [
-    "http://api.openai.com/v1/responses",
-    "https://api.openai.com.evil.test/v1/responses",
-    "https://api.openai.com/v1/files",
-    "https://api.openai.com/v1/responses/123",
+    "https://openai.internal/v1/responses",
+    "http://openai.internal.evil.test/v1/responses",
+    "http://openai.internal/v1/files",
+    "http://openai.internal/v1/responses/123",
   ]) {
     assert.equal(
       (await forwardOpenAI(new Request(url, { method: "POST" }), env, send))
@@ -106,7 +112,7 @@ test("credential handler injects only into allowed OpenAI requests", async () =>
   assert.equal(
     (
       await forwardOpenAI(
-        new Request("https://api.openai.com/v1/responses"),
+        new Request("http://openai.internal/v1/responses"),
         env,
         send,
       )
@@ -116,7 +122,7 @@ test("credential handler injects only into allowed OpenAI requests", async () =>
   assert.equal(calls, 1);
 });
 test("missing credentials and upstream exceptions reveal no secret", async () => {
-  const request = new Request("https://api.openai.com/v1/responses", {
+  const request = new Request("http://openai.internal/v1/responses", {
     method: "POST",
   });
   assert.equal(
@@ -154,4 +160,38 @@ test("expiry during restore prevents subsequent configuration and process launch
     ),
     /Expired/,
   );
+});
+
+test("local backup uses the SDK binding path without changing production defaults", async () => {
+  const calls: unknown[] = [];
+  const sandbox = {
+    createBackup: async (options: unknown) => {
+      calls.push(options);
+    },
+  } as unknown as CodexSandbox;
+  await checkpointCodex(sandbox);
+  await checkpointCodex(sandbox, true);
+  assert.deepEqual(
+    calls,
+    [false, true].map((localBucket) => ({
+      dir: "/workspace",
+      localBucket,
+      ttl: 30 * 24 * 60 * 60,
+      excludes: ["codex/auth.json", "codex/log", "runs"],
+    })),
+  );
+});
+
+test("model redirects are blocked without exposing the destination", async () => {
+  const response = await forwardOpenAI(
+    new Request("http://openai.internal/v1/responses", { method: "POST" }),
+    { CODEX_API_KEY: "private-test-key" },
+    async () =>
+      new Response(null, {
+        status: 307,
+        headers: { Location: "https://elsewhere.test" },
+      }),
+  );
+  assert.equal(response.status, 502);
+  assert.equal(response.headers.has("Location"), false);
 });

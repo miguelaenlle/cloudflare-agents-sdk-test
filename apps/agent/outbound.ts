@@ -6,7 +6,7 @@ export async function forwardOpenAI(
 ): Promise<Response> {
   const url = new URL(request.url);
   if (
-    url.origin !== "https://api.openai.com" ||
+    url.origin !== "http://openai.internal" ||
     request.method !== "POST" ||
     !["/v1/responses", "/v1/responses/compact"].includes(url.pathname)
   ) {
@@ -14,13 +14,21 @@ export async function forwardOpenAI(
   }
   if (typeof env.CODEX_API_KEY !== "string" || !env.CODEX_API_KEY)
     return new Response("Model credentials unavailable", { status: 503 });
-  const upstream = new Request(request, { redirect: "error" });
+  const upstream = new Request<unknown, CfProperties>(
+    `https://api.openai.com${url.pathname}`,
+    new Request(request, { redirect: "manual" }),
+  );
   upstream.headers.set("Authorization", `Bearer ${env.CODEX_API_KEY}`);
   // Do not let sandbox code select an unrelated billing project/organization.
   upstream.headers.delete("OpenAI-Organization");
   upstream.headers.delete("OpenAI-Project");
   try {
-    return await send(upstream);
+    const response = await send(upstream);
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
+      return new Response("Model redirect blocked", { status: 502 });
+    }
+    return response;
   } catch {
     return new Response("Model request failed", { status: 502 });
   }

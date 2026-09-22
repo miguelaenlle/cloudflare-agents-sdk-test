@@ -102,12 +102,18 @@ export async function connectCodex(
   assertCurrent();
   const response = await sandbox.wsConnect(
     new Request("http://sandbox/", {
-      headers: { Upgrade: "websocket", Authorization: `Bearer ${token}` },
+      headers: {
+        Upgrade: "websocket",
+        Connection: "Upgrade",
+        Authorization: `Bearer ${token}`,
+      },
     }),
     SERVER_PORT,
   );
   if (!response.webSocket)
-    throw new Error("Could not connect to Codex app-server.");
+    throw new Error(
+      `Could not connect to Codex app-server (HTTP ${response.status}).`,
+    );
   response.webSocket.accept();
   const client = new AppServer(response.webSocket);
   try {
@@ -121,9 +127,10 @@ export async function connectCodex(
   return { client, threadId };
 }
 
-export function checkpointCodex(sandbox: CodexSandbox) {
+export function checkpointCodex(sandbox: CodexSandbox, localBucket = false) {
   return sandbox.createBackup({
     dir: "/workspace",
+    localBucket,
     ttl: 30 * 24 * 60 * 60,
     excludes: ["codex/auth.json", "codex/log", "runs"],
   });
