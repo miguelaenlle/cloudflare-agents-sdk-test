@@ -4,9 +4,9 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "node --import ./test/platform.mjs --experimental-strip-types --test test/codex.test.ts test/app-server.test.ts",
     "test:native": "node --experimental-strip-types --test test/native.test.mjs",
-    "generate:protocol": "node scripts/generate-protocol.mjs",
-    "test": "node --experimental-strip-types --test test/app-server.test.ts"
+    "generate:protocol": "node scripts/generate-protocol.mjs"
   },
   "dependencies": {
     "@cloudflare/ai-chat": "0.12.0",
