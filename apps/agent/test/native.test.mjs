@@ -95,7 +95,7 @@ test(
     )
       .replace("/tmp/codex-logs", join(home, "logs"))
       .replace(
-        "https://api.openai.com/v1",
+        "http://openai.internal/v1",
         `http://127.0.0.1:${model.address().port}/v1`,
       );
     await writeFile(join(home, "config.toml"), config);
