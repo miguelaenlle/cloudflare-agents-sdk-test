@@ -1,189 +1,127 @@
-import {
-  parseSSEStream,
-  type DirectoryBackup,
-  type LogEvent,
-  type getSandbox,
-} from "@cloudflare/sandbox";
-import type { UIMessageChunk } from "ai";
-import { z } from "zod";
-import { CodexEvents } from "./codex-events.ts";
+import type { DirectoryBackup, getSandbox } from "@cloudflare/sandbox";
+import { AppServer } from "./app-server.ts";
 
 export type CodexSandbox = ReturnType<typeof getSandbox>;
 export const SANDBOX_IDLE_MS = 10 * 60_000;
-export const SANDBOX_LIFETIME_MS = 6 * 60 * 60_000;
-export type SandboxLifecycle = {
-  id: string;
-  createdAt: number;
-  phase:
-    | "starting"
-    | "waiting_for_agent"
-    | "waiting_for_user"
-    | "suspending"
-    | "destroying"
-    | "cleanup_failed";
-  waitingSince?: number;
-};
+export const USER_IDLE_MS = 6 * 60 * 60_000;
+export const SERVER_ID = "codex-app-server";
+export const SERVER_PORT = 4500;
+const readyFile = "/tmp/codex-app-server-ready";
+const tokenFile = "/tmp/codex-app-server-token";
 export type Run = {
   id: string;
   messageId: string;
   sandboxId: string;
-  startedAt: number;
-  stopReason?: "cancelled" | "interrupted" | "expired";
+  threadId?: string;
+  turnId?: string;
+  submitted?: boolean;
   status: "running" | "completed" | "cancelled" | "failed" | "interrupted";
 };
 export type CodexState = {
-  sandbox?: SandboxLifecycle;
+  sandbox?: {
+    id: string;
+    phase:
+      | "starting"
+      | "waiting_for_agent"
+      | "waiting_for_user"
+      | "suspending"
+      | "destroying"
+      | "cleanup_failed";
+    lastUserInteractionAt: number;
+    waitingSince?: number;
+    deadlineSchedule?: string;
+  };
+  run?: Run;
   threadId?: string;
   checkpoint?: { backup: DirectoryBackup; threadId?: string };
-  run?: Run;
 };
-
-const resultSchema = z.object({
-  status: z.enum(["completed", "failed", "cancelled", "timed-out"]),
-  error: z.string().optional(),
-});
-const readyFile = "/tmp/codex-ready";
-export function runDirectory(id: string) {
-  return `/tmp/codex-runs/${z.uuid().parse(id)}`;
-}
-
-export async function prepareSandbox(sandbox: CodexSandbox, state: CodexState) {
-  if ((await sandbox.exists(readyFile)).exists) return state.threadId;
-  if (state.checkpoint) {
-    await sandbox.restoreBackup(state.checkpoint.backup);
-  } else {
-    const result = await sandbox.exec(
-      "mkdir -p /workspace/repo /workspace/codex && git init /workspace/repo",
+export class ContainerLost extends Error {
+  constructor() {
+    super(
+      "Sandbox was lost. Send another message to restore the last checkpoint.",
     );
-    if (!result.success)
-      throw new Error("Could not initialize the Codex workspace.");
   }
-  await sandbox.writeFile(readyFile, "ready");
-  return state.checkpoint?.threadId;
 }
 
-export async function startCodex(
+export async function connectCodex(
   sandbox: CodexSandbox,
-  run: Run,
-  input: {
-    prompt: string;
-    threadId?: string;
-    model?: string;
-    apiKey: string;
-    expiresAt: number;
-  },
+  state: CodexState,
+  {
+    recovery = false,
+    assertCurrent = () => {},
+  }: { recovery?: boolean; assertCurrent?: () => void } = {},
 ) {
-  const dir = runDirectory(run.id);
-  await sandbox.mkdir(dir, { recursive: true });
-  // Only non-secret input goes on disk; the prompt never becomes shell syntax.
-  await sandbox.writeFile(
-    `${dir}/input.json`,
-    JSON.stringify({
-      prompt: input.prompt,
-      threadId: input.threadId,
-      model: input.model,
-      expiresAt: input.expiresAt,
+  // Expiration can interleave with SDK awaits; stop before issuing another operation.
+  assertCurrent();
+  const warm = (await sandbox.exists(readyFile)).exists;
+  assertCurrent();
+  if (!warm && recovery) throw new ContainerLost();
+  let threadId = state.threadId;
+  if (!warm) {
+    if (state.checkpoint) await sandbox.restoreBackup(state.checkpoint.backup);
+    else {
+      const initialized = await sandbox.exec(
+        "mkdir -p /workspace/repo /workspace/codex && git init /workspace/repo",
+      );
+      if (!initialized.success)
+        throw new Error("Could not initialize workspace.");
+    }
+    assertCurrent();
+    threadId = state.checkpoint?.threadId;
+    const configured = await sandbox.exec(
+      "cp /opt/codex-config.toml /workspace/codex/config.toml",
+    );
+    assertCurrent();
+    if (!configured.success) throw new Error("Could not configure Codex.");
+    await sandbox.writeFile(tokenFile, crypto.randomUUID());
+    assertCurrent();
+    await sandbox.writeFile(readyFile, "ready");
+  }
+  assertCurrent();
+  const process = await sandbox.getProcess(SERVER_ID);
+  assertCurrent();
+  if (!process || !["running", "starting"].includes(process.status)) {
+    if (recovery) throw new ContainerLost();
+    if (process) await sandbox.cleanupCompletedProcesses();
+    assertCurrent();
+    const server = await sandbox.startProcess(
+      `codex app-server --listen ws://0.0.0.0:${SERVER_PORT} --ws-auth capability-token --ws-token-file ${tokenFile}`,
+      {
+        processId: SERVER_ID,
+        autoCleanup: false,
+        env: { CODEX_HOME: "/workspace/codex" },
+      },
+    );
+    assertCurrent();
+    await server.waitForPort(SERVER_PORT, { path: "/readyz" });
+  } else if (process.status === "starting") {
+    await process.waitForPort(SERVER_PORT, { path: "/readyz" });
+  }
+  assertCurrent();
+  const { content: token } = await sandbox.readFile(tokenFile);
+  assertCurrent();
+  const response = await sandbox.wsConnect(
+    new Request("http://sandbox/", {
+      headers: { Upgrade: "websocket", Authorization: `Bearer ${token}` },
     }),
+    SERVER_PORT,
   );
-  await sandbox.startProcess(`node /opt/run-codex.mjs ${dir}`, {
-    processId: run.id,
-    autoCleanup: false,
-    timeout: Math.max(1, input.expiresAt - Date.now()),
-    env: { CODEX_API_KEY: input.apiKey, CODEX_HOME: "/workspace/codex" },
-  });
-}
-
-function isActive(process: { status: string } | null | undefined) {
-  return process?.status === "running" || process?.status === "starting";
-}
-
-export async function observeCodex(
-  sandbox: CodexSandbox,
-  run: Run,
-  write: (chunk: UIMessageChunk) => void,
-  signal?: AbortSignal,
-): Promise<{ status: Exclude<Run["status"], "running">; error?: string }> {
-  const dir = runDirectory(run.id);
-  const events = new CodexEvents(write, run.id);
-  let toolError = "Codex stopped before reporting a result.";
+  if (!response.webSocket)
+    throw new Error("Could not connect to Codex app-server.");
+  response.webSocket.accept();
+  const client = new AppServer(response.webSocket);
   try {
-    if (await sandbox.getProcess(run.id)) {
-      // Cloudflare replays buffered stdout, then streams live output and exit.
-      const stream = await sandbox.streamProcessLogs(run.id);
-      let exited = false;
-      for await (const event of parseSSEStream<LogEvent>(stream, signal)) {
-        if (event.type === "stdout") events.push(event.data);
-        if (event.type === "error")
-          throw new Error("Codex output stream failed.");
-        if (event.type === "exit") {
-          exited = true;
-          break;
-        }
-      }
-      if (!exited)
-        throw new Error("Codex output stream disconnected before exit.");
-    }
-    await confirmStopped(sandbox, run);
-    if (!(await sandbox.exists(`${dir}/result.json`)).exists) {
-      return {
-        status: "interrupted",
-        error:
-          "Codex was interrupted. The task was not automatically repeated.",
-      };
-    }
-    const { content } = await sandbox.readFile(`${dir}/result.json`);
-    const result = resultSchema.parse(JSON.parse(content));
-    toolError =
-      result.status === "cancelled"
-        ? "Cancelled"
-        : (result.error ?? "Command did not report a result.");
-    return {
-      ...result,
-      status: result.status === "timed-out" ? "failed" : result.status,
-    };
-  } finally {
-    events.failTools(toolError);
+    assertCurrent();
+    await client.initialize();
+    assertCurrent();
+  } catch (error) {
+    client.close();
+    throw error;
   }
+  return { client, threadId };
 }
 
-async function confirmStopped(sandbox: CodexSandbox, run: Run) {
-  if (isActive(await sandbox.getProcess(run.id))) {
-    throw new Error("Codex has not stopped; another turn cannot start yet.");
-  }
-}
-
-export async function stopCodex(sandbox: CodexSandbox, run: Run) {
-  if (!isActive(await sandbox.getProcess(run.id))) return;
-  // The runner watches this marker and aborts the official SDK's signal.
-  await sandbox.writeFile(`${runDirectory(run.id)}/cancel`, "cancel");
-  const stream = await sandbox.streamProcessLogs(run.id);
-  try {
-    for await (const event of parseSSEStream<LogEvent>(
-      stream,
-      AbortSignal.timeout(5000),
-    )) {
-      if (event.type === "exit") break;
-    }
-  } catch {
-    // Waiting is bounded, but Stop does not escalate to a forced kill.
-    await confirmStopped(sandbox, run);
-    return;
-  }
-  await confirmStopped(sandbox, run);
-}
-
-export async function sandboxThread(
-  sandbox: CodexSandbox,
-  run: Run,
-  fallback?: string,
-) {
-  const path = `${runDirectory(run.id)}/thread-id`;
-  if (!(await sandbox.exists(path)).exists) return fallback;
-  return (await sandbox.readFile(path)).content.trim();
-}
-
-export async function checkpointCodex(sandbox: CodexSandbox) {
-  // Called only after the process has stopped, including on cancellation.
+export function checkpointCodex(sandbox: CodexSandbox) {
   return sandbox.createBackup({
     dir: "/workspace",
     ttl: 30 * 24 * 60 * 60,

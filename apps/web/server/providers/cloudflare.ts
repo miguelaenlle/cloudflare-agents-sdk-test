@@ -9,7 +9,7 @@ import {
 } from "@playground/chat-contract";
 
 const CONNECTION_TIMEOUT_MS = 10_000;
-const REQUEST_TIMEOUT_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 const resumeEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("cf_agent_stream_resuming"), id: z.string() }),
   z.object({
@@ -22,9 +22,17 @@ const resumeEventSchema = z.discriminatedUnion("type", [
 export function createCloudflareProvider(workerUrl: URL): ChatProvider {
   const agentUrl = new URL(`/agents/chat/${CONVERSATION_ID}`, workerUrl);
 
-  async function request(path: string, method: string, signal: AbortSignal) {
+  async function request(
+    path: string,
+    method: string,
+    signal: AbortSignal,
+    body?: unknown,
+  ) {
     const response = await fetch(`${agentUrl}/${path}`, {
       method,
+      headers:
+        body === undefined ? undefined : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.any([
         signal,
         AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -32,7 +40,8 @@ export function createCloudflareProvider(workerUrl: URL): ChatProvider {
     });
     if (!response.ok) {
       throw new Error(
-        `Cloudflare ${method} ${path} failed (${response.status}).`,
+        (await response.json().catch(() => null))?.error ??
+          `Cloudflare ${method} ${path} failed (${response.status}).`,
       );
     }
     return response;
@@ -45,6 +54,9 @@ export function createCloudflareProvider(workerUrl: URL): ChatProvider {
       // An empty history is valid, although the SDK validates nonempty chat requests.
       if (Array.isArray(messages) && messages.length === 0) return [];
       return validateUIMessages({ messages });
+    },
+    async steer(input, signal) {
+      await request("steer", "POST", signal, input);
     },
     async cancel(signal) {
       await request("cancel", "POST", signal);

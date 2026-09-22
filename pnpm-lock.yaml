@@ -23,9 +23,9 @@ importers:
       '@cloudflare/sandbox':
         specifier: 0.12.9
         version: 0.12.9
-      '@openai/codex-sdk':
-        specifier: 0.155.0
-        version: 0.155.0
+      '@playground/chat-contract':
+        specifier: workspace:*
+        version: link:../../packages/chat-contract
       agents:
         specifier: 0.23.0
         version: 0.23.0(@ai-sdk/react@4.0.105(react@19.3.0)(zod@4.6.5))(@babel/core@8.0.5)(@babel/runtime@7.29.7)(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(@modelcontextprotocol/server@2.0.0)(ai@7.0.102(zod@4.6.5))(react@19.3.0)(rolldown@1.2.9)(vite@8.3.0(@types/node@24.13.5)(esbuild@0.28.2)(yaml@2.9.1))(zod@4.6.5)
@@ -39,6 +39,9 @@ importers:
       '@cloudflare/workers-types':
         specifier: 5.20260917.1
         version: 5.20260917.1
+      '@openai/codex':
+        specifier: 0.155.0
+        version: 0.155.0
       '@types/node':
         specifier: ^24.13.5
         version: 24.13.5
@@ -845,10 +848,6 @@ packages:
   '@modelcontextprotocol/server@2.0.0':
     resolution: {integrity: sha512-YhHWdHfpFMQfd0prsEnxKeS3Qz3ytIGmsS0sth4KDjnacIT7hxk6hXHkJ9KysxlkvTM+WZAtQbbcUhdoP4Hvtw==}
     engines: {node: '>=20'}
-
-  '@openai/codex-sdk@0.155.0':
-    resolution: {integrity: sha512-oD/7iCZnXqDlrnoWWpGkZExrUStpAau1koyUO/fSW3WwkqewRf+MGj3OS41Buw7gNwj0oM6ilI9RHqP5QQWJaQ==}
-    engines: {node: '>=18'}
 
   '@openai/codex@0.155.0':
     resolution: {integrity: sha512-35a85Hbwy9WXkDTJumLjTcmMgpR7BMdrTloWBVGjoA+FBCh7jb3+cYp2W+3U4klqGAjAskoIvQZv7/eedmCjHA==}
@@ -2612,10 +2611,6 @@ snapshots:
     dependencies:
       '@modelcontextprotocol/core': 2.0.0
       zod: 4.6.5
-
-  '@openai/codex-sdk@0.155.0':
-    dependencies:
-      '@openai/codex': 0.155.0
 
   '@openai/codex@0.155.0':
     optionalDependencies:

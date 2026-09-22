@@ -1,36 +1,37 @@
-# Persistent Codex chat through a local relay
+# Persistent Codex chat
 
-A minimal PrairieLearn-shaped prototype: the official TypeScript Codex SDK runs native Codex inside a Cloudflare Sandbox; an `AIChatAgent` owns the durable chat. The local webserver can disappear without stopping a turn. No PrairieLearn application files are changed.
+A minimal PrairieLearn-shaped prototype: a React/Vercel AI SDK UI talks through a replaceable Express relay to a Cloudflare `AIChatAgent`. Native **Codex app-server** runs inside a Cloudflare Sandbox and owns the model/tool loop. The browser and webserver can disappear without cancelling work.
 
-See the [technical architecture and global state machine](docs/architecture.md) for the horizontal system diagram, component ownership, protocols, persistence, lifecycle, failure behavior, and path to Course agent MVP.
+[Architecture and diagrams](docs/architecture.md) · [Proposal status](docs/architecture-proposed.md)
 
 ```text
-React / AI SDK useChat on localhost:4315
-  ↕ HTTP commands + AI SDK message-stream SSE
-Local Express relay on 127.0.0.1:4316
-  ↕ Cloudflare WebSocket / HTTP adapter
-Cloudflare Chat("playground") / AIChatAgent
-  ↕ Sandbox SDK
-Cloudflare Sandbox: official Codex SDK → local Codex + workspace
-  ↕ OpenAI model inference
+Browser: React / AI SDK
+  ↕ HTTP commands + AI SDK SSE
+PL-style Express relay
+  ↕ Cloudflare chat WebSocket + HTTP controls
+Chat Durable Object: history, coordinator, protocol/event adapter
+  ↕ Private app-server WebSocket via Cloudflare Sandbox SDK
+Sandbox: persistent native Codex app-server + workspace
+  ↕ HTTPS Responses through outbound credential injection
+OpenAI
 
-Completed workspace + native Codex session → R2 checkpoint
+Workspace + native session → R2 checkpoints
 ```
-
-The browser and relay have the same provider-independent interface as before. Codex owns its tool loop, commands, edits, and native conversation. There is no OpenAI Agents API or custom agent loop. Chat text is emitted when Codex completes a message item, not token by token.
 
 ## Code map
 
-- `apps/agent/agent.ts`: coordinates turns, cancellation, durable cleanup, and UI history through `AIChatAgent`.
-- `apps/agent/codex.ts`: starts/observes/stops Codex and saves/restores the sandbox.
-- `apps/agent/codex-events.ts`: converts streamed SDK events into standard AI SDK text and tool events.
-- `apps/agent/run-codex.mjs`: small container runner; calls `startThread` / `resumeThread` and `runStreamed`, redacts and streams events, and handles cancellation/deadlines.
-- `apps/agent/Dockerfile`: pins Sandbox **0.12.9** and Codex SDK **0.155.0** (which installs its matching native CLI). No credentials in the image.
-- `apps/web/client/`: barebones React UI with standard `useChat` and `DefaultChatTransport`.
-- `apps/web/server/`: stateless Express HTTP/SSE relay and the Cloudflare-specific adapter.
-- `packages/chat-contract/`: shared routes, request validation, and provider interface. No Cloudflare dependency.
+| File                                   | Responsibility                                                             |
+| -------------------------------------- | -------------------------------------------------------------------------- |
+| `apps/agent/agent.ts`                  | Chat coordinator, steering/Stop, deadlines, checkpoint and recovery policy |
+| `apps/agent/codex.ts`                  | Start/reuse app-server, private connection, restore/backup                 |
+| `apps/agent/app-server.ts`             | Small typed JSON-RPC client                                                |
+| `apps/agent/codex-events.ts`           | Native notifications → AI SDK text/tool events                             |
+| `apps/agent/sandbox.ts`, `outbound.ts` | Network allowlist and OpenAI credential injection                          |
+| `apps/agent/protocol.ts`               | Generated types from pinned Codex 0.155.0; do not hand-edit                |
+| `apps/web/`                            | Barebones UI, stateless relay, replaceable provider adapter                |
+| `packages/chat-contract/`              | Provider-independent routes, types, steering validation                    |
 
-To replace Cloudflare, change the server's provider adapter and deployed agent. The frontend event format and HTTP interface can stay; stored history still needs migration.
+The per-turn runner and Codex TypeScript SDK are removed. Prompts/steering/interrupts use app-server RPC; chat delivery no longer parses stdout. Process logs are diagnostic only.
 
 ## Cloudflare setup — you perform these steps
 
@@ -59,7 +60,7 @@ pnpm --filter @playground/agent exec wrangler secret put R2_SECRET_ACCESS_KEY --
 pnpm deploy
 ```
 
-Wrangler builds/uploads the container and deploys the Worker. The original `Chat` SQLite migration is preserved; `v2` adds `Sandbox`. No website is hosted by this Worker. Earlier Workers AI chat history remains visible, but it is not imported into the new native Codex thread.
+Wrangler builds/uploads the container and deploys the Worker. The existing `Chat` and `Sandbox` SQLite migrations are preserved. The Sandbox class and `ContainerProxy` export enable outbound interception. No website is hosted by this Worker. Earlier Workers AI chat history remains visible, but it is not imported into the new native Codex thread.
 
 Backups expire after **30 days**. Configure an R2 lifecycle rule on `backups/` to delete objects older than 31 days; the SDK's expiry does not delete the objects. This is a prototype retention policy, not permanent storage. An expired backup causes an explicit restore error.
 
@@ -83,69 +84,75 @@ Open **http://localhost:4315**. Restart the backend after changing `.env.local`.
 
 ## Try it
 
-1. Ask: **Create hello.txt containing a short greeting and run a command to print it.** Verify tool activity and the reply.
-2. Ask: **What did you put in hello.txt? Read it again.** This must resume the same native Codex thread.
-3. Click **Run one-minute task**. After command activity appears, stop the local backend and close the page. Restart it after a minute; the completed answer should be in history. Repeat with a restart during the turn to test stream replay.
-4. Click **Stop** during a task. It must stop the sandbox process; closing the page alone must not.
-5. Leave the conversation in `waiting_for_user` for ten minutes and confirm the sandbox is destroyed in Cloudflare. Ask it to read `hello.txt` again: a new sandbox should restore both workspace and native session from R2. History reads and browser reconnections must not extend the waiting deadline.
-6. Verify the six-hour sandbox lifetime deadline destroys the sandbox even during a turn. A later message should restore the last successful checkpoint without replaying the interrupted prompt.
+1. Ask **Create hello.txt containing a greeting, then print it with a shell command.** Verify streamed text and tool output.
+2. Ask **What did you put in hello.txt?** The same sandbox process and native thread should be reused.
+3. Click **Run one-minute task**. After work starts, restart the local backend or close the browser. Reconnect to see the saved/live result.
+4. During a turn, enter a correction and click **Steer current turn**. It adds input to that native turn; it does not restart the process. Reopen history to verify the accepted correction was saved.
+5. Click **Stop**. Wait for interruption confirmation; the app-server stays running and the next prompt resumes the thread. Closing the page alone never cancels work.
+6. Wait ten minutes in `waiting_for_user`, then send another prompt. Confirm destruction and restoration of both `hello.txt` and native context from R2.
+7. Verify the sliding six-hour user-interaction deadline. An accepted prompt/steer/active-turn Stop resets it; model/tool output and reconnects do not. There is no absolute sandbox-age cap.
 
-The live container checks are still necessary. In particular, verify that Codex's `workspace-write` sandbox works inside Cloudflare's runtime. The implementation never silently disables it. Inspect Worker logs with:
+Live acceptance must verify outbound HTTPS interception/TLS trust, private socket authentication, Codex `workspace-write` tool execution, and real R2 restoration. No cloud deployment or paid inference has been run by the implementation tests. Use Worker logs for diagnostics:
 
 ```sh
 pnpm --filter @playground/agent exec wrangler tail --config wrangler.jsonc
 ```
 
-SDK events travel over stdout through Cloudflare's buffered process-log stream. Non-secret input, cancellation markers, thread IDs, and final outcomes live under `/tmp/codex-runs/<run-id>/`, outside checkpoints. The runner determines the Codex outcome; the Worker handles infrastructure interruptions. SDK failures are reported in the chat; inspect the Sandbox process logs for runner startup failures.
+## Behavior and limits
 
-## Persistence and limits
+- **One app-server per warm sandbox.** `turn/completed` ends a turn; it does not exit the process. Close the control socket between turns and reconnect/initialize/resume on the next prompt.
+- **Persistence:** UI history/replay and coordination are in Chat DO SQLite. `/workspace/repo` and `/workspace/codex` are backed up after terminal turns and before idle destruction. Only the last successful checkpoint survives unexpected loss.
+- **Lifecycle:** `keepAlive: false`, CF `sleepAfter: "6h"`, ten minutes waiting-state cleanup, and a separate durable six-hour deadline since user input. An open proxied WebSocket prevents CF idle expiry; the application deadline still bounds active work.
+- **Uncertain execution:** reconnect and inspect/interrupt surviving native work before accepting another turn. Never automatically replay a prompt. Missing tool events may become a terminal recovery message rather than a complete event replay.
+- **Stop:** RPC acknowledgment is insufficient; wait for a terminal notification. Unconfirmed Stop blocks another turn; deadline cleanup can eventually destroy the box.
+- **Cleanup:** at most three automatic attempts, 30 seconds apart. Failed destruction retains the sandbox identity and blocks replacement; a later prompt can explicitly retry.
+- **History and backups are not atomic.** Restoring files may roll back work still described in UI history. Backup cadence remains conservative pending measurement.
+- **Trusted prototype only:** one shared conversation, no authentication or approval UI. Origin checks are not authorization. Multi-window synchronization remains a gap.
 
-- `AIChatAgent` persists the UI transcript. Codex's native session lives in `/workspace/codex`; the working Git repository is `/workspace/repo`.
-- A turn gets a durable run ID before launch. The launcher atomically claims that ID. A Chat Durable Object restart stops any surviving process and saves an interruption message. It never automatically repeats the prompt or reattaches to the old execution.
-- The Worker consumes Cloudflare’s process-log SSE stream, including buffered output from before attachment. There is no observation polling loop or container HTTP service. A disconnected process stream reports failure; it never replays the prompt.
-- Sandbox state follows `offline → starting → waiting_for_agent → waiting_for_user`. Keep-alive remains enabled between turns. A durable callback transitions `waiting_for_user → suspending → offline` after ten minutes, making a fresh checkpoint before destroying the sandbox. An active turn or a different waiting period invalidates an old idle callback. History reads do not wake the container or extend this deadline.
-- **Stop** writes a cancellation marker watched by the runner, which aborts `runStreamed` through the SDK. The coordinator waits up to five seconds for exit; it never force-kills merely because that wait expires. An unconfirmed stop reports an error and keeps the run active, keep-alive enabled, and new turns blocked. This ends the current turn; the next prompt resumes the native thread.
-- There is no ten-minute turn limit. Each sandbox generation has an absolute six-hour deadline, measured from allocation before startup and unchanged by later turns. The runner and process timeout use the remaining lifetime. The Chat DO schedules destruction at that same deadline and aborts its observer; it does not wait for graceful stop or a new backup. Work since the last checkpoint can be lost. Each new sandbox gets a new ID so stale callbacks cannot destroy its replacement.
-- Cleanup makes at most three attempts, 30 seconds apart. Idle backup failure keeps the workspace for another attempt or user message. Hard-expiry destruction failure records `cleanup_failed`, attempts to disable keep-alive, and does not silently provision another box. A later user message can explicitly retry destruction before restoring. The underlying `sleepAfter: "6h"` is a fallback idle timeout, not the absolute cap. Cloudflare API outages can delay actual destruction; a deadline is not a platform guarantee.
-- A turn-end checkpoint failure is reported while the sandbox remains warm. Idle suspension retries backup before destruction; the hard six-hour cap still takes precedence. Only the last successful checkpoint is guaranteed to survive container loss.
-- A container crash during a turn may lose work since the last checkpoint. The UI reports interruption rather than claiming exactly-once execution.
-- One shared conversation, one sandbox, no authentication or approval UI. This is for a trusted disposable workspace. The runtime API-key environment variable is readable by code inside the container; do not use this prototype for untrusted course code or expose it publicly as a production service.
-- A passive second tab needs **Reconnect / refresh history** to see a turn started elsewhere.
+## Credentials and network
 
-## Credentials and saved output
+`CODEX_API_KEY` stays a Worker secret. The Sandbox outbound handler injects it only into HTTPS POSTs to OpenAI Responses/compaction. It rejects redirects and overwrites caller authorization. Codex is configured for HTTP Responses without local authentication or model WebSockets.
 
-`CODEX_API_KEY` is injected into the runner environment, then passed to the official SDK. Codex uses memory-only credential storage (`cli_auth_credentials_store = "ephemeral"`). The native process receives only a small environment allowlist; shell tools inherit no environment and get only `PATH` and `HOME` explicitly.
+The container also permits the configured R2 account host for SDK presigned backup transfers. Other internet hosts—including Git/package registries—are blocked until explicitly allowed. The permanent R2 keys also stay in Workers; presigned URLs are short-lived scoped capabilities available during transfers.
 
-The runner redacts the exact injected key from structured event strings and final errors before writing stdout/results. The coordinator also redacts that key from errors it reports or logs. Run artifacts and Codex diagnostic file logs are under `/tmp`. Checkpoints retain `/workspace/repo` and native session state in `/workspace/codex`; they exclude `codex/auth.json`, legacy `codex/log`, and legacy `runs` directories as defense in depth.
+The private app-server socket has its own capability token in `/tmp`, separate from the OpenAI key. No OpenAI credential is passed in the container environment, auth file, or prompt; no runner redaction remains. Prompts, files, and native sessions can still contain unrelated sensitive information. Legacy credential paths remain excluded from backups; existing backups are not retroactively cleaned.
 
-This is not a guarantee that all stored data is secret-free. Native Codex session files are written before our event adapter and may contain sensitive prompts or tool output. Files deliberately written to the repository are also backed up. Environment filtering is not isolation from code that can inspect other processes. Exact-key redaction does not cover encoded keys or unrelated secrets. R2's encryption at rest does not hide content from authorized backup readers, and these changes do not scrub existing backups. Treat native sessions and backups as sensitive data.
+On upgrade from the old runner, stop old work first; the runtime does not migrate an actively executing runner into an app-server turn.
 
-## Stable web interface
+## Web interface
 
 | Endpoint                          | Behavior                                          |
 | --------------------------------- | ------------------------------------------------- |
-| `GET /api/chat/history`           | Saved AI SDK `UIMessage[]`                        |
-| `POST /api/chat`                  | Send a message; receive UI Message Stream SSE     |
-| `GET /api/chat/playground/stream` | Replay/attach to the current turn, or 204 if idle |
-| `POST /api/chat/cancel`           | Explicitly stop the active work                   |
+| `POST /api/chat`                  | Submit messages; AI SDK UI Message Stream SSE     |
+| `GET /api/chat/history`           | Saved `UIMessage[]`                               |
+| `GET /api/chat/playground/stream` | Replay/attach to current output, or 204           |
+| `POST /api/chat/cancel`           | Explicit interruption                             |
+| `POST /api/chat/steer`            | `{ id, runId, text }`; steer only that active run |
+
+Replacing Cloudflare changes the provider adapter and agent deployment; these browser routes/events can stay. Persistent data needs migration.
 
 ## Local checks
 
 ```sh
 pnpm typecheck
 pnpm build
-pnpm format:check
 pnpm test
+pnpm --filter @playground/agent test:native
+pnpm format:check
 ```
 
-Tests require neither credentials nor Docker. They run the real chat coordinator against a deterministic Sandbox substitute, plus native subprocess tests with a fake Codex executable. They cover JSONL chunking, tool mapping, duplicate launch prevention, SDK subprocess cancellation, confirmed Sandbox stop, relay replacement, saved history, cancellation, cold restoration, Worker restart interruption without replay, checkpoint failure followed by warm resume, ten-minute waiting-state destruction, stale callbacks, active work beyond ten minutes, absolute six-hour expiry, restoration after destruction, and bounded cleanup failures.
+`pnpm test` uses real AIChatAgent/Worker and relay code against a simulated sandbox. It covers reconnection, detached completion, native-process reuse, steering persistence, Stop, lost start acknowledgment, restore, stale alarms, sliding deadlines, and cleanup failures. `test:native` runs the pinned native app-server with a fake local Responses endpoint; it needs no API key, Docker, or paid inference.
 
-`pnpm build:worker` is a deployment dry run that also needs Docker to build the image. To check just Worker bundling without Docker:
+Regenerate protocol types after intentionally updating the Codex pin:
+
+```sh
+pnpm --filter @playground/agent generate:protocol
+```
+
+To check Worker bundling without building/deploying a container:
 
 ```sh
 pnpm --filter @playground/agent exec wrangler deploy --config wrangler.jsonc --dry-run --containers-rollout=none --outdir dist
 ```
 
-No cloud deployment or paid inference is part of these local tests. A passing fixture test is not proof of Cloudflare container compatibility or a real R2 restore.
-
-References: [Codex SDK](https://developers.openai.com/codex/sdk/), [Sandbox processes](https://developers.cloudflare.com/sandbox/guides/background-processes/), [Sandbox backups and R2 setup](https://developers.cloudflare.com/sandbox/guides/backup-restore/).
+`pnpm build:worker` also builds the container and requires Docker. Neither dry-run command deploys. Local tests do not prove the full Cloudflare/R2 integration; complete the acceptance steps above before relying on it.

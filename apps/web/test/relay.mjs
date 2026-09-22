@@ -115,6 +115,34 @@ try {
   );
 
   const first = await firstText(await send());
+  const fixture = "http://localhost:8791/agents/chat/playground/test";
+  const active = await (await fetch(`${fixture}/state`)).json();
+  const steering = {
+    id: crypto.randomUUID(),
+    runId: active.run.id,
+    text: "Please also explain the result.",
+  };
+  assert.equal(
+    (
+      await fetch(`${api}/steer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(steering),
+      })
+    ).status,
+    204,
+  );
+  assert.equal(
+    (
+      await fetch(`${api}/steer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(steering),
+      })
+    ).status,
+    204,
+  );
+  assert.equal((await (await fetch(`${fixture}/status`)).json()).steers, 1);
   await stopServer();
   await assert.rejects(async () => {
     while (!(await first.read()).done) {}
@@ -186,7 +214,6 @@ try {
   console.log(
     "Passed: explicit cancellation stops the agent independently of SSE disconnection.",
   );
-  const fixture = "http://localhost:8791/agents/chat/playground/test";
   assert.equal(
     (await fetch(`${fixture}/sleep`, { method: "POST" })).status,
     204,
@@ -195,15 +222,21 @@ try {
   }
   const status = await (await fetch(`${fixture}/status`)).json();
   assert.deepEqual(status, {
-    launches: 4,
+    launches: 2,
     restores: 1,
-    keepAlive: true,
+    running: true,
     destroys: 0,
+    steers: 1,
+    turns: 4,
   });
   console.log(
     "Passed: cold restore resumes the native thread and keeps the sandbox warm.",
   );
 
+  assert.ok((await history()).some((message) => message.id === steering.id));
+  console.log(
+    "Passed: accepted steering is durable and idempotent at the PL request boundary.",
+  );
   const beforeRecovery = (await history()).filter(
     (m) => m.role === "assistant",
   ).length;
@@ -241,10 +274,12 @@ try {
     "Task interrupted. It was not automatically repeated. You can send another message to continue.",
   );
   assert.deepEqual(await (await fetch(`${fixture}/status`)).json(), {
-    launches: 5,
+    launches: 2,
     restores: 1,
-    keepAlive: true,
+    running: true,
     destroys: 0,
+    steers: 1,
+    turns: 5,
   });
   console.log(
     "Passed: Worker replacement stops surviving work, saves interruption, and never repeats the prompt.",
@@ -263,10 +298,7 @@ try {
         part.text.includes("Task failed: Fixture R2 unavailable"),
     ),
   );
-  assert.equal(
-    (await (await fetch(`${fixture}/status`)).json()).keepAlive,
-    true,
-  );
+  assert.equal((await (await fetch(`${fixture}/status`)).json()).running, true);
   console.log(
     "Passed: checkpoint failure is saved in history and keeps the sandbox warm.",
   );
@@ -288,6 +320,29 @@ try {
   assert.equal(nextRun.checkpoint.threadId, "native-thread");
   console.log(
     "Passed: failed first checkpoint preserves the native thread for the next warm turn.",
+  );
+
+  const beforeUncertain = await (await fetch(`${fixture}/status`)).json();
+  await fetch(`${fixture}/drop-start-ack`, { method: "POST" });
+  for await (const _chunk of await send()) {
+  }
+  assert.equal(
+    (await (await fetch(`${fixture}/state`)).json()).run.status,
+    "running",
+  );
+  assert.equal(
+    (await fetch(`${fixture}/recover`, { method: "POST" })).ok,
+    true,
+  );
+  const afterUncertain = await (await fetch(`${fixture}/status`)).json();
+  assert.equal(afterUncertain.turns, beforeUncertain.turns + 1);
+  assert.equal(afterUncertain.launches, beforeUncertain.launches);
+  assert.equal(
+    (await (await fetch(`${fixture}/state`)).json()).run.status,
+    "interrupted",
+  );
+  console.log(
+    "Passed: lost turn/start acknowledgment is reconciled without replay or process replacement.",
   );
 
   const failedCancelReader = await firstText(await send());
@@ -328,11 +383,13 @@ try {
   assert.equal(lease.phase, "waiting_for_user");
   const schedules = await (await fetch(`${fixture}/schedules`)).json();
   const lifetime = schedules.filter(
-    (s) => s.payload.id === lease.id && s.payload.reason === "lifetime",
+    (s) => s.payload.id === lease.id && s.payload.reason === "interaction",
   );
   assert.equal(lifetime.length, 1);
   assert.ok(
-    Math.abs(lifetime[0].time * 1000 - lease.createdAt - minutes(360)) < 1000,
+    Math.abs(
+      lifetime[0].time * 1000 - lease.lastUserInteractionAt - minutes(360),
+    ) < 1000,
   );
   await advance(minutes(9));
   assert.equal((await getStatus()).destroys, 0);
@@ -360,14 +417,33 @@ try {
   await advance(minutes(20));
   assert.equal((await getState()).run.status, "running");
   assert.equal((await getStatus()).destroys, 1);
+  await advance(minutes(300));
+  const beforeSteer = (await getState()).sandbox.lastUserInteractionAt;
+  const steerRun = (await getState()).run.id;
+  const steer = async (runId) =>
+    fetch(`${api}/steer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        runId,
+        text: "Keep working.",
+      }),
+    });
+  assert.equal((await steer(crypto.randomUUID())).ok, false);
+  assert.equal((await getState()).sandbox.lastUserInteractionAt, beforeSteer);
+  assert.equal((await steer(steerRun)).status, 204);
+  await advance(minutes(61));
+  assert.equal((await getState()).sandbox.id, restored.sandbox.id);
+  assert.equal((await getState()).run.status, "running");
   await fetch(`${api}/cancel`, { method: "POST" });
   while (!(await activeReader.read()).done) {}
-  assert.equal(
-    (await getState()).sandbox.createdAt,
-    restored.sandbox.createdAt,
+  assert.ok(
+    (await getState()).sandbox.lastUserInteractionAt >
+      restored.sandbox.lastUserInteractionAt,
   );
   console.log(
-    "Passed: a new turn invalidates old idle timers, can run beyond ten minutes, and does not reset sandbox age.",
+    "Passed: a new turn invalidates old idle timers, can run beyond ten minutes, and refreshes the interaction deadline.",
   );
 
   await fetch(`${fixture}/fail-backup`, { method: "POST" });
@@ -391,7 +467,9 @@ try {
     (await history())
       .at(-1)
       .parts.some(
-        (p) => p.type === "text" && p.text.includes("six-hour lifetime"),
+        (p) =>
+          p.type === "text" &&
+          p.text.includes("No user interaction for six hours"),
       ),
   );
   assert.deepEqual(liveDeadline.checkpoint, beforeExpiry.checkpoint);
@@ -399,7 +477,7 @@ try {
   }
   assert.equal((await getState()).run.status, "completed");
   console.log(
-    "Passed: six-hour cap destroys during active work and restores the last checkpoint on the next message.",
+    "Passed: six-hour interaction deadline destroys during active work and restores the last checkpoint on the next message.",
   );
 
   await fetch(`${fixture}/ignore-cancel`, { method: "POST" });
@@ -420,7 +498,7 @@ try {
   await advance(31_000);
   await advance(31_000);
   assert.equal((await getStatus()).destroys, destroyedBeforeFailures + 3);
-  assert.equal((await getStatus()).keepAlive, false);
+  assert.equal((await getStatus()).running, true);
   assert.equal((await getState()).sandbox.phase, "cleanup_failed");
   await advance(minutes(1));
   assert.equal((await getStatus()).destroys, destroyedBeforeFailures + 3);
@@ -434,7 +512,7 @@ try {
   await post(`${fixture}/run`);
   assert.equal((await getState()).run.status, "completed");
   console.log(
-    "Passed: cleanup stops after three failures, disables keep-alive, and an explicit new message can retry and restore.",
+    "Passed: cleanup stops after three failures, retains the sandbox identity, and an explicit new message can retry and restore.",
   );
 } catch (error) {
   console.error(logs.slice(-12_000));

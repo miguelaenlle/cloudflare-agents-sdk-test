@@ -1,10 +1,6 @@
 import { Chat as ProductionChat } from "../agent.ts";
 import worker from "../agent.ts";
-import {
-  SANDBOX_IDLE_MS,
-  SANDBOX_LIFETIME_MS,
-  type CodexSandbox,
-} from "../codex.ts";
+import { SANDBOX_IDLE_MS, USER_IDLE_MS, type CodexSandbox } from "../codex.ts";
 import { TestSandbox } from "./sandbox.ts";
 export { TestSandbox };
 
@@ -20,7 +16,19 @@ export class Chat extends ProductionChat {
     return env.TestSandbox.get(env.TestSandbox.idFromName(this.name));
   }
   protected override sandbox(_id: string) {
-    return this.fixture() as unknown as CodexSandbox;
+    const fixture = this.fixture();
+    return new Proxy(fixture, {
+      get(target, key) {
+        if (key === "wsConnect")
+          return (request: Request) => target.fetch(request);
+        if (key === "startProcess")
+          return async (command: string, options: { processId: string }) => {
+            await target.startProcess(command, options);
+            return { waitForPort: async () => {} };
+          };
+        return Reflect.get(target, key);
+      },
+    }) as unknown as CodexSandbox;
   }
   override async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
@@ -32,7 +40,7 @@ export class Chat extends ProductionChat {
           parts: [{ type: "text", text: "Run fixture." }],
         },
       ]);
-      const response = await this.onChatMessage(() => {});
+      const response = await this.onChatMessage();
       await response.text();
       return Response.json(this.state);
     }
@@ -55,18 +63,19 @@ export class Chat extends ProductionChat {
     }
     if (path.endsWith("/test/expire")) {
       const lifecycle = this.state.sandbox!;
-      this.timeOffset = lifecycle.createdAt + SANDBOX_LIFETIME_MS - Date.now();
+      this.timeOffset =
+        lifecycle.lastUserInteractionAt + USER_IDLE_MS - Date.now();
       for (const schedule of this.getSchedules<{
         id: string;
         reason: string;
       }>()) {
         if (
           schedule.payload.id === lifecycle.id &&
-          schedule.payload.reason === "lifetime"
+          schedule.payload.reason === "interaction"
         )
           await this.cancelSchedule(schedule.id);
       }
-      await this.expireSandbox({ id: lifecycle.id, reason: "lifetime" });
+      await this.expireSandbox({ id: lifecycle.id, reason: "interaction" });
       return Response.json(this.state);
     }
     if (path.endsWith("/test/stale-idle")) {
@@ -79,7 +88,19 @@ export class Chat extends ProductionChat {
     }
     if (path.endsWith("/test/expire-old")) {
       const { id } = await request.json<{ id: string }>();
-      await this.expireSandbox({ id, reason: "lifetime" });
+      await this.expireSandbox({ id, reason: "interaction" });
+      return Response.json(this.state);
+    }
+    if (path.endsWith("/test/drop-start-ack")) {
+      await this.fixture().dropNextStartAck();
+      return new Response(null, { status: 204 });
+    }
+    if (path.endsWith("/test/disconnect")) {
+      await this.fixture().disconnect();
+      return new Response(null, { status: 204 });
+    }
+    if (path.endsWith("/test/recover")) {
+      await this.onChatRecovery();
       return Response.json(this.state);
     }
     if (path.endsWith("/test/sleep")) {

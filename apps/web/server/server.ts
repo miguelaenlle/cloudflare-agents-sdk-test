@@ -7,6 +7,8 @@ import {
 import { z } from "zod";
 import {
   CANCEL_API,
+  STEER_API,
+  steerRequestSchema,
   CHAT_API,
   sendRequestSchema,
   HISTORY_API,
@@ -56,6 +58,20 @@ app.get(HISTORY_API, async (_request, response) => {
   response.setHeader("Cache-Control", "no-store");
   response.json(messages);
 });
+
+app.post(
+  STEER_API,
+  express.json({ limit: 150_000 }),
+  async (request, response) => {
+    const input = steerRequestSchema.safeParse(request.body);
+    if (!input.success) {
+      response.status(400).send("Invalid steering request.");
+      return;
+    }
+    await provider.steer(input.data, clientSignal(response));
+    response.status(204).end();
+  },
+);
 
 app.post(CANCEL_API, async (_request, response) => {
   await provider.cancel(clientSignal(response));

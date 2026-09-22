@@ -4,6 +4,7 @@ import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, validateUIMessages, type UIMessage } from "ai";
 import {
   CANCEL_API,
+  STEER_API,
   CHAT_API,
   CONVERSATION_ID,
   HISTORY_API,
@@ -27,7 +28,25 @@ async function loadHistory(signal?: AbortSignal): Promise<UIMessage[]> {
   return validateUIMessages({ messages });
 }
 
-function Transcript({ messages }: { messages: UIMessage[] }) {
+type SteeringNote = { id: string; runId: string; text: string };
+
+function runIdOf(message: UIMessage | undefined) {
+  const metadata = message?.metadata;
+  return metadata &&
+    typeof metadata === "object" &&
+    "runId" in metadata &&
+    typeof metadata.runId === "string"
+    ? metadata.runId
+    : undefined;
+}
+
+function Transcript({
+  messages,
+  steeringNotes,
+}: {
+  messages: UIMessage[];
+  steeringNotes: SteeringNote[];
+}) {
   return (
     <section aria-label="Conversation">
       {messages.length === 0 && <p>No messages yet.</p>}
@@ -52,6 +71,13 @@ function Transcript({ messages }: { messages: UIMessage[] }) {
             }
             return null;
           })}
+          {steeringNotes
+            .filter((note) => note.runId === runIdOf(message))
+            .map((note) => (
+              <p key={note.id}>
+                <strong>Steering:</strong> {note.text}
+              </p>
+            ))}
         </article>
       ))}
     </section>
@@ -61,6 +87,8 @@ function Transcript({ messages }: { messages: UIMessage[] }) {
 function App({ initialMessages }: { initialMessages: UIMessage[] }) {
   const [input, setInput] = useState("");
   const [cancelError, setCancelError] = useState("");
+  const [steering, setSteering] = useState(false);
+  const [steeringNotes, setSteeringNotes] = useState<SteeringNote[]>([]);
   const [cancelling, setCancelling] = useState(false);
   const { messages, sendMessage, status, error, setMessages, resumeStream } =
     useChat({
@@ -106,6 +134,35 @@ function App({ initialMessages }: { initialMessages: UIMessage[] }) {
     }
   }
 
+  const runId = runIdOf(
+    messages.findLast((message) => message.role === "assistant"),
+  );
+
+  async function steerTurn() {
+    if (!runId || !input.trim()) return;
+    const text = input.trim();
+    const note = { id: crypto.randomUUID(), runId, text };
+    setSteering(true);
+    setCancelError("");
+    try {
+      const response = await fetch(STEER_API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(note),
+      });
+      if (!response.ok)
+        throw new Error(
+          "Steering was not confirmed. Reconnect to check history before retrying.",
+        );
+      setSteeringNotes((notes) => [...notes, note]);
+      setInput("");
+    } catch (error) {
+      setCancelError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSteering(false);
+    }
+  }
+
   function submitMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const text = input.trim();
@@ -124,7 +181,7 @@ function App({ initialMessages }: { initialMessages: UIMessage[] }) {
         {status === "error" ? "Reconnecting…" : busy ? "Working…" : "Ready"}
       </p>
 
-      <Transcript messages={messages} />
+      <Transcript messages={messages} steeringNotes={steeringNotes} />
 
       {error && <p role="alert">{error.message}</p>}
       {cancelError && <p role="alert">{cancelError}</p>}
@@ -141,6 +198,13 @@ function App({ initialMessages }: { initialMessages: UIMessage[] }) {
             Reconnect / refresh history
           </button>
           <button disabled={busy || !input.trim()}>Send</button>
+          <button
+            type="button"
+            disabled={!busy || !runId || steering || !input.trim()}
+            onClick={() => void steerTurn()}
+          >
+            Steer current turn
+          </button>
           <button
             type="button"
             disabled={cancelling}

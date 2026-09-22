@@ -1,7 +1,6 @@
 import { registerHooks } from "node:module";
 
-// The real Sandbox SSE parser is portable, but its package also imports Worker
-// classes. Unit tests must never instantiate those; integration tests use workerd.
+// Unit tests use portable helpers; Worker-only imports require workerd.
 const platform = `
   const unavailable = () => { throw new Error("Use workerd for Sandbox runtime tests."); };
   export class Container { constructor() { unavailable(); } }

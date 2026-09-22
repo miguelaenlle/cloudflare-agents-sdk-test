@@ -1,47 +1,37 @@
-# Persistent Codex prototype
+# Persistent Codex architecture
 
-A local React UI chats through a replaceable Express server with native Codex running in a Cloudflare Sandbox. The conversation survives browser/server disconnection; workspace recovery uses checkpoints.
+React/AI SDK → stateless PL relay → Chat Durable Object → Codex app-server in a Cloudflare Sandbox. Native Codex owns the model/tool loop. The Chat DO owns admission, UI history, lifecycle, and recovery.
 
-**Status:** local tests pass using a simulated sandbox. Real Cloudflare containers, Codex execution, and R2 restoration still need live verification. [Setup and smoke tests](../README.md).
+**Implemented locally.** Tests cover the real app-server with a fake model endpoint and the real Cloudflare chat runtime with a simulated sandbox. Live outbound credential injection, container isolation, and R2 restore still need deployment verification. [Setup](../README.md).
 
-## Key decisions
+## Components and boundaries
 
-- **Codex owns the agent loop.** One runner process per user prompt; subsequent prompts resume the native thread.
-- **The Chat DO owns coordination and history.** The PL server holds no durable execution state.
-- **The browser uses standard AI SDK HTTP/SSE.** The backend adapter handles Cloudflare WebSockets.
-- **Disconnection is not cancellation.** Reconnect to replay output; use Stop to cancel execution.
-- **Recovery restores files, not running processes.** Interrupted prompts are never automatically repeated.
-
-This documents the current implementation: keep-alive, ten-minute waiting-state cleanup, and an absolute six-hour sandbox lifetime. The discussed switch to Cloudflare-only idle shutdown is **not implemented**.
-
-## Architecture
-
-**One Worker deployment contains the entry point, Chat DO class, and Sandbox DO class.** DO instances have independent state and lifetimes; the Linux container runs separately.
+The Worker entry point, Chat class, and Sandbox class are deployed together. Each DO instance has its own state/lifetime; the Linux container is a separate runtime.
 
 ```mermaid
 flowchart TB
     subgraph browser["1 · Browser"]
-        UI["React UI<br/>useChat + DefaultChatTransport"]
+        UI["React UI<br/>Vercel AI SDK useChat"]
     end
     subgraph backend["2 · PL webserver"]
-        Relay["Express HTTP endpoints<br/>Cloudflare provider adapter"]
+        Relay["Express endpoints<br/>Provider adapter"]
     end
     subgraph cloudflare["One Worker deployment · separate runtime instances"]
         subgraph entry["3 · Worker entry point"]
-            Router["Origin check + routeAgentRequest<br/>Routes HTTP requests and WebSocket upgrades"]
+            Router["Origin check + routeAgentRequest<br/>HTTP and WebSocket upgrade routing"]
         end
         subgraph chat["4 · Chat Durable Object — conversation ID"]
-            Coordinator["AIChatAgent + our coordinator<br/>Admit turns, stop, checkpoint, manage lifecycle"]
-            SQLite[("DO SQLite<br/>History, run state, replay, schedules")]
+            Coordinator["AIChatAgent + our coordinator<br/>App-server client and UI event mapper"]
+            SQLite[("DO SQLite<br/>History, replay, run state, deadlines")]
         end
         subgraph control["5 · Sandbox Durable Object — generation ID"]
-            SandboxAPI["Sandbox SDK<br/>Process, filesystem and container control"]
+            SandboxAPI["Cloudflare Sandbox SDK<br/>Provision, startProcess, wsConnect, backup"]
+            Auth["Sandbox outbound handler<br/>Inject Worker-secret OpenAI key"]
         end
     end
     subgraph container["6 · Linux sandbox container"]
-        Runner["New Node runner for each prompt<br/>Codex SDK: startThread / resumeThread<br/>then runStreamed(prompt)"]
-        Codex["Native Codex harness<br/>Reasoning and tool loop"]
-        Files[("/workspace<br/>Repository + native session")]
+        Codex["Codex app-server<br/>One process across turns<br/>Native model/tool loop"]
+        Files[("Workspace + native Codex session")]
     end
     subgraph model["7 · OpenAI"]
         Inference["Model inference"]
@@ -50,16 +40,17 @@ flowchart TB
         Backup[("Workspace checkpoints")]
     end
 
-    UI -->|"HTTP: send / history / resume / cancel"| Relay
-    Relay -->|"HTTP requests / WebSocket upgrade"| Router
-    Router -->|"Route to named conversation"| Coordinator
-    Coordinator -->|"Sandbox SDK: writeFile / startProcess"| SandboxAPI
-    Coordinator --- SQLite
-    SandboxAPI -->|"Write input.json; run node /opt/run-codex.mjs"| Runner
+    UI <-->|"HTTP requests / Vercel AI SDK SSE and JSON"| Relay
+    Relay <-->|"HTTP requests / WebSocket upgrade"| Router
+    Router <-->|"Cloudflare routing / upgrade response"| Coordinator
+    Relay <-->|"Established WebSocket: prompts / UI events"| Coordinator
+    Coordinator <-->|"Cloudflare Sandbox SDK: operations + WebSocket connection"| SandboxAPI
+    SandboxAPI <-->|"Cloudflare routing: app-server commands / events"| Codex
+    Coordinator <-->|"Persist / load"| SQLite
     SandboxAPI <-->|"Backup / restore"| Backup
-    Runner -->|"SDK launches CLI and writes prompt to stdin"| Codex
     Codex <-->|"Read / edit / execute"| Files
-    Codex <-->|"HTTPS model requests and responses"| Inference
+    Codex <-->|"Intercepted model requests / responses"| Auth
+    Auth <-->|"Authenticated model requests / responses"| Inference
 
     classDef default fill:#374151,stroke:#9ca3af,color:#f9fafb
     style cloudflare fill:#111827,stroke:#6b7280,color:#f3f4f6
@@ -74,183 +65,153 @@ flowchart TB
     linkStyle default stroke:#9ca3af
 ```
 
-The Worker routes HTTP requests and WebSocket upgrades; it is not our per-message relay after connection.
+Wrangler registers the exported DO classes and bindings. PL connects to `/agents/chat/playground`; `routeAgentRequest` selects that named Chat DO, and Cloudflare instantiates it as needed. `AIChatAgent` receives chat messages, persists history/replay in the DO's SQLite, and invokes our `onChatMessage`. The Worker routes the initial request/upgrade; we do not relay every WebSocket frame through another Worker handler.
 
-### One turn: request and response
-
-**The Chat DO launches and observes each turn. Native Codex owns the model/tool loop.**
+### One turn: commands and responses
 
 ```mermaid
 sequenceDiagram
     participant UI as Browser
     participant PL as PL backend
-    box rgb(31,41,55) Cloudflare DOs
+    box rgb(31,41,55) Cloudflare
         participant Chat as Chat DO
         participant Sandbox as Sandbox DO
     end
-    box rgb(31,41,55) Linux container
-        participant Runner as Runner + Codex SDK
-        participant Codex as Native Codex
-    end
+    participant Codex as Sandbox Codex app-server
+    participant Auth as Sandbox outbound handler
+    participant Model as OpenAI
 
-    UI->>PL: POST prompt (UI messages)
-    PL->>Chat: Submit via Cloudflare WebSocket transport
-    Chat->>Sandbox: SDK writeFile(input.json): prompt + thread ID
-    Chat->>Sandbox: SDK startProcess(node run-codex.mjs)
-    Sandbox->>Runner: Launch a new runner for this turn
-    Runner->>Runner: Read input, startThread or resumeThread
-    Runner->>Codex: runStreamed: SDK spawns CLI, writes stdin
-    Chat->>Sandbox: SDK streamProcessLogs(run ID)
-
-    loop Codex model/tool iterations
-        Codex->>Codex: Call OpenAI, run tools, update native session
-        Codex-->>Runner: Native stdout JSONL, SDK yields event objects
-        Runner-->>Sandbox: Redacted JSONL on runner stdout
-        Sandbox-->>Chat: Buffered/live process-log SSE
-        Chat->>Chat: Unwrap logs, map to UIMessageChunk
-        Chat-->>PL: AIChatAgent WebSocket chat envelopes
+    UI->>PL: POST prompt: UIMessage[]
+    PL->>Chat: Cloudflare chat WebSocket transport
+    Chat->>Sandbox: CF Sandbox SDK: restore and startProcess if cold
+    Chat->>Sandbox: CF Sandbox SDK: wsConnect on private port 4500
+    Sandbox-->>Chat: Cloudflare-routed WebSocket to app-server
+    Chat->>Codex: JSON-RPC initialize, then initialized
+    Chat->>Codex: thread/start or thread/resume, then turn/start
+    loop Native model and tool iterations
+        Codex->>Auth: HTTPS Responses request without API key
+        Auth->>Model: Inject Worker-secret Authorization
+        Model-->>Codex: HTTP response stream through handler
+        Codex->>Codex: Run tools, edit files, save native session
+        Codex-->>Chat: JSON-RPC item notifications over WebSocket
+        Chat->>Chat: Map to AI SDK UIMessageChunk
+        Chat-->>PL: AIChatAgent chat envelopes
         PL-->>UI: Standard AI SDK SSE
     end
-
-    Codex-->>Runner: Native process exits
-    Runner->>Runner: Write result.json, exit
-    Sandbox-->>Chat: Process exit event
-    Chat->>Sandbox: SDK readFile(result.json), then backup
-    Chat->>Chat: Save checkpoint, enter waiting_for_user
-    Chat-->>PL: Final UI events
-    PL-->>UI: Finish response
+    opt User steers or stops
+        UI->>PL: POST steer or cancel
+        PL->>Chat: HTTP control request
+        Chat->>Codex: turn/steer or turn/interrupt
+    end
+    Codex-->>Chat: turn/completed with terminal status
+    Chat->>Sandbox: CF Sandbox SDK: checkpoint workspace
+    Chat->>Chat: waiting_for_user and close control socket
+    Chat-->>UI: Final UI events through PL
+    Note over Codex: App-server remains running between turns
 ```
 
-**Input is file + process launch, not an open stdin connection between DOs.** Only the Codex SDK writes native stdin, then closes it. Each new prompt launches a new runner; the sandbox and native session can stay warm across turns.
+The diagram's Chat ↔ Codex arrows use the socket returned by Cloudflare's Sandbox SDK. **Cloudflare owns DO RPC and container routing. We own JSON-RPC request matching and event conversion.** No stdout parsing, per-turn runner, cancellation marker, or Codex TypeScript SDK remains.
 
-**Output has two streams:** native stdout is parsed by the Codex SDK, then our runner emits redacted JSONL to its own stdout. The Sandbox SDK transports that output to the Chat DO; our mapper converts it for the UI. Codex never calls the Chat DO directly. Buffered logs cover output produced before the observer attaches.
+| Surface                                                                                           | Our code                                                       | Delegated                                                        |
+| ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------- |
+| [Browser](../apps/web/client/app.tsx)                                                             | Small UI, history/reconnect, Stop/steer                        | AI SDK message state and SSE                                     |
+| [PL relay](../apps/web/server/server.ts) / [provider](../apps/web/server/providers/cloudflare.ts) | Routes, validation, connection lifetime                        | Express, Cloudflare chat transport, AI SDK SSE                   |
+| [Chat DO](../apps/agent/agent.ts)                                                                 | Turn admission, durable deadlines, checkpoints, reconciliation | AIChatAgent history/replay, Agents scheduling                    |
+| [Sandbox bridge](../apps/agent/codex.ts)                                                          | Start/reuse process, connect, backup/restore calls             | Cloudflare Sandbox SDK                                           |
+| [App-server client](../apps/agent/app-server.ts) / [mapper](../apps/agent/codex-events.ts)        | Request IDs, notifications → UI events                         | Generated native protocol types; Codex thread/turn and tool loop |
+| [Sandbox policy](../apps/agent/sandbox.ts) / [outbound handler](../apps/agent/outbound.ts)        | Allowed hosts and credential injection                         | Cloudflare outbound interception                                 |
 
-Text is emitted on completed assistant items, not token by token. The mapper also handles commands and file changes; its Zod schema validates a subset of native events.
+## Commands we run
 
-### Communication ownership
+Cold startup creates/restores `/workspace`, copies the [Codex config](../apps/agent/codex-config.toml), and launches:
 
-| Connection                     | We implement                                                                                                               | Library / platform handles                                                                      |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| Browser ↔ PL backend           | Express endpoints and AI SDK configuration                                                                                 | AI SDK HTTP requests and SSE encoding/decoding                                                  |
-| PL backend ↔ Chat DO           | Adapter opens the WebSocket, manages connection lifetime, forwards resume controls, and sends history/cancel HTTP requests | Cloudflare `WebSocketChatTransport` chat envelopes and chunk decoding                           |
-| Worker entry → Chat DO         | Call `routeAgentRequest`                                                                                                   | Cloudflare routing to the named DO                                                              |
-| Chat DO ↔ Sandbox DO/container | Call Sandbox SDK methods; consume returned log events                                                                      | SDK-managed communication, process control, files, and backups; no custom HTTP/socket transport |
-| Runner ↔ native Codex          | Call Codex SDK thread and streaming methods                                                                                | SDK-managed subprocess and stdin/stdout protocol                                                |
+```sh
+codex app-server --listen ws://0.0.0.0:4500 \
+  --ws-auth capability-token --ws-token-file /tmp/codex-app-server-token
+```
 
-The Sandbox SDK’s `parseSSEStream` helper unwraps process-log events. Our `CodexEvents` mapper translates their JSONL payload into AI SDK UI events. **We own the event translation, not the sandbox transport.**
+The process receives `CODEX_HOME=/workspace/codex`, **no OpenAI API key**. The private control token is separate from model credentials and excluded from backups. Readiness and protocol initialization complete before a turn is submitted.
 
-### Code ownership
+Subsequent prompts use `thread/resume` and `turn/start`; steering uses `turn/steer` with the expected turn ID; Stop uses `turn/interrupt`. App-server stays running. A turn includes all model and tool steps until `turn/completed`, not just one tool call. Close the control socket after finalization; reconnect for the next prompt.
 
-| Surface                                                                                                        | We own                                                                      | Library/service owns                                           |
-| -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| [React client](../apps/web/client/App.tsx)                                                                     | Transcript UI, history loading, reconnect, Stop                             | AI SDK message state and SSE consumption                       |
-| [Express relay](../apps/web/server/server.ts) + [provider adapter](../apps/web/server/providers/cloudflare.ts) | Routes, validation, connection lifetime                                     | Express HTTP; Cloudflare chat transport; AI SDK SSE encoding   |
-| [Chat coordinator](../apps/agent/agent.ts)                                                                     | Admission, cancellation, lifecycle, checkpoint ordering                     | `AIChatAgent` history/replay; Agents durable scheduling        |
-| [Sandbox bridge](../apps/agent/codex.ts) + [event mapper](../apps/agent/codex-events.ts)                       | Process/file calls and Codex → UI translation                               | Sandbox execution, log streaming, backup/restore               |
-| [Runner](../apps/agent/run-codex.mjs)                                                                          | Input/result files, duplicate-launch claim, cancellation watcher, redaction | Official Codex SDK subprocess handling; native model/tool loop |
+[protocol.ts](../apps/agent/protocol.ts) is generated from pinned Codex **0.155.0**. The client checks JSON-RPC envelopes; payload types trust this authenticated, version-pinned endpoint. It is not full runtime schema validation. WebSocket app-server transport is experimental upstream.
 
-## Request contract
+## Lifecycle
 
-The [shared contract](../packages/chat-contract/src/index.ts) defines these provider-independent operations using AI SDK message types:
-
-| Endpoint                          | Behavior                                                              |
-| --------------------------------- | --------------------------------------------------------------------- |
-| `POST /api/chat`                  | Validate `UIMessage[]`, submit through the adapter, return AI SDK SSE |
-| `GET /api/chat/history`           | Return persisted UI messages                                          |
-| `GET /api/chat/playground/stream` | Attach to buffered/live output; 204 if none                           |
-| `POST /api/chat/cancel`           | Request explicit stop; report unconfirmed cleanup as an error         |
-
-The coordinator sends only the latest user text to `runStreamed`; native session files carry previous context. A **turn** includes every model call and tool action for that prompt. The runner exits after the turn.
-
-The adapter uses `cancelOnClientAbort: false`. Replacing the relay requires only the same `AGENT_URL`; reconnection does not resubmit the prompt.
-
-## Global state machine
-
-The Chat DO persists this lifecycle. The diagram shows the normal path; exception behavior follows. `offline` means `state.sandbox` is absent.
+A new chat starts without a sandbox. **The user sends the first prompt; startup runs that pending prompt.**
 
 ```mermaid
 flowchart TD
-    Offline["Offline<br/>History and checkpoint retained"]
-    Starting["Starting<br/>(starting)"]
-    Working["Running a turn<br/>(waiting_for_agent)"]
-    Waiting["Waiting for user<br/>(waiting_for_user)"]
-    Saving["Saving before shutdown<br/>(suspending)"]
-    Destroying["Destroying sandbox<br/>(destroying)"]
+    Initial(("New conversation"))
+    Offline["No sandbox allocated<br/>Waiting for a user message"]
+    Starting["Starting<br/>Create or restore and start app-server"]
+    Working["Running the submitted prompt<br/>waiting_for_agent"]
+    Waiting["Sandbox ready<br/>waiting_for_user"]
+    Saving["Checkpoint before idle shutdown"]
+    Destroying["Destroying sandbox"]
 
-    Offline -->|"New message"| Starting
-    Starting -->|"Create or restore"| Working
-    Working -->|"Confirm exit; attempt checkpoint"| Waiting
-    Waiting -->|"New message"| Working
+    Initial --> Offline
+    Offline -->|"User sends a message"| Starting
+    Starting -->|"Submit that prompt"| Working
+    Working -->|"turn/completed and finalization"| Waiting
+    Working -->|"Accepted steering: same turn"| Working
+    Waiting -->|"User sends next prompt"| Working
     Waiting -->|"10 minutes waiting"| Saving
-    Saving -->|"Backup succeeds"| Destroying
+    Saving -->|"Checkpoint succeeds"| Destroying
     Destroying -->|"Destruction confirmed"| Offline
 
     classDef default fill:#374151,stroke:#9ca3af,color:#f9fafb
     linkStyle default stroke:#9ca3af
 ```
 
-### Lifecycle rules
+| Timer                            | Reset by                                       | Action                                                       |
+| -------------------------------- | ---------------------------------------------- | ------------------------------------------------------------ |
+| Six hours since user interaction | Accepted prompt, steering, or active-turn Stop | Durable alarm: bounded interruption/checkpoint, then destroy |
+| Ten minutes waiting for user     | Next turn invalidates the waiting period       | Checkpoint, then destroy                                     |
+| Cloudflare `sleepAfter: "6h"`    | Activity recognized by the container interface | Infrastructure idle shutdown; `keepAlive: false`             |
 
-| Trigger                  | Behavior                                                                              |
-| ------------------------ | ------------------------------------------------------------------------------------- |
-| New message              | Reuse a warm sandbox or restore a cold one; reject overlapping turns                  |
-| Turn ends                | Confirm exit, save native thread ID, attempt checkpoint, enter `waiting_for_user`     |
-| Stop                     | Runner aborts the SDK signal; wait up to five seconds for exit, without force-killing |
-| Ten minutes waiting      | Checkpoint, then destroy; a new turn invalidates the old idle timer                   |
-| Six-hour sandbox age     | Abort observation and destroy, even mid-turn, without requiring a fresh checkpoint    |
-| Browser/relay disconnect | No execution or lifecycle transition                                                  |
+There is **no absolute sandbox-age cap and no per-turn process timeout**. Steering can extend the same turn beyond six hours. Model/tool output, history reads, reconnects, and duplicate/rejected steering do not reset the application deadline. Agents `schedule()` persists callbacks; generation IDs and timestamps reject stale callbacks.
 
-Keep-alive remains enabled during work and waiting. `sleepAfter: "6h"` is only a fallback once keep-alive is disabled. Runner timeout, process timeout, and durable destruction all target the same absolute deadline; new turns do not reset it.
+An open proxied control WebSocket prevents Cloudflare idle expiry in the installed container library. Local file/CPU activity alone is not an idle reset. Our application alarm bounds active work even while the socket remains open.
 
-Only `offline` and `waiting_for_user` normally accept new work. Stopping and turn-end checkpointing remain within `waiting_for_agent`. Run outcomes (`completed`, `cancelled`, `failed`, `interrupted`) are separate from sandbox phases.
+| Failure                                           | Behavior                                                                                                                          |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Stop acknowledgment without terminal notification | Wait up to five seconds after acknowledgment, report unconfirmed Stop; keep new turns blocked                                     |
+| Connection/DO lost after submission               | Reconnect and inspect the native thread; stop surviving work before admitting another turn; never replay the prompt automatically |
+| Container/process lost                            | Destroy the old generation, report interruption; a user prompt can restore the last checkpoint                                    |
+| Turn-end backup fails                             | Report failure; retain warm workspace and previous checkpoint                                                                     |
+| Pre-idle backup fails                             | Return to waiting and retry; do not destroy without that backup                                                                   |
+| Destruction fails/unknown                         | Retain generation as `cleanup_failed`; block replacement                                                                          |
+| Cleanup retry budget exhausted                    | Three total attempts, 30 seconds apart; next prompt may explicitly retry                                                          |
+| Restore fails/backup expired                      | Surface the error; do not invent native context from UI history                                                                   |
 
-### Failure behavior
+The six-hour deadline attempts interruption for at most five seconds and a final backup for at most ten seconds, then destroys regardless. Ordinary checkpoints are awaited before another turn can start. Destruction confirmation is bounded to 30 seconds; a timeout is an uncertain result, not proof of destruction. Cloudflare outages can delay cleanup.
 
-| Failure                               | Recovery                                                                                                           |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Stop unconfirmed                      | Keep run active; block new turns until confirmed exit or lifetime cleanup                                          |
-| Turn-end backup fails                 | Report error; preserve warm workspace and previous checkpoint                                                      |
-| Idle backup/destruction fails         | Return to waiting; at most three attempts, 30 seconds apart                                                        |
-| Lifetime destruction fails            | Record `cleanup_failed`; attempt to release keep-alive; same bounded retries, then explicit retry on a new message |
-| Chat DO restarts mid-turn             | Stop surviving work and checkpoint when possible; no automatic prompt replay                                       |
-| Container or output stream disappears | Report interruption/failure and attempt cleanup; cold recovery uses the last checkpoint                            |
-| Restore fails or backup expires       | Surface error; no automatic reconstruction from chat history                                                       |
+Run outcomes (`completed`, `cancelled`, `failed`, `interrupted`) are separate from sandbox phases. Browser/PL disconnection changes neither lifecycle nor execution. App-server recovery does not promise replay of every missed tool event; UI history receives a terminal result/interruption after reconciliation.
 
-Destruction must be confirmed before intentionally replacing a generation. Timers check the generation ID; idle timers also check `waitingSince`. Late callbacks/backups cannot overwrite a replacement's state. An unexpected cold restart does not extend the recorded lifetime. Cloudflare outages can delay destruction; there is no separate cleanup sweeper.
+## Persistence and credentials
 
-## Persistence
+| Data                                                       | Storage                                      |
+| ---------------------------------------------------------- | -------------------------------------------- |
+| UI messages, stream replay, run/thread/turn IDs, deadlines | Chat DO SQLite                               |
+| Native model context + repository                          | `/workspace/codex` + `/workspace/repo`       |
+| Workspace/session recovery                                 | R2 checkpoints, paired with native thread ID |
+| Control token + diagnostics                                | `/tmp`, outside checkpoints                  |
+| OpenAI credential                                          | Worker secret, used only by outbound handler |
 
-| Data                                                                     | Location                                 | Survives container loss?                |
-| ------------------------------------------------------------------------ | ---------------------------------------- | --------------------------------------- |
-| UI history, replay, latest run, generation, schedules, checkpoint handle | Chat DO SQLite (not D1 or PL PostgreSQL) | Yes                                     |
-| Repository and native Codex session                                      | `/workspace/repo`, `/workspace/codex`    | Only through a successful R2 checkpoint |
-| Runner input, claim, cancel marker, result, diagnostics                  | `/tmp`                                   | No                                      |
-| Workspace backups                                                        | R2                                       | Yes, until expiry                       |
+Checkpoints happen after terminal turns and before idle destruction. They save files, not a live process. Native app-server remains running; backup consistency with its background metadata writes still needs live verification. UI history and backups are not atomic; history may describe work missing from a restored checkpoint. Backups expire after 30 days; configure R2 deletion separately.
 
-Checkpoints pair workspace files with their native thread ID. The thread ID alone cannot restore a conversation. Backups happen after confirmed stop and before idle destruction; no shutdown hook is assumed to save work on abrupt loss.
+The Sandbox subclass allows `api.openai.com` and the configured R2 account host. For OpenAI it permits only HTTPS POSTs to `/v1/responses` and `/v1/responses/compact`, replaces Authorization, strips container-supplied project/organization headers, and rejects redirects. Codex uses HTTP Responses with model WebSockets disabled. Cloudflare's SDK uses presigned URLs for R2 transfer; permanent R2 keys remain Worker secrets. Other internet destinations are blocked, including package/Git hosts until explicitly added.
 
-**UI history and workspace backups are not atomic.** After recovery, history may describe edits absent from the last checkpoint. Launch claims prevent common duplicate execution in a surviving container; they do not provide exactly-once tool side effects.
+No OpenAI-key redaction pipeline is needed because the key is never sent into the container. This does not sanitize unrelated secrets in prompts/files or impose spending limits. Legacy credential paths remain excluded from backups; previous backups are not scrubbed retroactively. The app-server control token is container-readable and protects the private socket, not the model account.
 
-Backups expire after **30 days**; an R2 lifecycle rule must delete old objects. This differs from the Course agent MVP's seven-day policy.
+## Scope and verification
 
-## Security and known gaps
+Two deployments: `apps/web` and `apps/agent`; the shared chat contract is source code, not a service. Preserve history/send/resume/cancel/steer and AI SDK events when replacing Cloudflare; replace the provider adapter and migrate state.
 
-**Trusted prototype only:** one shared `playground` conversation, one configured container instance, an initially empty Git repository, and no application authentication. Origin checks are not authorization.
+- Trusted disposable prototype: one shared conversation, no user authentication/approval UI. Origin checks are not authorization.
+- Two-window synchronization remains a gap. Course checkout/push_sync, previews, usage accounting, and checkpoint-frequency optimization are deferred.
+- Unit tests cover protocol matching, mapper behavior, and outbound policy. Integration tests exercise real AIChatAgent/relay behavior against a simulated sandbox. The native test runs pinned app-server against a fake local model endpoint.
+- Live acceptance still requires Cloudflare HTTPS interception/TLS trust, workspace sandbox/tool execution, private socket authentication, and real R2 backup/restore. No deployment or paid inference is included in local checks.
 
-- The OpenAI key is injected into the runner environment. Auth storage is ephemeral; default shell-tool environments omit the key; known-key strings are redacted before runner output is persisted.
-- These measures do not isolate credentials from hostile container code. Workspace/native session backups are not comprehensively scrubbed. Auth and diagnostic paths are excluded from backups.
-- Two simultaneous chat windows through different relays are **untested**; idle windows do not automatically discover new turns elsewhere.
-- No course checkout/sync, publishing approvals, preview servers, usage accounting, or credential-injecting outbound proxy.
-- Native `workspace-write` compatibility, real child-process cancellation, R2 restore, and live lifecycle alarms remain unverified. Backup cost/latency and warm-session artifact growth are unmeasured.
-
-## Deployment and replacement
-
-**Two deployments:** `apps/web` serves React and Express; `apps/agent` deploys the Worker, DO classes, and container image. `packages/chat-contract` is shared source, not a service. [Deployment instructions](../README.md#cloudflare-setup--you-perform-these-steps).
-
-To replace Cloudflare, implement the same history/send/resume/cancel provider interface and replace `apps/agent`. Preserve durable history, subscriber-independent execution, reattachment, cancellation, and workspace recovery. The frontend can stay; the adapter and persisted data require migration.
-
-## Validation
-
-[Codex tests](../apps/agent/test/codex.test.ts) cover mapping, runner subprocess behavior, cancellation, and remaining-lifetime timeouts. [Relay integration tests](../apps/web/test/relay.mjs) use the real local chat runtime with a deterministic sandbox fixture for reconnection, restoration, lifecycle, stale timers, and failure handling. Clock advancement tests policy, not actual six-hour cloud execution.
-
-Run `pnpm test`; complete the [live acceptance steps](../README.md#try-it) before relying on the deployment. The broader [Course agent MVP](https://github.com/PrairieLearn/PrairieLearn/issues/15681) remains future work, particularly durable approval/publishing flows across sandbox loss.
+References: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [Cloudflare WebSockets](https://developers.cloudflare.com/sandbox/guides/websocket-connections/), [outbound handlers](https://developers.cloudflare.com/sandbox/guides/outbound-traffic/), [backups](https://developers.cloudflare.com/sandbox/guides/backup-restore/).
