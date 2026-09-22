@@ -15,7 +15,9 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm --filter @playground/agent test && pnpm --filter @playground/web test",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "dev:agent": "pnpm --filter @playground/agent dev",
+    "dev:server:local": "pnpm --filter @playground/web dev:server:local"
   },
   "devDependencies": {
     "prettier": "^3.9.7",

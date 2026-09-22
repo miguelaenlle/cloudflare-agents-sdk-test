@@ -25,6 +25,7 @@ export interface Env {
   Sandbox: DurableObjectNamespace<Sandbox>;
   Chat: DurableObjectNamespace<Chat>;
   CODEX_MODEL?: string;
+  LOCAL_DEV?: string;
   UI_ORIGIN: string;
 }
 type Expiration = {
@@ -228,7 +229,10 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       throw new ContainerLost();
     this.ensureUsable(id);
     const threadId = this.state.threadId;
-    const backup = await checkpointCodex(sandbox);
+    const backup = await checkpointCodex(
+      sandbox,
+      this.env.LOCAL_DEV === "true",
+    );
     if (this.usable(id))
       this.setState({ ...this.state, checkpoint: { backup, threadId } });
   }
@@ -432,7 +436,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             );
           }
           const backup = await within(
-            checkpointCodex(this.sandbox(id)),
+            checkpointCodex(this.sandbox(id), this.env.LOCAL_DEV === "true"),
             10_000,
             "Deadline checkpoint timed out.",
           );

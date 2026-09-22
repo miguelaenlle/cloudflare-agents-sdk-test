@@ -7,7 +7,8 @@
     "dev:server": "node --env-file=../../.env.local --experimental-strip-types server/server.ts",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test": "node test/relay.mjs"
+    "test": "node test/relay.mjs",
+    "dev:server:local": "AGENT_URL=http://localhost:8790 node --experimental-strip-types server/server.ts"
   },
   "dependencies": {
     "@ai-sdk/react": "^4.0.105",
