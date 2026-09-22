@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { DefaultChatTransport, readUIMessageStream } from "ai";
+import { Chat } from "@ai-sdk/react";
 
 const state = await mkdtemp(join(tmpdir(), "cf-relay-"));
 let logs = "";
@@ -59,20 +60,22 @@ async function stopServer() {
 }
 const history = async () => (await fetch(`${api}/history`)).json();
 const transport = new DefaultChatTransport({ api });
-async function send() {
-  return transport.sendMessages({
-    chatId: "playground",
-    trigger: "submit-message",
-    abortSignal: undefined,
-    messages: [
-      ...(await history()),
-      {
-        id: crypto.randomUUID(),
-        role: "user",
-        parts: [{ type: "text", text: "Run fixture." }],
-      },
-    ],
+const newMessage = (text = "Run fixture.") => ({
+  id: crypto.randomUUID(),
+  text,
+});
+const submit = (input = newMessage()) =>
+  fetch(api, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
   });
+async function send(input = newMessage()) {
+  const response = await submit(input);
+  assert.equal(response.status, 204, await response.text());
+  const stream = await transport.reconnectToStream({ chatId: "playground" });
+  assert.ok(stream);
+  return stream;
 }
 async function firstText(stream) {
   const reader = stream.getReader();
@@ -116,32 +119,9 @@ try {
 
   const first = await firstText(await send());
   const fixture = "http://localhost:8791/agents/chat/playground/test";
-  const active = await (await fetch(`${fixture}/state`)).json();
-  const steering = {
-    id: crypto.randomUUID(),
-    runId: active.run.id,
-    text: "Please also explain the result.",
-  };
-  assert.equal(
-    (
-      await fetch(`${api}/steer`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(steering),
-      })
-    ).status,
-    204,
-  );
-  assert.equal(
-    (
-      await fetch(`${api}/steer`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(steering),
-      })
-    ).status,
-    204,
-  );
+  const steering = newMessage("Please also explain the result.");
+  assert.equal((await submit(steering)).status, 204);
+  assert.equal((await submit(steering)).status, 204);
   assert.equal((await (await fetch(`${fixture}/status`)).json()).steers, 1);
   await stopServer();
   await assert.rejects(async () => {
@@ -324,8 +304,7 @@ try {
 
   const beforeUncertain = await (await fetch(`${fixture}/status`)).json();
   await fetch(`${fixture}/drop-start-ack`, { method: "POST" });
-  for await (const _chunk of await send()) {
-  }
+  assert.equal((await submit()).ok, false);
   assert.equal(
     (await (await fetch(`${fixture}/state`)).json()).run.status,
     "running",
@@ -419,20 +398,12 @@ try {
   assert.equal((await getStatus()).destroys, 1);
   await advance(minutes(300));
   const beforeSteer = (await getState()).sandbox.lastUserInteractionAt;
-  const steerRun = (await getState()).run.id;
-  const steer = async (runId) =>
-    fetch(`${api}/steer`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        id: crypto.randomUUID(),
-        runId,
-        text: "Keep working.",
-      }),
-    });
-  assert.equal((await steer(crypto.randomUUID())).ok, false);
+  assert.equal(
+    (await submit({ id: crypto.randomUUID(), text: "" })).status,
+    400,
+  );
   assert.equal((await getState()).sandbox.lastUserInteractionAt, beforeSteer);
-  assert.equal((await steer(steerRun)).status, 204);
+  assert.equal((await submit(newMessage("Keep working."))).status, 204);
   await advance(minutes(61));
   assert.equal((await getState()).sandbox.id, restored.sandbox.id);
   assert.equal((await getState()).run.status, "running");
@@ -513,6 +484,91 @@ try {
   assert.equal((await getState()).run.status, "completed");
   console.log(
     "Passed: cleanup stops after three failures, retains the sandbox identity, and an explicit new message can retry and restore.",
+  );
+  const chat = new Chat({
+    id: "playground",
+    transport,
+    messages: await history(),
+  });
+  const uiBefore = await getStatus();
+  const initialMessage = newMessage("UI first message.");
+  assert.equal((await submit(initialMessage)).status, 204);
+  chat.messages = await history();
+  const firstAttachment = chat.resumeStream();
+  for (let i = 0; i < 100 && chat.status !== "streaming"; i++) await delay(20);
+  assert.equal(chat.status, "streaming");
+  await chat.stop();
+  const correction = newMessage("UI correction while working.");
+  assert.equal((await submit(correction)).status, 204);
+  chat.messages = await history();
+  await chat.resumeStream();
+  await firstAttachment;
+  assert.equal(chat.status, "ready");
+  assert.equal((await getStatus()).turns, uiBefore.turns + 1);
+  assert.equal((await getStatus()).steers, uiBefore.steers + 1);
+  assert.equal(chat.messages.filter((m) => m.id === correction.id).length, 1);
+  assert.equal(
+    chat.messages
+      .at(-1)
+      .parts.filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join(""),
+    "Started. Finished.",
+  );
+  console.log(
+    "Passed: AI SDK stop/history/resume preserves one response when Send steers an active turn.",
+  );
+
+  // Both outcomes use the same public POST, with no run ID or client-side busy decision.
+  const raceReader = await firstText(await send());
+  const beforeRace = await getStatus();
+  await post(`${fixture}/steer-behavior`, { behavior: "finish" });
+  const racedMessage = newMessage("Continue after the turn finished.");
+  assert.equal((await submit(racedMessage)).status, 204);
+  while (!(await raceReader.read()).done) {}
+  assert.equal((await getStatus()).turns, beforeRace.turns + 1);
+  assert.equal((await getStatus()).steers, beforeRace.steers);
+  assert.equal((await submit(racedMessage)).status, 204);
+  assert.equal((await getStatus()).turns, beforeRace.turns + 1);
+  const raceStream = await transport.reconnectToStream({
+    chatId: "playground",
+  });
+  for await (const _chunk of raceStream) {
+  }
+  assert.equal(
+    (await history()).filter((m) => m.id === racedMessage.id).length,
+    1,
+  );
+  console.log(
+    "Passed: rejected steering after turn completion starts once; duplicate submission does not rerun it.",
+  );
+
+  const rejectedReader = await firstText(await send());
+  const beforeRejected = await getStatus();
+  await post(`${fixture}/steer-behavior`, { behavior: "reject" });
+  assert.equal((await submit(newMessage("Rejected correction."))).ok, false);
+  assert.equal((await getStatus()).turns, beforeRejected.turns);
+  assert.equal((await getStatus()).steers, beforeRejected.steers);
+  await fetch(`${api}/cancel`, { method: "POST" });
+  while (!(await rejectedReader.read()).done) {}
+  console.log(
+    "Passed: an unrelated RPC rejection during active work does not start a second turn.",
+  );
+
+  const uncertainReader = await firstText(await send());
+  const beforeLostSteer = await getStatus();
+  await post(`${fixture}/steer-behavior`, { behavior: "lose-ack" });
+  assert.equal(
+    (await submit(newMessage("Accepted but acknowledgment lost."))).ok,
+    false,
+  );
+  while (!(await uncertainReader.read()).done) {}
+  assert.equal((await getStatus()).turns, beforeLostSteer.turns);
+  assert.equal((await getStatus()).steers, beforeLostSteer.steers + 1);
+  await post(`${fixture}/recover`);
+  assert.equal((await getStatus()).turns, beforeLostSteer.turns);
+  console.log(
+    "Passed: uncertain steering is never automatically resubmitted as a new turn.",
   );
 } catch (error) {
   console.error(logs.slice(-12_000));

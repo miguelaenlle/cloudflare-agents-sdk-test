@@ -14,6 +14,7 @@ type State = {
   destroyFailures?: number;
   ignoreCancellation?: boolean;
   dropStartAck?: boolean;
+  steerBehavior?: "finish" | "lose-ack" | "reject";
 };
 const textItem = (id: string, text: string): ThreadItem => ({
   type: "agentMessage",
@@ -87,6 +88,15 @@ export class TestSandbox extends DurableObject {
             await this.disconnect();
             return;
           }
+          if (
+            frame.method === "turn/steer" &&
+            state.steerBehavior === "lose-ack"
+          ) {
+            state.steerBehavior = undefined;
+            await this.save(state);
+            await this.disconnect();
+            return;
+          }
           if (frame.id !== undefined)
             server.send(JSON.stringify({ id: frame.id, result }));
         })
@@ -153,6 +163,24 @@ export class TestSandbox extends DurableObject {
         return { turn };
       }
       case "turn/steer":
+        if (
+          state.steerBehavior === "finish" &&
+          current?.status === "inProgress"
+        ) {
+          state.steerBehavior = undefined;
+          current.status = "completed";
+          await this.save(state);
+          this.emit("turn/completed", {
+            threadId: "native-thread",
+            turn: current,
+          });
+          throw new Error("No active turn to steer");
+        }
+        if (state.steerBehavior === "reject") {
+          state.steerBehavior = undefined;
+          await this.save(state);
+          throw new Error("Fixture rejected steering");
+        }
         if (
           current?.status !== "inProgress" ||
           current.id !== params.expectedTurnId
@@ -234,6 +262,11 @@ export class TestSandbox extends DurableObject {
     return (await this.state()).running ? { id, status: "running" } : null;
   }
   async cleanupCompletedProcesses() {}
+  async setSteerBehavior(behavior: State["steerBehavior"]) {
+    const state = await this.state();
+    state.steerBehavior = behavior;
+    await this.save(state);
+  }
   async dropNextStartAck() {
     const state = await this.state();
     state.dropStartAck = true;
