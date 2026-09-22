@@ -4,6 +4,7 @@ import type { ThreadItem, Turn } from "../protocol.ts";
 type State = {
   files: Record<string, string>;
   backup?: Record<string, string>;
+  backupEvents: string[];
   running: boolean;
   launches: number;
   restores: number;
@@ -49,6 +50,7 @@ export class TestSandbox extends DurableObject {
     return (
       (await this.ctx.storage.get<State>("state")) ?? {
         files: {},
+        backupEvents: [],
         running: false,
         launches: 0,
         restores: 0,
@@ -287,10 +289,12 @@ export class TestSandbox extends DurableObject {
     if (state.turns.at(-1)?.status === "inProgress" && state.running)
       throw new Error("Checkpoint while turn active");
     if (state.failBackup) {
+      state.backupEvents.push("backup-failed");
       state.failBackup = false;
       await this.save(state);
       throw new Error("Fixture R2 unavailable");
     }
+    state.backupEvents.push("backup");
     state.backup = Object.fromEntries(
       Object.entries(state.files).filter(([path]) =>
         path.startsWith("/workspace/"),
@@ -327,6 +331,9 @@ export class TestSandbox extends DurableObject {
   async destroy() {
     const state = await this.state();
     state.destroys++;
+    state.backupEvents.push(
+      state.destroyFailures ? "destroy-failed" : "destroy",
+    );
     if (state.destroyFailures) {
       state.destroyFailures--;
       await this.save(state);
@@ -338,6 +345,9 @@ export class TestSandbox extends DurableObject {
     await this.save(state);
     await this.ctx.storage.deleteAlarm();
     await this.disconnect();
+  }
+  async backupEvents() {
+    return (await this.state()).backupEvents;
   }
   async inspect() {
     const { launches, restores, destroys, running, steers, turns } =

@@ -194,6 +194,7 @@ try {
   console.log(
     "Passed: explicit cancellation stops the agent independently of SSE disconnection.",
   );
+  assert.deepEqual(await (await fetch(`${fixture}/backups`)).json(), []);
   assert.equal(
     (await fetch(`${fixture}/sleep`, { method: "POST" })).status,
     204,
@@ -203,14 +204,14 @@ try {
   const status = await (await fetch(`${fixture}/status`)).json();
   assert.deepEqual(status, {
     launches: 2,
-    restores: 1,
+    restores: 0,
     running: true,
     destroys: 0,
     steers: 1,
     turns: 4,
   });
   console.log(
-    "Passed: cold restore resumes the native thread and keeps the sandbox warm.",
+    "Passed: unexpected loss before the first shutdown backup starts a fresh workspace.",
   );
 
   assert.ok((await history()).some((message) => message.id === steering.id));
@@ -255,7 +256,7 @@ try {
   );
   assert.deepEqual(await (await fetch(`${fixture}/status`)).json(), {
     launches: 2,
-    restores: 1,
+    restores: 0,
     running: true,
     destroys: 0,
     steers: 1,
@@ -264,42 +265,9 @@ try {
   console.log(
     "Passed: Worker replacement stops surviving work, saves interruption, and never repeats the prompt.",
   );
-  assert.equal(
-    (await fetch(`${fixture}/fail-backup`, { method: "POST" })).status,
-    204,
-  );
-  for await (const _chunk of await send()) {
-  }
-  const failed = (await history()).at(-1);
-  assert.ok(
-    failed.parts.some(
-      (part) =>
-        part.type === "text" &&
-        part.text.includes("Task failed: Fixture R2 unavailable"),
-    ),
-  );
-  assert.equal((await (await fetch(`${fixture}/status`)).json()).running, true);
+  assert.deepEqual(await (await fetch(`${fixture}/backups`)).json(), []);
   console.log(
-    "Passed: checkpoint failure is saved in history and keeps the sandbox warm.",
-  );
-  const fresh = "http://localhost:8791/agents/chat/backup-failure/test";
-  assert.equal(
-    (await fetch(`${fresh}/fail-backup`, { method: "POST" })).status,
-    204,
-  );
-  const firstRun = await (
-    await fetch(`${fresh}/run`, { method: "POST" })
-  ).json();
-  assert.equal(firstRun.run.status, "failed");
-  assert.equal(firstRun.threadId, "native-thread");
-  assert.equal(firstRun.checkpoint, undefined);
-  const nextRun = await (
-    await fetch(`${fresh}/run`, { method: "POST" })
-  ).json();
-  assert.equal(nextRun.run.status, "completed");
-  assert.equal(nextRun.checkpoint.threadId, "native-thread");
-  console.log(
-    "Passed: failed first checkpoint preserves the native thread for the next warm turn.",
+    "Passed: completion, steering, Stop, and recovery do not create backups.",
   );
 
   const beforeUncertain = await (await fetch(`${fixture}/status`)).json();
@@ -323,26 +291,6 @@ try {
   console.log(
     "Passed: lost turn/start acknowledgment is reconciled without replay or process replacement.",
   );
-
-  const failedCancelReader = await firstText(await send());
-  await fetch(`${fixture}/fail-backup`, { method: "POST" });
-  assert.equal((await fetch(`${api}/cancel`, { method: "POST" })).status, 204);
-  let cancelFailure = "";
-  while (true) {
-    const { value, done } = await failedCancelReader.read();
-    if (done) break;
-    if (value.type === "text-delta") cancelFailure += value.delta;
-  }
-  assert.match(cancelFailure, /Fixture R2 unavailable/);
-  assert.ok(
-    (await history())
-      .at(-1)
-      .parts.some(
-        (part) =>
-          part.type === "text" && part.text.includes("Fixture R2 unavailable"),
-      ),
-  );
-  console.log("Passed: cancellation does not hide a failed checkpoint.");
 
   const post = async (url, body = {}) => {
     const response = await fetch(url, {
@@ -375,12 +323,16 @@ try {
   await advance(minutes(1) + 1000);
   assert.equal((await getState()).sandbox, undefined);
   assert.equal((await getStatus()).destroys, 1);
+  assert.deepEqual(await (await fetch(`${fixture}/backups`)).json(), [
+    "backup",
+    "destroy",
+  ]);
   for await (const _chunk of await send()) {
   }
   const restored = await getState();
   assert.notEqual(restored.sandbox.id, lease.id);
   assert.equal(restored.threadId, "native-thread");
-  assert.equal((await getStatus()).restores, 2);
+  assert.equal((await getStatus()).restores, 1);
   await post(`${fixture}/expire-old`, { id: lease.id });
   assert.equal((await getState()).sandbox.id, restored.sandbox.id);
   console.log(
@@ -417,6 +369,7 @@ try {
     "Passed: a new turn invalidates old idle timers, can run beyond ten minutes, and refreshes the interaction deadline.",
   );
 
+  const beforeIdleFailure = await (await fetch(`${fixture}/backups`)).json();
   await fetch(`${fixture}/fail-backup`, { method: "POST" });
   await advance(minutes(10) + 1000);
   assert.equal((await getStatus()).destroys, 1);
@@ -424,12 +377,18 @@ try {
   await advance(31_000);
   assert.equal((await getState()).sandbox, undefined);
   assert.equal((await getStatus()).destroys, 2);
+  assert.deepEqual(await (await fetch(`${fixture}/backups`)).json(), [
+    ...beforeIdleFailure,
+    "backup-failed",
+    "backup",
+    "destroy",
+  ]);
   console.log(
     "Passed: idle suspension does not destroy on backup failure; bounded retry can complete it.",
   );
 
   const deadlineReader = await firstText(await send());
-  const beforeExpiry = await getState();
+  const backupsBeforeExpiry = await (await fetch(`${fixture}/backups`)).json();
   const liveDeadline = await post(`${fixture}/expire`);
   assert.equal(liveDeadline.run.status, "interrupted");
   assert.equal(liveDeadline.sandbox, undefined);
@@ -443,7 +402,12 @@ try {
           p.text.includes("No user interaction for six hours"),
       ),
   );
-  assert.deepEqual(liveDeadline.checkpoint, beforeExpiry.checkpoint);
+  assert.equal(liveDeadline.checkpoint.threadId, "native-thread");
+  assert.deepEqual(await (await fetch(`${fixture}/backups`)).json(), [
+    ...backupsBeforeExpiry,
+    "backup",
+    "destroy",
+  ]);
   for await (const _chunk of await send()) {
   }
   assert.equal((await getState()).run.status, "completed");
@@ -485,6 +449,38 @@ try {
   console.log(
     "Passed: cleanup stops after three failures, retains the sandbox identity, and an explicit new message can retry and restore.",
   );
+  const idleDeadline = "http://localhost:8791/agents/chat/idle-deadline/test";
+  const firstRun = await post(`${idleDeadline}/run`);
+  assert.equal(firstRun.run.status, "completed");
+  assert.equal(firstRun.checkpoint, undefined);
+  const idleExpired = await post(`${idleDeadline}/expire`);
+  assert.equal(idleExpired.sandbox, undefined);
+  assert.equal(idleExpired.checkpoint.threadId, "native-thread");
+  assert.deepEqual(await (await fetch(`${idleDeadline}/backups`)).json(), [
+    "backup",
+    "destroy",
+  ]);
+  console.log(
+    "Passed: deadline cleanup backs up an idle sandbox before destroying it.",
+  );
+
+  const backupFailure = "http://localhost:8791/agents/chat/backup-failure/test";
+  await fetch(`${backupFailure}/fail-backup`, { method: "POST" });
+  const warmRun = await post(`${backupFailure}/run`);
+  assert.equal(warmRun.run.status, "completed");
+  assert.equal(warmRun.checkpoint, undefined);
+  assert.deepEqual(await (await fetch(`${backupFailure}/backups`)).json(), []);
+  const expiredWithoutBackup = await post(`${backupFailure}/expire`);
+  assert.equal(expiredWithoutBackup.sandbox, undefined);
+  assert.equal(expiredWithoutBackup.checkpoint, undefined);
+  assert.deepEqual(await (await fetch(`${backupFailure}/backups`)).json(), [
+    "backup-failed",
+    "destroy",
+  ]);
+  console.log(
+    "Passed: unavailable backups do not fail a turn, and deadline cleanup still destroys the sandbox.",
+  );
+
   const chat = new Chat({
     id: "playground",
     transport,

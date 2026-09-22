@@ -1,6 +1,5 @@
 import { AIChatAgent } from "@cloudflare/ai-chat";
-import { getSandbox, ContainerProxy } from "@cloudflare/sandbox";
-import { routeAgentRequest } from "agents";
+import { getSandbox } from "@cloudflare/sandbox";
 import {
   createUIMessageStream,
   createUIMessageStreamResponse,
@@ -8,8 +7,8 @@ import {
 } from "ai";
 import { sendRequestSchema, type SendRequest } from "@playground/chat-contract";
 import { AppServer, AppServerError, within } from "./app-server.ts";
-import { Sandbox } from "./sandbox.ts";
-import { CodexEvents } from "./codex-events.ts";
+import type { Sandbox } from "./sandbox.ts";
+import { openCodexTurn, type CodexTurn } from "./codex-turn.ts";
 import {
   checkpointCodex,
   connectCodex,
@@ -22,8 +21,7 @@ import {
 } from "./codex.ts";
 import type { Turn } from "./protocol.ts";
 
-export { Sandbox, ContainerProxy };
-interface Env {
+export interface Env {
   Sandbox: DurableObjectNamespace<Sandbox>;
   Chat: DurableObjectNamespace<Chat>;
   CODEX_MODEL?: string;
@@ -45,11 +43,7 @@ const interruptedMessage =
 
 export class Chat extends AIChatAgent<Env, CodexState> {
   initialState: CodexState = {};
-  private active?: {
-    client: AppServer;
-    completed: Promise<Turn>;
-    terminal: boolean;
-  };
+  private active?: CodexTurn;
   private controlTail: Promise<unknown> = Promise.resolve();
   private chatTask?: Promise<void>;
   private acceptance?: { resolve(): void; reject(error: unknown): void };
@@ -146,7 +140,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       this.ensureUsable(run.sandboxId);
       let steered = false;
       try {
-        await active.client.request("turn/steer", {
+        await active.steer({
           threadId: run.threadId,
           expectedTurnId: run.turnId,
           clientUserMessageId: input.id,
@@ -172,7 +166,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         return;
       }
     }
-    // Finish checkpoint/transcript persistence before the next turn can own the stream.
+    // Finish transcript persistence before the next turn can own the stream.
     await this.chatTask;
     let resolve!: () => void;
     let reject!: (error: unknown) => void;
@@ -209,10 +203,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     this.ensureUsable(run.sandboxId);
     const active = this.active;
     if (active && run.threadId && run.turnId) {
-      await active.client.request("turn/interrupt", {
-        threadId: run.threadId,
-        turnId: run.turnId,
-      });
+      await active.interrupt(run.turnId);
       await this.interaction();
       await within(
         active.completed,
@@ -244,34 +235,21 @@ export class Chat extends AIChatAgent<Env, CodexState> {
 
   private async finishRun(run: Run, status: Run["status"]) {
     if (!this.usable(run.sandboxId)) return;
-    try {
-      await this.checkpoint(run.sandboxId);
-    } catch (error) {
-      status = "failed";
-      throw error;
-    } finally {
-      if (this.usable(run.sandboxId)) {
-        const waitingSince = this.now();
-        this.setState({
-          ...this.state,
-          run: { ...this.state.run!, status },
-          sandbox: {
-            ...this.state.sandbox!,
-            phase: "waiting_for_user",
-            waitingSince,
-          },
-        });
-        await this.schedule(
-          new Date(Math.ceil((waitingSince + SANDBOX_IDLE_MS) / 1000) * 1000),
-          "expireSandbox",
-          {
-            id: run.sandboxId,
-            reason: "idle",
-            waitingSince,
-          } satisfies Expiration,
-        );
-      }
-    }
+    const waitingSince = this.now();
+    this.setState({
+      ...this.state,
+      run: { ...this.state.run!, status },
+      sandbox: {
+        ...this.state.sandbox!,
+        phase: "waiting_for_user",
+        waitingSince,
+      },
+    });
+    await this.schedule(
+      new Date(Math.ceil((waitingSince + SANDBOX_IDLE_MS) / 1000) * 1000),
+      "expireSandbox",
+      { id: run.sandboxId, reason: "idle", waitingSince } satisfies Expiration,
+    );
   }
 
   // After connection/DO loss, stop surviving work before allowing another prompt.
@@ -442,28 +420,27 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         const active = this.active;
         const run = this.state.run;
         try {
-          if (active && run?.threadId && run.turnId) {
+          if (run?.status === "running") {
+            if (!active || !run.threadId || !run.turnId)
+              throw new Error(
+                "Native execution is unconfirmed; skip final backup.",
+              );
             await within(
-              active.client
-                .request("turn/interrupt", {
-                  threadId: run.threadId,
-                  turnId: run.turnId,
-                })
-                .then(() => active.completed),
+              active.interrupt(run.turnId).then(() => active.completed),
               5_000,
               "Deadline Stop timed out.",
             );
-            const backup = await within(
-              checkpointCodex(this.sandbox(id)),
-              10_000,
-              "Deadline checkpoint timed out.",
-            );
-            if (this.state.sandbox?.id === id)
-              this.setState({
-                ...this.state,
-                checkpoint: { backup, threadId: this.state.threadId },
-              });
           }
+          const backup = await within(
+            checkpointCodex(this.sandbox(id)),
+            10_000,
+            "Deadline checkpoint timed out.",
+          );
+          if (this.state.sandbox?.id === id)
+            this.setState({
+              ...this.state,
+              checkpoint: { backup, threadId: this.state.threadId },
+            });
         } catch {
           /* Expiration must not wait indefinitely for a final checkpoint. */
         }
@@ -560,9 +537,8 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         onError: messageOf,
         execute: async ({ writer }) => {
           const write = (chunk: UIMessageChunk) => writer.write(chunk);
-          const events = new CodexEvents(write, run.id);
           let client: AppServer | undefined;
-          let unsubscribe = () => {};
+          let execution: CodexTurn | undefined;
           let terminal = false;
           let failure: unknown;
           let status: Run["status"] = "failed";
@@ -579,64 +555,27 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             );
             client = connected.client;
             this.ensureUsable(sandbox.id);
-            const options = {
-              cwd: "/workspace/repo",
-              approvalPolicy: "never" as const,
-              sandbox: "workspace-write" as const,
+            execution = await openCodexTurn(client, {
+              threadId: connected.threadId,
               model: this.env.CODEX_MODEL,
-            };
-            const { thread } = connected.threadId
-              ? await client.request("thread/resume", {
-                  ...options,
-                  threadId: connected.threadId,
-                })
-              : await client.request("thread/start", options);
+              runId: run.id,
+              write,
+              onTurnStarted: (turnId) =>
+                this.setRun({ ...this.state.run!, turnId }),
+            });
             this.ensureUsable(sandbox.id);
-            if (thread.turns.some((turn) => turn.status === "inProgress"))
-              throw new Error("Native thread still has an active turn.");
+            this.active = execution;
             this.setState({
               ...this.state,
-              threadId: thread.id,
-              run: { ...run, threadId: thread.id },
+              threadId: execution.threadId,
+              run: { ...run, threadId: execution.threadId, submitted: true },
               sandbox: { ...this.state.sandbox!, phase: "waiting_for_agent" },
             });
-            let resolve!: (turn: Turn) => void;
-            const result = new Promise<Turn>((r) => {
-              resolve = r;
-            });
-            const completed = Promise.race([result, client.disconnected]);
-            void completed.catch(() => {});
-            const active = { client, completed, terminal: false };
-            this.active = active;
-            unsubscribe = client.subscribe((event) => {
-              if (event.params.threadId !== thread.id) return;
-              if (event.method === "turn/started") {
-                this.setRun({
-                  ...this.state.run!,
-                  turnId: event.params.turn.id,
-                });
-              } else if (event.method === "turn/completed") {
-                if (
-                  !this.state.run?.turnId ||
-                  event.params.turn.id === this.state.run.turnId
-                ) {
-                  active.terminal = true;
-                  resolve(event.params.turn);
-                }
-              } else if (event.params.turnId === this.state.run?.turnId)
-                events.accept(event);
-            });
-            this.setRun({ ...this.state.run!, submitted: true });
-            const started = await client.request("turn/start", {
-              threadId: thread.id,
-              clientUserMessageId: message.id,
-              input: [{ type: "text", text: prompt, text_elements: [] }],
-            });
-            this.setRun({ ...this.state.run!, turnId: started.turn.id });
+            const started = await execution.start(prompt, message.id);
+            this.setRun({ ...this.state.run!, turnId: started.id });
             acceptance?.resolve();
-            const turn = await completed;
+            const turn = await execution.completed;
             terminal = true;
-            for (const item of turn.items) events.item(item);
             status =
               turn.status === "completed"
                 ? "completed"
@@ -658,8 +597,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               }
             }
           } finally {
-            events.finish();
-            unsubscribe();
+            await execution?.close();
             client?.close();
             this.active = undefined;
             if (!this.usable(run.sandboxId))
@@ -683,26 +621,3 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     });
   }
 }
-export default {
-  async fetch(request, env) {
-    // Only the chat is public; the Sandbox binding is an internal execution API.
-    if (!new URL(request.url).pathname.startsWith("/agents/chat/")) {
-      return new Response("Not found", { status: 404 });
-    }
-    // CORS covers history requests; WebSocket upgrades need an origin check too.
-    const origin = request.headers.get("Origin");
-    if (origin && origin !== env.UI_ORIGIN) {
-      return new Response("Origin not allowed", { status: 403 });
-    }
-    return (
-      (await routeAgentRequest(request, env, {
-        cors: {
-          "Access-Control-Allow-Origin": env.UI_ORIGIN,
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
-          Vary: "Origin",
-        },
-      })) ?? new Response("Not found", { status: 404 })
-    );
-  },
-} satisfies ExportedHandler<Env>;

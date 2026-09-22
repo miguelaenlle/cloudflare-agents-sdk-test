@@ -1,5 +1,5 @@
 import { Chat as ProductionChat } from "../agent.ts";
-import worker from "../agent.ts";
+import worker from "../worker.ts";
 import { SANDBOX_IDLE_MS, USER_IDLE_MS, type CodexSandbox } from "../codex.ts";
 import { TestSandbox } from "./sandbox.ts";
 export { TestSandbox };
@@ -130,6 +130,8 @@ export class Chat extends ProductionChat {
     if (path.endsWith("/test/schedules"))
       return Response.json(this.getSchedules());
     if (path.endsWith("/test/state")) return Response.json(this.state);
+    if (path.endsWith("/test/backups"))
+      return Response.json(await this.fixture().backupEvents());
     if (path.endsWith("/test/status"))
       return Response.json(await this.fixture().inspect());
     return super.onRequest(request);
