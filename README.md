@@ -2,7 +2,7 @@
 
 A minimal PrairieLearn-shaped prototype: a React/Vercel AI SDK UI talks through a replaceable Express relay to a Cloudflare `AIChatAgent`. Native **Codex app-server** runs inside a Cloudflare Sandbox and owns the model/tool loop. The browser and webserver can disappear without cancelling work.
 
-[Architecture and diagrams](docs/architecture.md) · [Proposal status](docs/architecture-proposed.md)
+[Local testing and manual deployment](docs/testing.md) · [Architecture and diagrams](docs/architecture.md) · [Proposal status](docs/architecture-proposed.md)
 
 ```text
 Browser: React / AI SDK
@@ -22,6 +22,8 @@ Workspace + native session → R2 checkpoints
 
 | File                                   | Responsibility                                                             |
 | -------------------------------------- | -------------------------------------------------------------------------- |
+| `apps/agent/worker.ts`                 | Public routing, origin checks, deployment exports                          |
+| `apps/agent/codex-turn.ts`             | Native thread/turn startup, subscriptions, output conversion               |
 | `apps/agent/agent.ts`                  | Chat coordinator, steering/Stop, deadlines, checkpoint and recovery policy |
 | `apps/agent/codex.ts`                  | Start/reuse app-server, private connection, restore/backup                 |
 | `apps/agent/app-server.ts`             | Small typed JSON-RPC client                                                |
@@ -101,12 +103,12 @@ pnpm --filter @playground/agent exec wrangler tail --config wrangler.jsonc
 ## Behavior and limits
 
 - **One app-server per warm sandbox.** `turn/completed` ends a turn; it does not exit the process. Close the control socket between turns and reconnect/initialize/resume on the next prompt.
-- **Persistence:** UI history/replay and coordination are in Chat DO SQLite. `/workspace/repo` and `/workspace/codex` are backed up after terminal turns and before idle destruction. Only the last successful checkpoint survives unexpected loss.
+- **Persistence:** UI history/replay and coordination are in Chat DO SQLite. `/workspace/repo` and `/workspace/codex` are backed up only immediately before planned destruction. Completion, steering, Stop, and recovery retain the warm workspace without a backup. Unexpected loss restores the last successful checkpoint; before the first backup it starts a fresh workspace.
 - **Lifecycle:** `keepAlive: false`, CF `sleepAfter: "6h"`, ten minutes waiting-state cleanup, and a separate durable six-hour deadline since user input. An open proxied WebSocket prevents CF idle expiry; the application deadline still bounds active work.
 - **Uncertain execution:** reconnect and inspect/interrupt surviving native work before accepting another turn. Never automatically replay a prompt. Missing tool events may become a terminal recovery message rather than a complete event replay.
 - **Stop:** RPC acknowledgment is insufficient; wait for a terminal notification. Unconfirmed Stop blocks another turn; deadline cleanup can eventually destroy the box.
 - **Cleanup:** at most three automatic attempts, 30 seconds apart. Failed destruction retains the sandbox identity and blocks replacement; a later prompt can explicitly retry.
-- **History and backups are not atomic.** Restoring files may roll back work still described in UI history. Backup cadence remains conservative pending measurement.
+- **History and backups are not atomic.** Restoring files may roll back work still described in UI history. Unexpected loss may discard all work since the last planned shutdown, even though its chat history remains.
 - **Trusted prototype only:** one shared conversation, no authentication or approval UI. Origin checks are not authorization. Multi-window synchronization remains a gap.
 
 ## Credentials and network
@@ -144,7 +146,7 @@ pnpm --filter @playground/agent test:native
 pnpm format:check
 ```
 
-`pnpm test` uses real AIChatAgent/Worker and relay code against a simulated sandbox. It covers reconnection, detached completion, native-process reuse, unified send, steering persistence, completion-race fallback, lost steering acknowledgment without replay, Stop, lost start acknowledgment, restore, stale alarms, sliding deadlines, and cleanup failures. `test:native` runs the pinned native app-server with a fake local Responses endpoint; it needs no API key, Docker, or paid inference.
+`pnpm test` uses real AIChatAgent/Worker and relay code against a simulated sandbox. It covers reconnection, detached completion, native-process reuse, unified send, steering persistence, completion-race fallback, lost steering acknowledgment without replay, Stop, no backups during warm execution, pre-destruction backup ordering, idle/deadline backup failures, lost start acknowledgment, restore, stale alarms, sliding deadlines, and cleanup failures. `test:native` runs the pinned native app-server with a fake local Responses endpoint; it needs no API key, Docker, or paid inference.
 
 Regenerate protocol types after intentionally updating the Codex pin:
 

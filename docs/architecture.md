@@ -2,7 +2,7 @@
 
 React/AI SDK → stateless PL relay → Chat Durable Object → Codex app-server in a Cloudflare Sandbox. Native Codex owns the model/tool loop. The Chat DO owns admission, UI history, lifecycle, and recovery.
 
-**Implemented locally.** Tests cover the real app-server with a fake model endpoint and the real Cloudflare chat runtime with a simulated sandbox. Live outbound credential injection, container isolation, and R2 restore still need deployment verification. [Setup](../README.md).
+**Implemented locally.** Tests cover the real app-server with a fake model endpoint and the real Cloudflare chat runtime with a simulated sandbox. Live outbound credential injection, container isolation, and R2 restore still need deployment verification. [Local testing and manual deployment](testing.md).
 
 ## Components and boundaries
 
@@ -114,10 +114,15 @@ sequenceDiagram
         Chat->>Codex: turn/interrupt
     end
     Codex-->>Chat: turn/completed with terminal status
-    Chat->>Sandbox: CF Sandbox SDK: checkpoint workspace
     Chat->>Chat: waiting_for_user and close control socket
     Chat-->>UI: Final UI events through PL
-    Note over Codex: App-server remains running between turns
+    Note over Codex: App-server remains running between turns, no backup yet
+    opt Ten minutes waiting for user
+        Chat->>Sandbox: Back up workspace and native session to R2
+        Sandbox-->>Chat: Backup reference
+        Chat->>Chat: Persist backup reference and native thread ID
+        Chat->>Sandbox: Destroy sandbox
+    end
 ```
 
 The diagram's Chat ↔ Codex arrows use the socket returned by Cloudflare's Sandbox SDK. **Cloudflare owns DO RPC and container routing. We own JSON-RPC request matching and event conversion.** No stdout parsing, per-turn runner, cancellation marker, or Codex TypeScript SDK remains.
@@ -126,6 +131,8 @@ The diagram's Chat ↔ Codex arrows use the socket returned by Cloudflare's Sand
 | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------- |
 | [Browser](../apps/web/client/app.tsx)                                                             | Small UI, submit/reattach, history/reconnect, Stop             | AI SDK message state and SSE                                     |
 | [PL relay](../apps/web/server/server.ts) / [provider](../apps/web/server/providers/cloudflare.ts) | Routes, validation, connection lifetime                        | Express, Cloudflare chat transport, AI SDK SSE                   |
+| [Worker entry](../apps/agent/worker.ts)                                                           | Public routing and origin checks                               | Agents routing                                                   |
+| [Native turn](../apps/agent/codex-turn.ts)                                                        | Thread/turn startup, subscriptions, event conversion           | Codex app-server and existing event mapper                       |
 | [Chat DO](../apps/agent/agent.ts)                                                                 | Turn admission, durable deadlines, checkpoints, reconciliation | AIChatAgent history/replay, Agents scheduling                    |
 | [Sandbox bridge](../apps/agent/codex.ts)                                                          | Start/reuse process, connect, backup/restore calls             | Cloudflare Sandbox SDK                                           |
 | [App-server client](../apps/agent/app-server.ts) / [mapper](../apps/agent/codex-events.ts)        | Request IDs, notifications → UI events                         | Generated native protocol types; Codex thread/turn and tool loop |
@@ -137,7 +144,7 @@ The diagram's Chat ↔ Codex arrows use the socket returned by Cloudflare's Sand
 
 - With a live nonterminal turn, deliver `turn/steer` and persist the accepted user message.
 - With no active turn, call `saveMessages` to run a new library-managed response; acknowledge once Codex accepts `turn/start`.
-- If steering is explicitly rejected and the native turn is confirmed terminal, wait for the old turn's checkpoint/transcript finalization and start a new turn with that message.
+- If steering is explicitly rejected and the native turn is confirmed terminal, wait for the old turn's transcript finalization and start a new turn with that message.
 - A disconnect or timeout is an uncertain result, not evidence of rejection. Do not fall back to `turn/start` or automatically resend.
 - An already persisted message ID is acknowledged without executing again. This is not an exactly-once guarantee across native acceptance and DO persistence; an uncertain steering request needs reconciliation before a manual retry.
 
@@ -180,6 +187,10 @@ flowchart TD
     Waiting -->|"User sends next prompt"| Working
     Waiting -->|"10 minutes waiting"| Saving
     Saving -->|"Checkpoint succeeds"| Destroying
+    Saving -->|"Backup fails: bounded retry"| Waiting
+    Working -->|"6 hours without user interaction"| Deadline["Attempt bounded interruption and backup"]
+    Waiting -->|"6 hours without user interaction"| Deadline
+    Deadline -->|"Success, failure, or timeout"| Destroying
     Destroying -->|"Destruction confirmed"| Offline
 
     classDef default fill:#374151,stroke:#9ca3af,color:#f9fafb
@@ -201,13 +212,12 @@ An open proxied control WebSocket prevents Cloudflare idle expiry in the install
 | Stop acknowledgment without terminal notification | Wait up to five seconds after acknowledgment, report unconfirmed Stop; keep new turns blocked                                     |
 | Connection/DO lost after submission               | Reconnect and inspect the native thread; stop surviving work before admitting another turn; never replay the prompt automatically |
 | Container/process lost                            | Destroy the old generation, report interruption; a user prompt can restore the last checkpoint                                    |
-| Turn-end backup fails                             | Report failure; retain warm workspace and previous checkpoint                                                                     |
 | Pre-idle backup fails                             | Return to waiting and retry; do not destroy without that backup                                                                   |
 | Destruction fails/unknown                         | Retain generation as `cleanup_failed`; block replacement                                                                          |
 | Cleanup retry budget exhausted                    | Three total attempts, 30 seconds apart; next prompt may explicitly retry                                                          |
 | Restore fails/backup expired                      | Surface the error; do not invent native context from UI history                                                                   |
 
-The six-hour deadline attempts interruption for at most five seconds and a final backup for at most ten seconds, then destroys regardless. Ordinary checkpoints are awaited before another turn can start. Destruction confirmation is bounded to 30 seconds; a timeout is an uncertain result, not proof of destruction. Cloudflare outages can delay cleanup.
+The six-hour deadline attempts interruption for at most five seconds and a final backup for at most ten seconds, then destroys regardless. Idle cleanup waits for its backup before destruction; ordinary turn completion does not back up. If native execution cannot be confirmed stopped, deadline cleanup skips the backup and destroys. Destruction retries do not repeat a backup already attempted during shutdown. Destruction confirmation is bounded to 30 seconds; a timeout is an uncertain result, not proof of destruction. Cloudflare outages can delay cleanup.
 
 Run outcomes (`completed`, `cancelled`, `failed`, `interrupted`) are separate from sandbox phases. Browser/PL disconnection changes neither lifecycle nor execution. App-server recovery does not promise replay of every missed tool event; UI history receives a terminal result/interruption after reconciliation.
 
@@ -221,7 +231,7 @@ Run outcomes (`completed`, `cancelled`, `failed`, `interrupted`) are separate fr
 | Control token + diagnostics                                | `/tmp`, outside checkpoints                  |
 | OpenAI credential                                          | Worker secret, used only by outbound handler |
 
-Checkpoints happen after terminal turns and before idle destruction. They save files, not a live process. Native app-server remains running; backup consistency with its background metadata writes still needs live verification. UI history and backups are not atomic; history may describe work missing from a restored checkpoint. Backups expire after 30 days; configure R2 deletion separately.
+Checkpoints happen only immediately before planned destruction. Completion, steering, Stop, and recovery do not back up a sandbox being retained. Idle cleanup requires a successful checkpoint; the six-hour inactivity deadline attempts one even when the sandbox is already idle, but proceeds with destruction if backup fails or times out. They save files, not a live process. Native app-server remains running; backup consistency with its background metadata writes still needs live verification. UI history and backups are not atomic; history may describe work missing from a restored checkpoint. Unexpected loss can discard all workspace/native-session changes since the last successful pre-destruction checkpoint. Before the first checkpoint, cold startup creates a fresh workspace/thread. Infrastructure shutdown is not a guaranteed application backup hook. Backups expire after 30 days; configure R2 deletion separately.
 
 The Sandbox subclass allows `api.openai.com` and the configured R2 account host. For OpenAI it permits only HTTPS POSTs to `/v1/responses` and `/v1/responses/compact`, replaces Authorization, strips container-supplied project/organization headers, and rejects redirects. Codex uses HTTP Responses with model WebSockets disabled. Cloudflare's SDK uses presigned URLs for R2 transfer; permanent R2 keys remain Worker secrets. Other internet destinations are blocked, including package/Git hosts until explicitly added.
 
@@ -232,7 +242,7 @@ No OpenAI-key redaction pipeline is needed because the key is never sent into th
 Two deployments: `apps/web` and `apps/agent`; the shared chat contract is source code, not a service. Preserve history/send/resume/cancel and AI SDK events when replacing Cloudflare; replace the provider adapter and migrate state.
 
 - Trusted disposable prototype: one shared conversation, no user authentication/approval UI. Origin checks are not authorization.
-- Two-window synchronization remains a gap. Course checkout/push_sync, previews, usage accounting, and checkpoint-frequency optimization are deferred.
+- Two-window synchronization remains a gap. Course checkout/push_sync, previews, and usage accounting are deferred.
 - Unit tests cover protocol matching, mapper behavior, and outbound policy. Integration tests exercise real AIChatAgent/relay behavior against a simulated sandbox. The native test runs pinned app-server against a fake local model endpoint.
 - Live acceptance still requires Cloudflare HTTPS interception/TLS trust, workspace sandbox/tool execution, private socket authentication, and real R2 backup/restore. No deployment or paid inference is included in local checks.
 
