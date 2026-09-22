@@ -6,7 +6,8 @@
     "dev": "vite",
     "dev:server": "node --env-file=../../.env.local --experimental-strip-types server/server.ts",
     "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node test/relay.mjs"
   },
   "dependencies": {
     "@ai-sdk/react": "^4.0.105",
