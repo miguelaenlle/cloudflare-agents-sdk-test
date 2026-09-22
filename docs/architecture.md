@@ -106,7 +106,7 @@ sequenceDiagram
         UI->>PL: Same POST /api/chat: message id + text
         PL->>Chat: Same HTTP /message
         Chat->>Codex: turn/steer with current native turn ID
-        Chat-->>UI: Acknowledge through PL; UI reloads history and reattaches
+        Chat-->>UI: Acknowledge through PL, UI reloads history and reattaches
     end
     opt User stops
         UI->>PL: POST /api/chat/cancel
