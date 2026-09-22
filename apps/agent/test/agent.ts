@@ -91,6 +91,13 @@ export class Chat extends ProductionChat {
       await this.expireSandbox({ id, reason: "interaction" });
       return Response.json(this.state);
     }
+    if (path.endsWith("/test/steer-behavior")) {
+      const { behavior } = await request.json<{
+        behavior: "finish" | "lose-ack" | "reject";
+      }>();
+      await this.fixture().setSteerBehavior(behavior);
+      return Response.json({});
+    }
     if (path.endsWith("/test/drop-start-ack")) {
       await this.fixture().dropNextStartAck();
       return new Response(null, { status: 204 });

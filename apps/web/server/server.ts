@@ -1,14 +1,8 @@
 import express, { type ErrorRequestHandler, type Response } from "express";
-import {
-  pipeUIMessageStreamToResponse,
-  validateUIMessages,
-  type UIMessage,
-} from "ai";
+import { pipeUIMessageStreamToResponse } from "ai";
 import { z } from "zod";
 import {
   CANCEL_API,
-  STEER_API,
-  steerRequestSchema,
   CHAT_API,
   sendRequestSchema,
   HISTORY_API,
@@ -37,12 +31,10 @@ function clientSignal(response: Response) {
   return controller.signal;
 }
 
-async function streamChat(response: Response, messages?: UIMessage[]) {
+async function streamChat(response: Response) {
   const connection = await provider.connect(clientSignal(response));
   try {
-    const stream = messages
-      ? await connection.send(messages)
-      : await connection.resume();
+    const stream = await connection.resume();
     if (!stream) {
       response.status(204).end();
       return;
@@ -59,20 +51,6 @@ app.get(HISTORY_API, async (_request, response) => {
   response.json(messages);
 });
 
-app.post(
-  STEER_API,
-  express.json({ limit: 150_000 }),
-  async (request, response) => {
-    const input = steerRequestSchema.safeParse(request.body);
-    if (!input.success) {
-      response.status(400).send("Invalid steering request.");
-      return;
-    }
-    await provider.steer(input.data, clientSignal(response));
-    response.status(204).end();
-  },
-);
-
 app.post(CANCEL_API, async (_request, response) => {
   await provider.cancel(clientSignal(response));
   response.status(204).end();
@@ -82,17 +60,13 @@ app.post(
   CHAT_API,
   express.json({ limit: 1_000_000 }),
   async (request, response) => {
-    let messages: UIMessage[];
-    try {
-      const input = sendRequestSchema.parse(request.body);
-      messages = await validateUIMessages({ messages: input.messages });
-    } catch {
-      response
-        .status(400)
-        .send("Expected a valid playground chat request with UI messages.");
+    const input = sendRequestSchema.safeParse(request.body);
+    if (!input.success) {
+      response.status(400).send("Expected a message ID and nonempty text.");
       return;
     }
-    await streamChat(response, messages);
+    await provider.send(input.data, clientSignal(response));
+    response.status(204).end();
   },
 );
 
