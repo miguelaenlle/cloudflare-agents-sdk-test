@@ -8,7 +8,7 @@ import {
   ContainerLost,
   type CodexSandbox,
 } from "../codex.ts";
-import { forwardOpenAI } from "../outbound.ts";
+import { forwardOpenAI, forwardGitHub } from "../outbound.ts";
 import type { ThreadItem } from "../protocol.ts";
 
 const text: ThreadItem = {
@@ -194,4 +194,99 @@ test("model redirects are blocked without exposing the destination", async () =>
   );
   assert.equal(response.status, 502);
   assert.equal(response.headers.has("Location"), false);
+});
+
+test("steering splits live text and reasoning without duplicating completion snapshots", () => {
+  const chunks: UIMessageChunk[] = [];
+  const events = new CodexEvents((chunk) => chunks.push(chunk), "r");
+  events.accept({
+    method: "item/agentMessage/delta",
+    params: { threadId: "t", turnId: "u", itemId: "text", delta: "Hello " },
+  });
+  events.accept({
+    method: "item/reasoning/summaryTextDelta",
+    params: {
+      threadId: "t",
+      turnId: "u",
+      itemId: "thought",
+      summaryIndex: 0,
+      delta: "Checking",
+    },
+  });
+  events.steering("user-2", "Use a different approach.");
+  events.item(text);
+  events.finish();
+  assert.equal(
+    chunks
+      .filter((c) => c.type === "text-delta")
+      .map((c) => c.delta)
+      .join(""),
+    "Hello world",
+  );
+  const marker = chunks.findIndex((c) => c.type === "data-steering");
+  assert.ok(chunks.slice(0, marker).some((c) => c.type === "reasoning-end"));
+  assert.ok(chunks.slice(marker + 1).some((c) => c.type === "text-start"));
+});
+
+test("Git credential injection only permits configured repository reads and blocks redirects", async () => {
+  let calls = 0;
+  const env = {
+    GITHUB_REPOSITORY: "owner/course",
+    GITHUB_TOKEN: "private-token",
+  };
+  const send: typeof fetch = async (input) => {
+    calls++;
+    assert.ok(input instanceof Request);
+    assert.equal(
+      input.url,
+      "https://github.com/owner/course.git/info/refs?service=git-upload-pack",
+    );
+    assert.equal(
+      input.headers.get("Authorization"),
+      `Basic ${btoa("x-access-token:private-token")}`,
+    );
+    assert.equal(input.headers.has("cookie"), false);
+    return new Response("refs");
+  };
+  assert.equal(
+    (
+      await forwardGitHub(
+        new Request(
+          "https://github.com/owner/course.git/info/refs?service=git-upload-pack",
+          { headers: { cookie: "untrusted" } },
+        ),
+        env,
+        send,
+      )
+    ).status,
+    200,
+  );
+  for (const url of [
+    "https://github.com/other/repo.git/info/refs?service=git-upload-pack",
+    "https://github.com/owner/course.git/git-receive-pack",
+    "https://github.com/owner/course.git/info/refs?service=git-receive-pack",
+    "https://github.com/owner/course.git/info/refs?service=git-upload-pack&other=1",
+  ]) {
+    assert.equal(
+      (await forwardGitHub(new Request(url), env, send)).status,
+      403,
+    );
+  }
+  assert.equal(calls, 1);
+  assert.equal(
+    (
+      await forwardGitHub(
+        new Request(
+          "https://github.com/owner/course.git/info/refs?service=git-upload-pack",
+        ),
+        env,
+        async () =>
+          new Response(null, {
+            status: 302,
+            headers: { Location: "https://evil.test" },
+          }),
+      )
+    ).status,
+    502,
+  );
 });

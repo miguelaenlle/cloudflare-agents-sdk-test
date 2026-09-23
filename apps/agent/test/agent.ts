@@ -1,10 +1,14 @@
 import { Chat as ProductionChat } from "../agent.ts";
 import worker from "../worker.ts";
-import { SANDBOX_IDLE_MS, USER_IDLE_MS, type CodexSandbox } from "../codex.ts";
+import { SANDBOX_IDLE_MS, type CodexSandbox } from "../codex.ts";
 import { TestSandbox } from "./sandbox.ts";
 export { TestSandbox };
 
 export class Chat extends ProductionChat {
+  // Exercise deadline-before-idle ordering without changing the production timeout.
+  protected override get interactionTimeoutMs() {
+    return this.name === "short-deadline" ? 30_000 : super.interactionTimeoutMs;
+  }
   private timeOffset = 0;
   protected override now() {
     return Date.now() + this.timeOffset;
@@ -32,6 +36,10 @@ export class Chat extends ProductionChat {
   }
   override async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
+    if (path.endsWith("/test/approval")) {
+      await this.fixture().requestApproval();
+      return new Response(null, { status: 204 });
+    }
     if (path.endsWith("/test/run")) {
       await this.persistMessages([
         {
@@ -64,7 +72,9 @@ export class Chat extends ProductionChat {
     if (path.endsWith("/test/expire")) {
       const lifecycle = this.state.sandbox!;
       this.timeOffset =
-        lifecycle.lastUserInteractionAt + USER_IDLE_MS - Date.now();
+        lifecycle.lastUserInteractionAt +
+        this.interactionTimeoutMs -
+        Date.now();
       for (const schedule of this.getSchedules<{
         id: string;
         reason: string;

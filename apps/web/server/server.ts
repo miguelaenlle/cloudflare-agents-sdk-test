@@ -2,36 +2,146 @@ import express, { type ErrorRequestHandler, type Response } from "express";
 import { pipeUIMessageStreamToResponse } from "ai";
 import { z } from "zod";
 import {
-  CANCEL_API,
-  CHAT_API,
+  ChatError,
   sendRequestSchema,
-  HISTORY_API,
-  RESUME_API,
+  approvalDecisionSchema,
+  type ChatProvider,
 } from "@playground/chat-contract";
 import { createCloudflareProvider } from "./providers/cloudflare.ts";
+import {
+  publicationSnapshot,
+  retryPublications,
+  listConversations,
+  createConversation,
+  hasConversation,
+  recordDecision,
+  pendingDecisions,
+  deliveredDecision,
+} from "./conversations.ts";
 
 const config = z
   .object({
-    AGENT_URL: z
-      .url()
-      .refine(
-        (value) => ["http:", "https:"].includes(new URL(value).protocol),
-        "Use an HTTP or HTTPS Worker URL.",
-      ),
+    AGENT_URL: z.url(),
     PORT: z.coerce.number().int().min(1).max(65535).default(4316),
   })
   .parse(process.env);
-const provider = createCloudflareProvider(new URL(config.AGENT_URL));
 const app = express();
 app.disable("x-powered-by");
-
+app.use(express.json({ limit: 1_000_000 }));
+// This localhost prototype has one trusted user. PrairieLearn must authorize each conversation here.
+app.use((request, response, next) => {
+  if (
+    request.method !== "GET" &&
+    request.headers.origin &&
+    request.headers.origin !==
+      (process.env.UI_ORIGIN ?? "http://localhost:4315")
+  ) {
+    response.status(403).send("Origin not allowed");
+    return;
+  }
+  next();
+});
 function clientSignal(response: Response) {
   const controller = new AbortController();
   response.once("close", () => controller.abort());
   return controller.signal;
 }
-
-async function streamChat(response: Response) {
+app.get("/api/conversations", (_request, response) =>
+  response.json(listConversations()),
+);
+app.post("/api/conversations", (request, response) => {
+  const parsed = z
+    .object({ title: z.string().trim().min(1).max(100) })
+    .safeParse(request.body);
+  if (!parsed.success) {
+    response.status(400).send("Expected a title.");
+    return;
+  }
+  response.status(201).json(createConversation(parsed.data.title));
+});
+function routes(
+  base: string,
+  conversationId: (params: Record<string, string | string[]>) => string,
+) {
+  function provider(params: Record<string, string | string[]>) {
+    const id = conversationId(params);
+    if (!hasConversation(id))
+      throw new ChatError(404, "Conversation not found.");
+    return createCloudflareProvider(new URL(config.AGENT_URL), id);
+  }
+  app.get(`${base}/snapshot`, async (request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.json(
+      await publicationSnapshot(
+        conversationId(request.params),
+        await provider(request.params).getSnapshot(clientSignal(response)),
+      ),
+    );
+  });
+  app.get(`${base}/history`, async (request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.json(
+      await provider(request.params).getHistory(clientSignal(response)),
+    );
+  });
+  app.get(`${base}/diagnostics`, async (request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.json(
+      await provider(request.params).getDiagnostics(clientSignal(response)),
+    );
+  });
+  app.post(base, async (request, response) => {
+    const parsed = sendRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      response
+        .status(400)
+        .send("Expected a message ID, revision and nonempty text.");
+      return;
+    }
+    await provider(request.params).send(parsed.data, clientSignal(response));
+    response.status(204).end();
+  });
+  app.post(`${base}/cancel`, async (request, response) => {
+    await provider(request.params).cancel(clientSignal(response));
+    response.status(204).end();
+  });
+  app.post(`${base}/approval`, async (request, response) => {
+    const parsed = approvalDecisionSchema.safeParse(request.body);
+    if (!parsed.success) {
+      response.status(400).send("Invalid approval decision.");
+      return;
+    }
+    const chat = provider(request.params);
+    const snapshot = await chat.getSnapshot(clientSignal(response));
+    const approval = snapshot.approval;
+    if (
+      !approval ||
+      approval.id !== parsed.data.id ||
+      approval.digest !== parsed.data.digest ||
+      (approval.status === "pending" &&
+        snapshot.revision !== parsed.data.expectedRevision)
+    )
+      throw new ChatError(409, "Approval changed. Refresh before deciding.");
+    const outcome = await recordDecision(
+      conversationId(request.params),
+      parsed.data,
+      approval,
+    );
+    await chat.decide(outcome, AbortSignal.timeout(30_000));
+    deliveredDecision(outcome.id);
+    response.status(204).end();
+  });
+  app.get(`${base}/:chatId/stream`, async (request, response) => {
+    if (request.params.chatId !== conversationId(request.params))
+      throw new ChatError(404, "Conversation not found.");
+    await streamChat(provider(request.params), response);
+  });
+}
+routes("/api/conversations/:conversationId/chat", (params) =>
+  z.string().parse(params.conversationId),
+);
+routes("/api/chat", () => "playground");
+async function streamChat(provider: ChatProvider, response: Response) {
   const connection = await provider.connect(clientSignal(response));
   try {
     const stream = await connection.resume();
@@ -44,41 +154,14 @@ async function streamChat(response: Response) {
     connection.close();
   }
 }
-
-app.get(HISTORY_API, async (_request, response) => {
-  const messages = await provider.getHistory(clientSignal(response));
-  response.setHeader("Cache-Control", "no-store");
-  response.json(messages);
-});
-
-app.post(CANCEL_API, async (_request, response) => {
-  await provider.cancel(clientSignal(response));
-  response.status(204).end();
-});
-
-app.post(
-  CHAT_API,
-  express.json({ limit: 1_000_000 }),
-  async (request, response) => {
-    const input = sendRequestSchema.safeParse(request.body);
-    if (!input.success) {
-      response.status(400).send("Expected a message ID and nonempty text.");
-      return;
-    }
-    await provider.send(input.data, clientSignal(response));
-    response.status(204).end();
-  },
-);
-
-app.get(RESUME_API, async (_request, response) => {
-  await streamChat(response);
-});
-
 const handleError: ErrorRequestHandler = (error, _request, response, _next) => {
   if (response.destroyed) return;
-  // A broken SSE stream signals reconnection; an error body would corrupt it.
   if (response.headersSent) {
     response.destroy();
+    return;
+  }
+  if (error instanceof ChatError) {
+    response.status(error.status).send(error.message);
     return;
   }
   if (error.type === "entity.too.large") {
@@ -95,7 +178,29 @@ const handleError: ErrorRequestHandler = (error, _request, response, _next) => {
     .send("Agent unavailable. Check the backend terminal and reconnect.");
 };
 app.use(handleError);
-
-app.listen(config.PORT, "127.0.0.1", () => {
-  console.log(`Chat relay listening on http://127.0.0.1:${config.PORT}`);
-});
+let delivering = false;
+// Durable result delivery continues after a browser disconnect or relay restart.
+const deliveryTimer = setInterval(async () => {
+  if (delivering) return;
+  delivering = true;
+  try {
+    await retryPublications();
+    for (const { conversationId, input } of pendingDecisions()) {
+      try {
+        await createCloudflareProvider(
+          new URL(config.AGENT_URL),
+          conversationId,
+        ).decide(input, AbortSignal.timeout(30_000));
+        deliveredDecision(input.id);
+      } catch {
+        /* Keep the receipt for retry, including while sandbox cleanup is finishing. */
+      }
+    }
+  } finally {
+    delivering = false;
+  }
+}, 2000);
+deliveryTimer.unref();
+app.listen(config.PORT, "127.0.0.1", () =>
+  console.log(`Chat relay listening on http://127.0.0.1:${config.PORT}`),
+);

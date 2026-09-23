@@ -1,14 +1,14 @@
 # Test the complete stack, then deploy manually
 
-Use **`codex/prototype`**, the head of PR #1. It contains all six review layers; checking out PR #5 alone omits the later integration tests and documentation. Commands below run from the repository root unless stated otherwise. Preserve your local `.env.local` and Wrangler settings when updating the checkout.
+Use **`codex/review-05-integration-tests`**, the head of PR #6. It contains all five review layers; checking out PR #5 alone omits trusted publication and complete-stack integration. `codex/prototype` is retained as a compatibility branch with the complete implementation. Commands below run from the repository root unless stated otherwise. Preserve your local `.env.local` and Wrangler settings when updating the checkout.
 
 ## 1. Local automated checks
 
 Prerequisites: Node 22.18+ and pnpm 11. These tests need no API key, Docker, R2, or cloud deployment.
 
 ```sh
-git switch codex/prototype
-git pull --ff-only origin codex/prototype
+git switch codex/review-05-integration-tests
+git pull --ff-only origin codex/review-05-integration-tests
 pnpm install --frozen-lockfile
 pnpm typecheck
 pnpm build
@@ -33,6 +33,8 @@ Check the production Worker bundle without deploying or building a container:
 ```sh
 pnpm --filter @playground/agent exec wrangler deploy --config wrangler.jsonc --dry-run --containers-rollout=none --outdir dist
 ```
+
+The live prototype uses **ten minutes idle** and **six hours without accepted user interaction**. The six-hour deadline also bounds active work. Simulated lifecycle tests use the production timeout, except for one test-only 30-second case that checks deadline-before-idle ordering.
 
 ## Real local development (actual prompts)
 
@@ -65,7 +67,7 @@ Open **http://localhost:4315**. The Worker listens on **8790**, the relay on **4
 
 `dev:agent` uses the production Wrangler config with `LOCAL_DEV:true` supplied only on its command line. Do not set this flag in production. It selects SDK `localBucket: true` for every shutdown backup; restore reads the mode from the stored handle. Wrangler keeps DO state and emulated R2 in `apps/agent/.wrangler/local`. No separate S3 server or R2 API keys are needed.
 
-**Current local limitation:** on the tested Apple Silicon Docker setup, real model replies work but Codex tool execution fails with `bwrap: pivot_root: Operation not permitted`. Installing distribution Bubblewrap did not resolve it. `workspace-write` remains enabled; do not treat a text-only reply as a successful tool-execution test. A compatible Linux/container environment is still needed to complete this acceptance check.
+Codex turns use `externalSandbox`: the Cloudflare container provides isolation and its outbound handler restricts network access. Codex does not create an inner Bubblewrap sandbox, so no custom Docker seccomp profile is needed. Agent commands can modify writable container files outside the workspace, including the app-server installation; treat the entire container and its output as untrusted.
 
 Try creating a file, reading it on another turn, steering, Stop, and restarting the relay. Then leave the completed conversation idle for ten minutes, observe backup/destruction in the Worker terminal, and ask Codex to read the file after restoration. Backups contain real workspace archives. Local restore extracts them; deployed restore uses an overlay, so keep the deployed acceptance checks below.
 
@@ -150,18 +152,20 @@ Check `apps/agent/wrangler.jsonc`:
 Create an R2 API token with Object Read & Write scoped to this bucket. Set these secrets if not already configured; the R2 values are its S3 access-key pair:
 
 ```sh
+pnpm --filter @playground/agent exec wrangler secret put RELAY_TOKEN --config wrangler.jsonc
 pnpm --filter @playground/agent exec wrangler secret put CODEX_API_KEY --config wrangler.jsonc
 pnpm --filter @playground/agent exec wrangler secret put R2_ACCESS_KEY_ID --config wrangler.jsonc
 pnpm --filter @playground/agent exec wrangler secret put R2_SECRET_ACCESS_KEY --config wrangler.jsonc
 pnpm deploy
 ```
 
-This builds/uploads the container and deploys the Worker. No automated deployment is added. If upgrading a running prototype, finish or stop its active turn before deploying. Backups expire after 30 days; configure the R2 lifecycle rule described in the [README](../README.md).
+This builds/uploads the container and deploys the Worker. On the first deployment, allow several minutes for the container image to provision before sending a prompt. No automated deployment is added. If upgrading a running prototype, finish or stop its active turn before deploying. Backups expire after 30 days; configure the R2 lifecycle rule described in the [README](../README.md).
 
 Set the root `.env.local` to the actual URL printed by Wrangler:
 
 ```dotenv
 AGENT_URL=https://cloudflare-agents-sdk-test.YOUR_SUBDOMAIN.workers.dev
+RELAY_TOKEN=the-same-random-secret-set-on-the-worker
 ```
 
 Start `pnpm dev:server` and `pnpm dev` in separate terminals. Start logs in another:
@@ -173,12 +177,20 @@ pnpm --filter @playground/agent exec wrangler tail --config wrangler.jsonc
 ## 4. Live acceptance checks
 
 1. **Native execution:** ask Codex to create `/workspace/repo/review-marker.txt` containing a unique value and print it with a shell command. Verify text and tool results stream. Ask it to read the file on a second turn.
-2. **Send/Stop:** use the one-minute task, send a correction during execution, and try Stop. Send another prompt afterward. It should continue the same native conversation.
+2. **Send/Stop:** ask Codex to run `sleep 60`, send a correction during execution, and try Stop. Send another prompt afterward. It should continue the same native conversation.
 3. **Ephemeral relay:** restart the local relay or close the browser during a task. Reconnect and verify its result/history. Subscriber disconnection must not act as Stop.
 4. **No turn-end backups:** note the bucket's existing objects before testing. Complete several turns and Stop one while keeping idle periods below ten minutes. There should be no new workspace backup from those operations. Existing backups are not deleted by this change.
 5. **Idle shutdown and restore:** after completion, send nothing for at least ten minutes plus cleanup time. In the Cloudflare dashboard verify a new backup under `backups/` and container shutdown. Send a prompt asking Codex to read the marker file and recall the previous work. Expect cold-start latency, restored files, and resumed native context.
-6. **Deadline behavior:** the six-hour deadline is measured from accepted user interaction, not sandbox creation. To exercise it live, leave a long task with no further Send/Stop actions for six hours and observe cleanup. This is optional for the first smoke test; local clock-controlled tests cover both active and idle cases. Do not add public test-clock routes or change production timers just to accelerate it.
+6. **Deadline behavior:** the six-hour deadline is measured from accepted user interaction, not sandbox creation. To exercise it live, leave a long task with no further Send/Stop actions for six hours and observe cleanup. Send a new message after changing the timeout to establish a new durable deadline. This is optional for the first smoke test; local clock-controlled tests cover both active and idle cases. Do not add public test-clock routes.
 
 Successful live checks establish the paths that local tests cannot: container startup, private WebSocket authentication, internal HTTP credential injection and upstream OpenAI HTTPS, native tool execution, and real R2 restore. Container/R2 usage and model inference are billed normally.
 
 Backups save files, not a running process. They are attempted only before application-controlled destruction. A platform crash, forced deletion, or failed deadline backup can lose all changes since the previous successful backup; before the first backup, there is nothing to restore. DO chat history remains, but it cannot recreate workspace files. If idle backup fails, the sandbox stays available and cleanup retries; if deadline backup fails, destruction proceeds. Inspect Worker logs if shutdown/restore does not match these expectations.
+
+## Conversations and approvals
+
+See [feature setup and acceptance checks](conversations-and-approvals.md#manual-testing) for revision conflicts, reasoning, read-only Git injection, and approval after idle destruction. Start a **new conversation** to register `push_sync`; existing Codex threads retain their original tool definitions.
+
+## Real Git pushes
+
+[Configure the shared repository read/write PAT and test an empty repository](push-sync-testing.md). Course Sync remains simulated.

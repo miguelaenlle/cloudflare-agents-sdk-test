@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type {
+  DynamicToolCallParams,
+  DynamicToolCallResponse,
   ClientRequest,
   ServerNotification,
   InitializeResponse,
@@ -70,6 +72,9 @@ export class AppServer {
   >();
   private subscribers = new Set<(event: ServerNotification) => void>();
   private closed = false;
+  toolHandler?: (
+    params: DynamicToolCallParams,
+  ) => Promise<DynamicToolCallResponse>;
   readonly disconnected: Promise<never>;
   private rejectDisconnected!: (error: Error) => void;
 
@@ -81,19 +86,47 @@ export class AppServer {
     void this.disconnected.catch(() => {});
     socket.addEventListener("message", (event) => {
       try {
+        if (typeof event.data !== "string" || event.data.length > 1_000_000)
+          throw new Error("Codex frame exceeds limit.");
         const frame = envelope.parse(JSON.parse(String(event.data)));
         if (frame.method) {
           if (frame.id !== undefined) {
-            // No approval or interactive-tool UI in this prototype. Never hang on an unsupported request.
-            socket.send(
-              JSON.stringify({
-                id: frame.id,
-                error: {
-                  code: -32601,
-                  message: "Client interaction is not supported",
-                },
-              }),
-            );
+            const id = frame.id;
+            if (frame.method === "item/tool/call" && this.toolHandler) {
+              void this.toolHandler(frame.params as DynamicToolCallParams)
+                .then(
+                  (result) => {
+                    socket.send(JSON.stringify({ id, result }));
+                  },
+                  () =>
+                    socket.send(
+                      JSON.stringify({
+                        id,
+                        result: {
+                          success: false,
+                          contentItems: [
+                            {
+                              type: "inputText",
+                              text: "Could not prepare approval.",
+                            },
+                          ],
+                        },
+                      }),
+                    ),
+                )
+                .catch(() =>
+                  this.fail(new Error("Could not deliver tool result.")),
+                );
+            } else
+              socket.send(
+                JSON.stringify({
+                  id,
+                  error: {
+                    code: -32601,
+                    message: "Client interaction is not supported",
+                  },
+                }),
+              );
           } else if (
             [
               "turn/started",
@@ -101,6 +134,8 @@ export class AppServer {
               "item/started",
               "item/completed",
               "item/agentMessage/delta",
+              "item/reasoning/summaryTextDelta",
+              "item/reasoning/summaryPartAdded",
             ].includes(frame.method)
           ) {
             // Authenticated, version-pinned protocol; generated types describe the payload.
@@ -174,7 +209,7 @@ export class AppServer {
 
   async initialize() {
     await this.request("initialize", {
-      capabilities: null,
+      capabilities: { experimentalApi: true, requestAttestation: false },
       clientInfo: {
         name: "pl_sandbox_prototype",
         title: "PL sandbox prototype",

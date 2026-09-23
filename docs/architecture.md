@@ -1,15 +1,17 @@
 # Persistent Codex architecture
 
-React/AI SDK → stateless PL relay → Chat Durable Object → Codex app-server in a Cloudflare Sandbox. Native Codex owns the model/tool loop. The Chat DO owns admission, UI history, lifecycle, and recovery.
+React/AI SDK → PL relay with a durable approval-result outbox → Chat Durable Object → Codex app-server in a Cloudflare Sandbox. Native Codex owns the model/tool loop. The Chat DO owns admission, UI history, lifecycle, and recovery.
 
 **Implemented locally.** Tests cover the real app-server with a fake model endpoint and the real Cloudflare chat runtime with a simulated sandbox. Deployed outbound credential injection, container isolation, and R2 restore still need deployment verification. [Local testing and manual deployment](testing.md).
+
+See [conversation, transcript and approval state](conversations-and-approvals.md) for the current additions: multiple conversations, revision admission, reasoning summaries, scoped Git reads, and durable approvals.
 
 ## Components and boundaries
 
 The Worker entry point, Chat class, and Sandbox class are deployed together. Each DO instance has its own state/lifetime; the Linux container is a separate runtime.
 
 ```mermaid
-flowchart TB
+flowchart LR
     subgraph browser["1 · Browser"]
         UI["React UI<br/>Vercel AI SDK useChat"]
     end
@@ -18,7 +20,7 @@ flowchart TB
     end
     subgraph cloudflare["One Worker deployment · separate runtime instances"]
         subgraph entry["3 · Worker entry point"]
-            Router["Origin check + routeAgentRequest<br/>HTTP and WebSocket upgrade routing"]
+            Router["Relay authentication + origin check + routeAgentRequest<br/>HTTP and WebSocket upgrade routing"]
         end
         subgraph chat["4 · Chat Durable Object — conversation ID"]
             Coordinator["AIChatAgent + our coordinator<br/>App-server client and UI event mapper"]
@@ -65,7 +67,7 @@ flowchart TB
     linkStyle default stroke:#9ca3af
 ```
 
-Wrangler registers the exported DO classes and bindings. PL connects to `/agents/chat/playground`; `routeAgentRequest` selects that named Chat DO, and Cloudflare instantiates it as needed. Our HTTP message handler chooses start versus steer. For a new turn it calls `AIChatAgent.saveMessages`, which persists history/replay in the DO's SQLite and invokes our `onChatMessage`. The Worker routes the initial request/upgrade; we do not relay every WebSocket frame through another Worker handler.
+Wrangler registers the exported DO classes and bindings. PL connects to `/agents/chat/:conversationId`; `routeAgentRequest` selects that named Chat DO, and Cloudflare instantiates it as needed. Our HTTP message handler chooses start versus steer. For a new turn it calls `AIChatAgent.saveMessages`, which persists history/replay in the DO's SQLite and invokes our `onChatMessage`. The Worker routes the initial request/upgrade; we do not relay every WebSocket frame through another Worker handler.
 
 ### One turn: commands and responses
 
@@ -81,7 +83,7 @@ sequenceDiagram
     participant Auth as Sandbox outbound handler
     participant Model as OpenAI
 
-    UI->>PL: POST /api/chat: message id + text
+    UI->>PL: POST /api/chat: message id + text + expectedRevision
     PL->>Chat: HTTP /message: decide start or steer
     Chat->>Sandbox: CF Sandbox SDK: restore and startProcess if cold
     Chat->>Sandbox: CF Sandbox SDK: wsConnect on private port 4500
@@ -103,7 +105,7 @@ sequenceDiagram
         PL-->>UI: Standard AI SDK SSE
     end
     opt User sends another message while working
-        UI->>PL: Same POST /api/chat: message id + text
+        UI->>PL: Same POST /api/chat: message id + text + expectedRevision
         PL->>Chat: Same HTTP /message
         Chat->>Codex: turn/steer with current native turn ID
         Chat-->>UI: Acknowledge through PL, UI reloads history and reattaches
@@ -117,7 +119,7 @@ sequenceDiagram
     Chat->>Chat: waiting_for_user and close control socket
     Chat-->>UI: Final UI events through PL
     Note over Codex: App-server remains running between turns, no backup yet
-    opt Ten minutes waiting for user
+    opt ten minutes waiting for user
         Chat->>Sandbox: Back up workspace and native session to R2
         Sandbox-->>Chat: Backup reference
         Chat->>Chat: Persist backup reference and native thread ID
@@ -185,11 +187,11 @@ flowchart TD
     Working -->|"turn/completed and finalization"| Waiting
     Working -->|"Accepted steering: same turn"| Working
     Waiting -->|"User sends next prompt"| Working
-    Waiting -->|"10 minutes waiting"| Saving
+    Waiting -->|"ten minutes waiting"| Saving
     Saving -->|"Checkpoint succeeds"| Destroying
     Saving -->|"Backup fails: bounded retry"| Waiting
-    Working -->|"6 hours without user interaction"| Deadline["Attempt bounded interruption and backup"]
-    Waiting -->|"6 hours without user interaction"| Deadline
+    Working -->|"six hours without user interaction"| Deadline["Attempt bounded interruption and backup"]
+    Waiting -->|"six hours without user interaction"| Deadline
     Deadline -->|"Success, failure, or timeout"| Destroying
     Destroying -->|"Destruction confirmed"| Offline
 
@@ -199,8 +201,8 @@ flowchart TD
 
 | Timer                            | Reset by                                       | Action                                                       |
 | -------------------------------- | ---------------------------------------------- | ------------------------------------------------------------ |
-| Six hours since user interaction | Accepted prompt, steering, or active-turn Stop | Durable alarm: bounded interruption/checkpoint, then destroy |
-| Ten minutes waiting for user     | Next turn invalidates the waiting period       | Checkpoint, then destroy                                     |
+| six hours since user interaction | Accepted prompt, steering, or active-turn Stop | Durable alarm: bounded interruption/checkpoint, then destroy |
+| ten minutes waiting for user     | Next turn invalidates the waiting period       | Checkpoint, then destroy                                     |
 | Cloudflare `sleepAfter: "6h"`    | Activity recognized by the container interface | Infrastructure idle shutdown; `keepAlive: false`             |
 
 There is **no absolute sandbox-age cap and no per-turn process timeout**. Steering can extend the same turn beyond six hours. Model/tool output, history reads, reconnects, and duplicate/rejected steering do not reset the application deadline. Agents `schedule()` persists callbacks; generation IDs and timestamps reject stale callbacks.
@@ -241,8 +243,8 @@ No OpenAI-key redaction pipeline is needed because the key is never sent into th
 
 Two deployments: `apps/web` and `apps/agent`; the shared chat contract is source code, not a service. Preserve history/send/resume/cancel and AI SDK events when replacing Cloudflare; replace the provider adapter and migrate state.
 
-- Trusted disposable prototype: one shared conversation, no user authentication/approval UI. Origin checks are not authorization.
-- Two-window synchronization remains a gap. Course checkout/push_sync, previews, and usage accounting are deferred.
+- Trusted single-user prototype: conversation IDs, revision-checked sends, and durable approval UI. Production Worker requests require a relay token; PL user/course authorization remains an integration requirement.
+- Read-only course checkout and approval-gated Git pushes are implemented; see [PAT setup and real-push tests](push-sync-testing.md). Course Sync remains simulated. Previews, distributed relay storage, and usage accounting remain deferred.
 - Unit tests cover protocol matching, mapper behavior, and outbound policy. Integration tests exercise real AIChatAgent/relay behavior against a simulated sandbox. The native test runs pinned app-server against a fake local model endpoint.
 - Live acceptance still requires outbound credential injection/upstream HTTPS, workspace sandbox/tool execution, private socket authentication, and real R2 backup/restore. The automated suite uses a fake model; real local development uses paid inference.
 

@@ -2,7 +2,7 @@
 
 A minimal PrairieLearn-shaped prototype: a React/Vercel AI SDK UI talks through a replaceable Express relay to a Cloudflare `AIChatAgent`. Native **Codex app-server** runs inside a Cloudflare Sandbox and owns the model/tool loop. The browser and webserver can disappear without cancelling work.
 
-[Local testing and manual deployment](docs/testing.md) · [Architecture and diagrams](docs/architecture.md) · [Proposal status](docs/architecture-proposed.md)
+[Local testing and manual deployment](docs/testing.md) · [Architecture and diagrams](docs/architecture.md) · [Proposal status](docs/architecture-proposed.md) · [Conversations, steering, Git and approvals](docs/conversations-and-approvals.md)
 
 ```text
 Browser: React / AI SDK
@@ -27,10 +27,10 @@ Workspace + native session → R2 checkpoints
 | `apps/agent/agent.ts`                  | Chat coordinator, steering/Stop, deadlines, checkpoint and recovery policy |
 | `apps/agent/codex.ts`                  | Start/reuse app-server, private connection, restore/backup                 |
 | `apps/agent/app-server.ts`             | Small typed JSON-RPC client                                                |
-| `apps/agent/codex-events.ts`           | Native notifications → AI SDK text/tool events                             |
-| `apps/agent/sandbox.ts`, `outbound.ts` | Network allowlist and OpenAI credential injection                          |
+| `apps/agent/codex-events.ts`           | Native notifications → AI SDK text/reasoning/tool/steering events          |
+| `apps/agent/sandbox.ts`, `outbound.ts` | Network allowlist and OpenAI/GitHub credential injection                   |
 | `apps/agent/protocol.ts`               | Generated types from pinned Codex 0.155.0; do not hand-edit                |
-| `apps/web/`                            | Barebones UI, stateless relay, replaceable provider adapter                |
+| `apps/web/`                            | Barebones UI, relay with durable decision outbox, provider adapter         |
 | `packages/chat-contract/`              | Provider-independent routes, types, message validation                     |
 
 The per-turn runner and Codex TypeScript SDK are removed. Prompts/steering/interrupts use app-server RPC; chat delivery no longer parses stdout. Process logs are diagnostic only.
@@ -62,6 +62,7 @@ Edit `apps/agent/wrangler.jsonc`:
 Create an R2 API token with **Object Read & Write** scoped to this bucket. Store its access-key pair and your OpenAI API key as Worker secrets:
 
 ```sh
+pnpm --filter @playground/agent exec wrangler secret put RELAY_TOKEN --config wrangler.jsonc
 pnpm --filter @playground/agent exec wrangler secret put CODEX_API_KEY --config wrangler.jsonc
 pnpm --filter @playground/agent exec wrangler secret put R2_ACCESS_KEY_ID --config wrangler.jsonc
 pnpm --filter @playground/agent exec wrangler secret put R2_SECRET_ACCESS_KEY --config wrangler.jsonc
@@ -76,6 +77,7 @@ Set the root `.env.local` (use `.env.example` as a template):
 
 ```dotenv
 AGENT_URL=https://cloudflare-agents-sdk-test.YOUR_SUBDOMAIN.workers.dev
+RELAY_TOKEN=the-same-random-secret-set-on-the-worker
 ```
 
 Run the local backend and frontend in separate terminals:
@@ -90,17 +92,21 @@ pnpm dev
 
 Open **http://localhost:4315**. Restart the backend after changing `.env.local`.
 
+## Approval-gated Git pushes
+
+The private [test repository](https://github.com/miguelaenlle/course-agent-push-sync-test) starts empty. Approved changes are pushed by the PL relay with the shared repository-scoped read/write PAT; Course Sync remains simulated. Follow [PAT setup and the empty-repository test](docs/push-sync-testing.md).
+
 ## Try it
 
 1. Ask **Create hello.txt containing a greeting, then print it with a shell command.** Verify streamed text and tool output.
 2. Ask **What did you put in hello.txt?** The same sandbox process and native thread should be reused.
-3. Click **Run one-minute task**. After work starts, restart the local backend or close the browser. Reconnect to see the saved/live result.
+3. Ask **Run a shell command that waits 60 seconds, then report the result.** After work starts, restart the local backend or close the browser. Reconnect to see the saved/live result.
 4. During a turn, enter a correction and click **Send** again. The DO steers the active turn, or starts a new turn if it just finished. No run ID or separate steering action is required. Verify the correction in history.
 5. Click **Stop**. Wait for interruption confirmation; the app-server stays running and the next prompt resumes the thread. Closing the page alone never cancels work.
-6. Wait ten minutes in `waiting_for_user`, then send another prompt. Confirm destruction and restoration of both `hello.txt` and native context from R2.
+6. Wait ten minutes after turn completion for idle cleanup, then send another prompt. Confirm destruction and restoration of both `hello.txt` and native context from R2.
 7. Verify the sliding six-hour user-interaction deadline. An accepted prompt/steer/active-turn Stop resets it; model/tool output and reconnects do not. There is no absolute sandbox-age cap.
 
-Live acceptance must verify outbound credential injection and upstream HTTPS, private socket authentication, Codex `workspace-write` tool execution, and real R2 restoration. The automated tests use a fake model. A separate local Docker smoke test reached real OpenAI inference, but tool execution hit a nested Bubblewrap limitation on the tested Mac; see the local testing guide. No cloud deployment has been performed. Use Worker logs for diagnostics:
+Live acceptance must verify outbound credential injection and upstream HTTPS, private socket authentication, Codex `externalSandbox` tool execution, and real R2 restoration. The automated tests use a fake model. Native commands with `externalSandbox` were verified in a local Docker smoke test; the container is the isolation boundary. No cloud deployment has been performed. Use Worker logs for diagnostics:
 
 ```sh
 pnpm --filter @playground/agent exec wrangler tail --config wrangler.jsonc
@@ -115,13 +121,13 @@ pnpm --filter @playground/agent exec wrangler tail --config wrangler.jsonc
 - **Stop:** RPC acknowledgment is insufficient; wait for a terminal notification. Unconfirmed Stop blocks another turn; deadline cleanup can eventually destroy the box.
 - **Cleanup:** at most three automatic attempts, 30 seconds apart. Failed destruction retains the sandbox identity and blocks replacement; a later prompt can explicitly retry.
 - **History and backups are not atomic.** Restoring files may roll back work still described in UI history. Unexpected loss may discard all work since the last planned shutdown, even though its chat history remains.
-- **Trusted prototype only:** one shared conversation, no authentication or approval UI. Origin checks are not authorization. Multi-window synchronization remains a gap.
+- **Trusted single-user prototype:** multiple conversations, revision-checked sends, durable approval UI. Production Worker access requires `RELAY_TOKEN`; the localhost relay still needs PrairieLearn user/course authorization before integration.
 
 ## Credentials and network
 
 `CODEX_API_KEY` stays a Worker secret. The Sandbox outbound handler accepts private HTTP requests at `openai.internal` and injects it only into HTTPS POSTs to the fixed OpenAI Responses/compaction endpoints. It rejects redirects and overwrites caller authorization. Codex is configured for HTTP Responses without local authentication or model WebSockets.
 
-In production, the container also permits the configured R2 account host for SDK presigned backup transfers. Other internet hosts—including direct OpenAI access and Git/package registries—are blocked until explicitly allowed. The permanent R2 keys also stay in Workers; presigned URLs are short-lived scoped capabilities available during transfers.
+In production, the container also permits the configured R2 account host for SDK presigned backup transfers. Other internet hosts—including direct OpenAI access and package registries—are blocked. GitHub permits only read-only Git endpoints for `GITHUB_REPOSITORY`. The permanent R2 keys also stay in Workers; presigned URLs are short-lived scoped capabilities available during transfers.
 
 The private app-server socket has its own capability token in `/tmp`, separate from the OpenAI key. No OpenAI credential is passed in the container environment, auth file, or prompt; no runner redaction remains. Prompts, files, and native sessions can still contain unrelated sensitive information. Files named `auth.json` remain excluded from backups; existing backups are not retroactively cleaned.
 
@@ -129,12 +135,12 @@ On upgrade from the old runner, stop old work first; the runtime does not migrat
 
 ## Web interface
 
-| Endpoint                          | Behavior                                           |
-| --------------------------------- | -------------------------------------------------- |
-| `POST /api/chat`                  | `{ id, text }`; start or steer; 204 acknowledgment |
-| `GET /api/chat/history`           | Saved `UIMessage[]`                                |
-| `GET /api/chat/playground/stream` | Replay/attach to current output, or 204            |
-| `POST /api/chat/cancel`           | Explicit interruption                              |
+| Endpoint                          | Behavior                                                             |
+| --------------------------------- | -------------------------------------------------------------------- |
+| `POST /api/chat`                  | `{ id, text, expectedRevision }`; start or steer; 204 acknowledgment |
+| `GET /api/chat/history`           | Saved `UIMessage[]`                                                  |
+| `GET /api/chat/playground/stream` | Replay/attach to current output, or 204                              |
+| `POST /api/chat/cancel`           | Explicit interruption                                                |
 
 Send submits one message through HTTP; output is attached separately through the existing AI SDK resume stream. The UI detaches its previous subscription, sends, reloads history, and reattaches. Detaching never stops Codex. This deliberately replays output on each Send instead of maintaining two competing streams or a separate steering transcript.
 

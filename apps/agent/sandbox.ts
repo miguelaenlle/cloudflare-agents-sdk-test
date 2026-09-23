@@ -1,5 +1,5 @@
 import { Sandbox as CloudflareSandbox } from "@cloudflare/sandbox";
-import { forwardOpenAI } from "./outbound.ts";
+import { forwardOpenAI, forwardGitHub } from "./outbound.ts";
 
 export class Sandbox extends CloudflareSandbox {
   enableInternet = false;
@@ -14,7 +14,7 @@ export class Sandbox extends CloudflareSandbox {
     },
   ) {
     super(ctx, env);
-    this.allowedHosts = ["openai.internal"];
+    this.allowedHosts = ["openai.internal", "github.com"];
     if (env.LOCAL_DEV === "true") return;
     // The SDK uploads/downloads backups from the container with presigned R2 URLs.
     const backupOrigin =
@@ -25,6 +25,10 @@ export class Sandbox extends CloudflareSandbox {
 }
 
 Sandbox.outboundByHost = {
+  "github.com": (
+    request,
+    env: { GITHUB_REPOSITORY?: string; GITHUB_TOKEN?: string },
+  ) => forwardGitHub(request, env),
   "openai.internal": (request, env: { CODEX_API_KEY: string }) =>
     forwardOpenAI(request, env),
 };

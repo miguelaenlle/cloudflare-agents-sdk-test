@@ -1,7 +1,13 @@
 import type { UIMessageChunk } from "ai";
 import type { AppServer } from "./app-server.ts";
 import { CodexEvents } from "./codex-events.ts";
-import type { Turn, TurnSteerParams } from "./protocol.ts";
+import { pushSyncTool } from "./approval.ts";
+import type {
+  DynamicToolCallParams,
+  DynamicToolCallResponse,
+  Turn,
+  TurnSteerParams,
+} from "./protocol.ts";
 
 export type CodexTurn = Awaited<ReturnType<typeof openCodexTurn>>;
 
@@ -14,26 +20,33 @@ export async function openCodexTurn(
     runId,
     write,
     onTurnStarted,
+    onPushSync,
   }: {
     threadId?: string;
     model?: string;
     runId: string;
     write: (chunk: UIMessageChunk) => void;
     onTurnStarted: (turnId: string) => void;
+    onPushSync?: (
+      params: DynamicToolCallParams,
+    ) => Promise<DynamicToolCallResponse>;
   },
 ) {
   const options = {
     cwd: "/workspace/repo",
     approvalPolicy: "never" as const,
-    sandbox: "workspace-write" as const,
     model,
   };
   const { thread } = threadId
     ? await client.request("thread/resume", { ...options, threadId })
-    : await client.request("thread/start", options);
+    : await client.request("thread/start", {
+        ...options,
+        dynamicTools: [pushSyncTool],
+      });
   if (thread.turns.some((turn) => turn.status === "inProgress"))
     throw new Error("Native thread still has an active turn.");
 
+  client.toolHandler = onPushSync;
   const events = new CodexEvents(write, runId);
   const controls = new Set<Promise<unknown>>();
   async function control<T>(request: Promise<T>): Promise<T> {
@@ -60,14 +73,25 @@ export async function openCodexTurn(
     async start(prompt: string, messageId: string) {
       const { turn } = await client.request("turn/start", {
         threadId: thread.id,
+        // Cloudflare owns isolation and outbound network restrictions.
+        sandboxPolicy: { type: "externalSandbox", networkAccess: "restricted" },
+        summary: "auto",
         clientUserMessageId: messageId,
         input: [{ type: "text", text: prompt, text_elements: [] }],
       });
       turnId = turn.id;
       return turn;
     },
-    steer(input: TurnSteerParams) {
-      return control(client.request("turn/steer", input));
+    async steer(input: TurnSteerParams) {
+      const result = await control(client.request("turn/steer", input));
+      events.steering(
+        input.clientUserMessageId ?? crypto.randomUUID(),
+        input.input
+          .filter((p) => p.type === "text")
+          .map((p) => p.text)
+          .join("\n"),
+      );
+      return result;
     },
     interrupt(turnId: string) {
       return control(
@@ -77,6 +101,7 @@ export async function openCodexTurn(
     async close() {
       // A terminal notification can precede the acknowledgment of Stop or steering.
       await Promise.allSettled(controls);
+      client.toolHandler = undefined;
       unsubscribe();
       events.finish();
     },
