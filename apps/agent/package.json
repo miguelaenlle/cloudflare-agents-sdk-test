@@ -3,6 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "deploy": "wrangler deploy --config wrangler.jsonc",
+    "build": "wrangler deploy --config wrangler.jsonc --dry-run --outdir dist",
     "typecheck": "tsc --noEmit",
     "test": "node --import ./test/platform.mjs --experimental-strip-types --test test/codex.test.ts test/app-server.test.ts",
     "test:native": "node --experimental-strip-types --test test/native.test.mjs",
