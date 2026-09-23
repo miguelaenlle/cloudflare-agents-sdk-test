@@ -2,7 +2,15 @@
   "name": "@playground/agent",
   "private": true,
   "type": "module",
-  "scripts": {},
+  "scripts": {
+    "deploy": "wrangler deploy --config wrangler.jsonc",
+    "build": "wrangler deploy --config wrangler.jsonc --dry-run --outdir dist",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import ./test/platform.mjs --experimental-strip-types --test test/codex.test.ts test/app-server.test.ts",
+    "test:native": "node --experimental-strip-types --test test/native.test.mjs",
+    "generate:protocol": "node scripts/generate-protocol.mjs",
+    "dev": "wrangler dev --config wrangler.jsonc --port 8790 --inspector-port 0 --var LOCAL_DEV:true --persist-to .wrangler/local"
+  },
   "dependencies": {
     "@cloudflare/ai-chat": "0.12.0",
     "@cloudflare/sandbox": "0.12.9",

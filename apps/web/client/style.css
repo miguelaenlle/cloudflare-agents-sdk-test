@@ -55,3 +55,11 @@ button:disabled {
 [role="alert"] {
   color: #a00;
 }
+
+code {
+  overflow-wrap: anywhere;
+}
+select {
+  max-width: 100%;
+  font: inherit;
+}
