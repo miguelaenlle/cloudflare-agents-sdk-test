@@ -7,7 +7,7 @@
     "dev:server": "node --env-file=../../.env.local --experimental-strip-types server/server.ts",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test": "node test/relay.mjs",
+    "test": "node --experimental-strip-types --test test/publish.test.ts && node test/relay.mjs",
     "dev:server:local": "AGENT_URL=http://localhost:8790 node --experimental-strip-types server/server.ts"
   },
   "dependencies": {
@@ -18,6 +18,7 @@
     "express": "^5.2.1",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
+    "ws": "^8.21.3",
     "zod": "^4.6.5"
   },
   "devDependencies": {
@@ -25,6 +26,7 @@
     "@types/node": "^24.13.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "6.1.1",
     "vite": "^8.3.0"
   }

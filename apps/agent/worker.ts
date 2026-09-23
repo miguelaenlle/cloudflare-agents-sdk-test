@@ -12,6 +12,12 @@ export default {
     if (!new URL(request.url).pathname.startsWith("/agents/chat/")) {
       return new Response("Not found", { status: 404 });
     }
+    if (
+      env.LOCAL_DEV !== "true" &&
+      (!env.RELAY_TOKEN ||
+        request.headers.get("Authorization") !== `Bearer ${env.RELAY_TOKEN}`)
+    )
+      return new Response("Relay authentication required", { status: 401 });
     // CORS covers history requests; WebSocket upgrades need an origin check too.
     const origin = request.headers.get("Origin");
     if (origin && origin !== env.UI_ORIGIN) {

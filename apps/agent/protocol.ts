@@ -62,7 +62,226 @@ export type ThreadReadParams = {
   includeTurns?: boolean;
 };
 
+/**
+ * A path that is guaranteed to be absolute and normalized (though it is not
+ * guaranteed to be canonicalized or exist on the filesystem).
+ *
+ * IMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set
+ * using [AbsolutePathBufGuard::new]. If no base path is set, the
+ * deserialization will fail unless the path being deserialized is already
+ * absolute.
+ */
+export type AbsolutePathBuf = string;
+
 export type Personality = "none" | "friendly" | "pragmatic";
+
+export type AgentMessageInputContent =
+  | { type: "input_text"; text: string }
+  | { type: "encrypted_content"; encrypted_content: string };
+
+/**
+ * See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
+ */
+export type ReasoningEffort = string;
+
+/**
+ * Reasoning settings interpreted by the backend for the routed model.
+ */
+export type ConfigurationReasoning = { effort: ReasoningEffort };
+
+export type ImageDetail = "auto" | "low" | "high" | "original";
+
+export type ContentItem =
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string; detail?: ImageDetail }
+  | { type: "input_audio"; audio_url: string }
+  | { type: "output_text"; text: string };
+
+/**
+ * Responses API compatible content items that can be returned by a tool call.
+ * This is a subset of ContentItem with the types we support as function call outputs.
+ */
+export type FunctionCallOutputContentItem =
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string; detail?: ImageDetail }
+  | { type: "input_audio"; audio_url: string }
+  | { type: "encrypted_content"; encrypted_content: string };
+
+export type FunctionCallOutputBody =
+  string | Array<FunctionCallOutputContentItem>;
+
+/**
+ * Internal Responses API passthrough metadata copied into underlying chat messages.
+ *
+ * Responses API strongly types this payload. Do not modify it without first getting API
+ * approval and making the corresponding Responses API change.
+ */
+export type InternalChatMessageMetadataPassthrough = { turn_id?: string };
+
+export type LocalShellExecAction = {
+  command: Array<string>;
+  timeout_ms: bigint | null;
+  working_directory: string | null;
+  env: { [key in string]?: string } | null;
+  user: string | null;
+};
+
+export type LocalShellAction = { type: "exec" } & LocalShellExecAction;
+
+export type LocalShellStatus = "completed" | "in_progress" | "incomplete";
+
+/**
+ * Classifies an assistant message as interim commentary or final answer text.
+ *
+ * Providers do not emit this consistently, so callers must treat `None` as
+ * "phase unknown" and keep compatibility behavior for legacy models.
+ */
+export type MessagePhase = "commentary" | "final_answer";
+
+export type ReasoningItemContent =
+  { type: "reasoning_text"; text: string } | { type: "text"; text: string };
+
+export type ReasoningItemReasoningSummary = {
+  type: "summary_text";
+  text: string;
+};
+
+/**
+ * A Responses API item ID. New IDs require an explicit prefix; deserialization
+ * remains permissive so legacy rollouts can still be read.
+ */
+export type ResponseItemId = string;
+
+export type LegacyWebSearchAction =
+  | { type: "search"; query?: string; queries?: Array<string> }
+  | { type: "open_page"; url?: string }
+  | { type: "find_in_page"; url?: string; pattern?: string }
+  | { type: "other" };
+
+export type ResponseItem =
+  | {
+      type: "message";
+      id?: ResponseItemId;
+      role: string;
+      content: Array<ContentItem>;
+      phase?: MessagePhase;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "agent_message";
+      id?: ResponseItemId;
+      author: string;
+      recipient: string;
+      content: Array<AgentMessageInputContent>;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "reasoning";
+      id?: ResponseItemId;
+      summary: Array<ReasoningItemReasoningSummary>;
+      content?: Array<ReasoningItemContent>;
+      encrypted_content: string | null;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "local_shell_call";
+      /**
+       * Legacy id field retained for compatibility with older payloads.
+       */
+      id?: ResponseItemId;
+      /**
+       * Set when using the Responses API.
+       */
+      call_id: string | null;
+      status: LocalShellStatus;
+      action: LocalShellAction;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "function_call";
+      id?: ResponseItemId;
+      name: string;
+      namespace?: string;
+      arguments: string;
+      encrypted_function_args?: Array<string>;
+      call_id: string;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "tool_search_call";
+      id?: ResponseItemId;
+      call_id: string | null;
+      status?: string;
+      execution: string;
+      arguments: unknown;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "function_call_output";
+      id?: ResponseItemId;
+      call_id?: string;
+      name?: string;
+      namespace?: string;
+      output: FunctionCallOutputBody;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "custom_tool_call";
+      id?: ResponseItemId;
+      status?: string;
+      call_id: string;
+      name: string;
+      namespace?: string;
+      input: string;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "custom_tool_call_output";
+      id?: ResponseItemId;
+      call_id: string;
+      name?: string;
+      output: FunctionCallOutputBody;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "tool_search_output";
+      id?: ResponseItemId;
+      call_id: string | null;
+      status: string;
+      execution: string;
+      tools: unknown[];
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "web_search_call";
+      id?: ResponseItemId;
+      status?: string;
+      action?: LegacyWebSearchAction;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "image_generation_call";
+      id?: ResponseItemId;
+      status: string;
+      revised_prompt?: string;
+      result: string;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | {
+      type: "compaction";
+      id?: ResponseItemId;
+      encrypted_content: string;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | { type: "configuration_update"; reasoning: ConfigurationReasoning }
+  | { type: "compaction_trigger" }
+  | {
+      type: "context_compaction";
+      id?: ResponseItemId;
+      encrypted_content?: string;
+      internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough;
+    }
+  | { type: "other" };
 
 /**
  * Configures who approval requests are routed to for review. Examples
@@ -90,6 +309,25 @@ export type AskForApproval =
 export type SandboxMode =
   "read-only" | "workspace-write" | "danger-full-access";
 
+export type SortDirection = "asc" | "desc";
+
+export type TurnItemsView = "notLoaded" | "summary" | "full";
+
+export type ThreadResumeInitialTurnsPageParams = {
+  /**
+   * Optional turn page size.
+   */
+  limit?: number | null;
+  /**
+   * Optional turn pagination direction; defaults to descending.
+   */
+  sortDirection?: SortDirection | null;
+  /**
+   * How much item detail to include for each returned turn; defaults to summary.
+   */
+  itemsView?: TurnItemsView | null;
+};
+
 /**
  * There are three ways to resume a thread:
  * 1. By thread_id: load the thread from disk by thread_id and resume it.
@@ -107,23 +345,48 @@ export type SandboxMode =
  * Prefer using thread_id whenever possible.
  */
 export type ThreadResumeParams = {
-  threadId: string; /**
+  threadId: string;
+  /**
+   * [UNSTABLE] FOR CODEX CLOUD - DO NOT USE.
+   * If specified, the thread will be resumed with the provided history
+   * instead of loaded from disk.
+   */
+  history?: Array<ResponseItem> | null;
+  /**
+   * [UNSTABLE] Specify the rollout path to resume from.
+   * If specified for a non-running thread, the thread_id param will be ignored.
+   * If thread_id identifies a running thread, the path must match the active
+   * rollout path.
+   */
+  path?: string | null;
+  /**
    * Configuration overrides for the resumed thread, if any.
    */
   model?: string | null;
   modelProvider?: string | null;
   serviceTier?: string | null | null;
   cwd?: string | null;
-  approvalPolicy?: AskForApproval | null; /**
+  /**
+   * Replace the thread's runtime workspace roots. Paths must be absolute.
+   */
+  runtimeWorkspaceRoots?: Array<AbsolutePathBuf> | null;
+  approvalPolicy?: AskForApproval | null;
+  /**
    * Override where approval requests are routed for review on this thread
    * and subsequent turns.
    */
   approvalsReviewer?: ApprovalsReviewer | null;
   sandbox?: SandboxMode | null;
+  /**
+   * Named profile id for the resumed thread. Cannot be combined with
+   * `sandbox`.
+   */
+  permissions?: string | null;
   config?: { [key in string]?: JsonValue } | null;
   baseInstructions?: string | null;
   developerInstructions?: string | null;
-  personality?: Personality | null; /**
+  personality?: Personality | null;
+  /**
    * When true, return only thread metadata and live-resume state without
    * populating `thread.turns`. This is useful when the client plans to call
    * `thread/turns/list` immediately after resuming. Full-history hydration
@@ -131,41 +394,201 @@ export type ThreadResumeParams = {
    * and `thread/items/list` instead.
    */
   excludeTurns?: boolean;
+  /**
+   * When present, include a `thread/turns/list` page in the resume response
+   * so clients can bootstrap recent turns without a second request.
+   */
+  initialTurnsPage?: ThreadResumeInitialTurnsPageParams | null;
 };
+
+/**
+ * Controls the effective multi-agent delegation instructions for a turn. `custom` means the
+ * configured mode hint defines the policy instead of a built-in policy.
+ */
+export type MultiAgentMode =
+  { custom: string } | "explicitRequestOnly" | "proactive";
+
+export type DynamicToolFunctionSpec = {
+  name: string;
+  description: string;
+  inputSchema: JsonValue;
+  deferLoading?: boolean;
+};
+
+export type DynamicToolNamespaceTool = {
+  type: "function";
+} & DynamicToolFunctionSpec;
+
+export type DynamicToolNamespaceSpec = {
+  name: string;
+  description: string;
+  tools: Array<DynamicToolNamespaceTool>;
+};
+
+export type DynamicToolSpec =
+  | ({ type: "function" } & DynamicToolFunctionSpec)
+  | ({ type: "namespace" } & DynamicToolNamespaceSpec);
+
+/**
+ * Location used to resolve a selected capability root.
+ */
+export type CapabilityRootLocation = {
+  type: "environment";
+  environmentId: string;
+  /**
+   * Absolute path for the root in the selected environment.
+   */
+  path: string;
+};
+
+/**
+ * A user-selected root that can expose one or more runtime capabilities.
+ */
+export type SelectedCapabilityRoot = {
+  /**
+   * Stable identifier supplied by the capability selection platform.
+   */
+  id: string;
+  /**
+   * Where the selected root can be resolved.
+   */
+  location: CapabilityRootLocation;
+};
+
+export type ThreadHistoryMode = "legacy" | "paginated";
 
 export type ThreadSource = string;
 
 export type ThreadStartSource = "startup" | "clear";
 
+/**
+ * A UTF-8 path for preserving raw path compatibility at the app-server API
+ * boundary while Codex migrates to [`PathUri`].
+ *
+ * Supports storing arbitrary strings read from the API and converting to and
+ * from [`PathUri`] using an explicitly selected native path convention.
+ *
+ * When converting from [`PathUri`], "native" refers to the supplied
+ * [`PathConvention`], which may be foreign to the operating system running
+ * this process. The inner string is private so path-producing code must use a
+ * path conversion method instead of bypassing the intended conversion
+ * boundary. Non-UTF-8 paths are converted to UTF-8 lossily because this API
+ * value is serialized as a JSON string.
+ *
+ * Deserialization and [`Self::from_string`] accept any UTF-8 string without
+ * interpreting or validating it. Use [`Self::from_string`] when a caller
+ * already owns legacy app-server path text and needs to preserve its wire
+ * spelling; use [`Self::from_path`], [`Self::from_abs_path`], or
+ * [`Self::from_path_uri`] when converting an actual path value. Relative
+ * path text remains valid until an operation such as [`Self::to_path_uri`]
+ * requires an absolute path.
+ */
+export type LegacyAppPathString = string;
+
+export type TurnEnvironmentParams = {
+  environmentId: string;
+  cwd: LegacyAppPathString;
+  /**
+   * Environment-native runtime workspace roots. Omitted defaults to `cwd`.
+   */
+  runtimeWorkspaceRoots?: Array<LegacyAppPathString> | null;
+};
+
 export type ThreadStartParams = {
   model?: string | null;
   modelProvider?: string | null;
+  /**
+   * Allow a provider with an authoritative static model catalog to replace an unavailable
+   * requested model with its default.
+   */
+  allowProviderModelFallback?: boolean;
   serviceTier?: string | null | null;
   cwd?: string | null;
-  approvalPolicy?: AskForApproval | null; /**
+  /**
+   * Replace the thread's runtime workspace roots. Paths must be absolute.
+   */
+  runtimeWorkspaceRoots?: Array<AbsolutePathBuf> | null;
+  approvalPolicy?: AskForApproval | null;
+  /**
    * Override where approval requests are routed for review on this thread
    * and subsequent turns.
    */
   approvalsReviewer?: ApprovalsReviewer | null;
   sandbox?: SandboxMode | null;
+  /**
+   * Named profile id for this thread. Cannot be combined with `sandbox`.
+   */
+  permissions?: string | null;
   config?: { [key in string]?: JsonValue } | null;
   serviceName?: string | null;
   baseInstructions?: string | null;
   developerInstructions?: string | null;
   personality?: Personality | null;
+  /**
+   * @deprecated Ignored. Use Ultra reasoning effort for proactive multi-agent behavior.
+   */
+  multiAgentMode?: MultiAgentMode | null;
   ephemeral?: boolean | null;
-  sessionStartSource?: ThreadStartSource | null; /**
+  /**
+   * Persisted thread history contract to use for this new thread.
+   */
+  historyMode?: ThreadHistoryMode | null;
+  sessionStartSource?: ThreadStartSource | null;
+  /**
    * Optional client-supplied analytics source classification for this thread.
    */
   threadSource?: ThreadSource | null;
+  /**
+   * Optional project identity for this new thread. Durable threads persist
+   * the assignment; ephemeral threads expose it only in live responses.
+   */
+  projectId?: string | null;
+  /**
+   * Optional sticky environments for this thread.
+   *
+   * Omitted selects the default environment when environment access is
+   * enabled. Empty disables environment access for turns that do not
+   * provide a turn override. Non-empty selects the first environment as the
+   * current turn environment.
+   */
+  environments?: Array<TurnEnvironmentParams> | null;
+  dynamicTools?: Array<DynamicToolSpec> | null;
+  /**
+   * Capability roots selected for this thread by the hosting platform.
+   */
+  selectedCapabilityRoots?: Array<SelectedCapabilityRoot> | null;
+  /**
+   * Test-only experimental field used to validate experimental gating and
+   * schema filtering behavior in a stable way.
+   */
+  mockExperimentalField?: string | null;
+  /**
+   * If true, opt into emitting raw Responses API items on the event stream.
+   * This is for internal use only (e.g. Codex Cloud).
+   */
+  experimentalRawEvents?: boolean;
 };
 
 export type TurnInterruptParams = { threadId: string; turnId: string };
 
 /**
- * See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
+ * Initial collaboration mode to use when the TUI starts.
  */
-export type ReasoningEffort = string;
+export type ModeKind = "plan" | "default";
+
+/**
+ * Settings for a collaboration mode.
+ */
+export type Settings = {
+  model: string;
+  reasoning_effort: ReasoningEffort | null;
+  developer_instructions: string | null;
+};
+
+/**
+ * Collaboration mode for a Codex session.
+ */
+export type CollaborationMode = { mode: ModeKind; settings: Settings };
 
 /**
  * A summary of the reasoning performed by the model. This can be useful for
@@ -174,16 +597,18 @@ export type ReasoningEffort = string;
  */
 export type ReasoningSummary = "auto" | "concise" | "detailed" | "none";
 
+export type AdditionalContextKind = "untrusted" | "application";
+
+export type AdditionalContextEntry = {
+  value: string;
+  kind: AdditionalContextKind;
+};
+
 /**
- * A path that is guaranteed to be absolute and normalized (though it is not
- * guaranteed to be canonicalized or exist on the filesystem).
- *
- * IMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set
- * using [AbsolutePathBufGuard::new]. If no base path is set, the
- * deserialization will fail unless the path being deserialized is already
- * absolute.
+ * Requested cyber treatment for a ChatGPT-authenticated Codex turn.
+ * Authorization and model-tier restrictions remain server-owned.
  */
-export type AbsolutePathBuf = string;
+export type CyberAccessProgram = "standard" | "daybreakBlue" | "daybreakRed";
 
 export type NetworkAccess = "restricted" | "enabled";
 
@@ -198,21 +623,6 @@ export type SandboxPolicy =
       excludeTmpdirEnvVar: boolean;
       excludeSlashTmp: boolean;
     };
-
-export type ImageDetail = "auto" | "low" | "high" | "original";
-
-/**
- * Responses API compatible content items that can be returned by a tool call.
- * This is a subset of ContentItem with the types we support as function call outputs.
- */
-export type FunctionCallOutputContentItem =
-  | { type: "input_text"; text: string }
-  | { type: "input_image"; image_url: string; detail?: ImageDetail }
-  | { type: "input_audio"; audio_url: string }
-  | { type: "encrypted_content"; encrypted_content: string };
-
-export type FunctionCallOutputBody =
-  string | Array<FunctionCallOutputContentItem>;
 
 export type TurnToolOutput = {
   name: string;
@@ -252,55 +662,131 @@ export type UserInput =
 export type TurnStartParams = {
   threadId: string;
   clientUserMessageId?: string | null;
-  input: Array<UserInput>; /**
+  input: Array<UserInput>;
+  /**
    * Optional source classification for the caller that starts this turn.
    * Ignored when this request steers an already-active turn.
    */
   turnTrigger?: string | null;
-  toolOutput?: TurnToolOutput | null; /**
+  toolOutput?: TurnToolOutput | null;
+  /**
+   * Optional metadata to enrich Codex's ResponsesAPI turn metadata.
+   *
+   * Entries are flattened into the JSON string sent as
+   * `client_metadata["x-codex-turn-metadata"]` on ResponsesAPI HTTP and websocket requests.
+   *
+   * They are not sent as top-level ResponsesAPI `client_metadata` keys, and reserved keys
+   * such as `session_id`, `thread_id`, `turn_id`, and `window_id` cannot be overridden.
+   */
+  responsesapiClientMetadata?: { [key in string]?: string } | null;
+  /**
+   * Optional client-provided context fragments keyed by an opaque source identifier.
+   */
+  additionalContext?: { [key in string]?: AdditionalContextEntry } | null;
+  /**
+   * Optional environments for this turn and subsequent turns.
+   *
+   * Omitted uses the thread sticky environments. Empty disables
+   * environment access for this turn. Non-empty selects the first
+   * environment as the current turn environment for this turn.
+   */
+  environments?: Array<TurnEnvironmentParams> | null;
+  /**
    * Override the working directory for this turn and subsequent turns.
    */
-  cwd?: string | null; /**
+  cwd?: string | null;
+  /**
+   * Replace the thread's runtime workspace roots for this turn and
+   * subsequent turns. Paths must be absolute.
+   */
+  runtimeWorkspaceRoots?: Array<AbsolutePathBuf> | null;
+  /**
    * Override the approval policy for this turn and subsequent turns.
    */
-  approvalPolicy?: AskForApproval | null; /**
+  approvalPolicy?: AskForApproval | null;
+  /**
    * Override where approval requests are routed for review on this turn and
    * subsequent turns.
    */
-  approvalsReviewer?: ApprovalsReviewer | null; /**
+  approvalsReviewer?: ApprovalsReviewer | null;
+  /**
    * Override the sandbox policy for this turn and subsequent turns.
    */
-  sandboxPolicy?: SandboxPolicy | null; /**
+  sandboxPolicy?: SandboxPolicy | null;
+  /**
+   * Select a named permissions profile id for this turn and subsequent
+   * turns. Cannot be combined with `sandboxPolicy`.
+   */
+  permissions?: string | null;
+  /**
    * Override the model for this turn and subsequent turns.
    */
-  model?: string | null; /**
+  model?: string | null;
+  /**
    * Override the service tier for this turn and subsequent turns.
    */
-  serviceTier?: string | null | null; /**
+  serviceTier?: string | null | null;
+  /**
    * Override the service tier only when this request starts a new turn.
    * Use "default" for standard speed. Omitted or null inherits the thread's tier.
    * Does not change the thread's tier or a turn being steered.
    */
-  serviceTierForTurn?: string | null; /**
+  serviceTierForTurn?: string | null;
+  /**
    * Override the reasoning effort for this turn and subsequent turns.
    */
-  effort?: ReasoningEffort | null; /**
+  effort?: ReasoningEffort | null;
+  /**
    * Override the reasoning summary for this turn and subsequent turns.
    */
-  summary?: ReasoningSummary | null; /**
+  summary?: ReasoningSummary | null;
+  /**
    * Override the personality for this turn and subsequent turns.
    */
-  personality?: Personality | null; /**
+  personality?: Personality | null;
+  /**
    * Optional JSON Schema used to constrain the final assistant message for
    * this turn.
    */
   outputSchema?: JsonValue | null;
+  /**
+   * EXPERIMENTAL - Set a pre-set collaboration mode.
+   * Takes precedence over model, reasoning_effort, and developer instructions if set.
+   *
+   * For `collaboration_mode.settings.developer_instructions`, `null` means
+   * "use the built-in instructions for the selected mode".
+   */
+  collaborationMode?: CollaborationMode | null;
+  /**
+   * @deprecated Ignored. Use `effort: "ultra"` for proactive multi-agent behavior.
+   */
+  multiAgentMode?: MultiAgentMode | null;
+  /**
+   * EXPERIMENTAL - Request a workspace-authorized cyber program for this
+   * turn. Omission preserves automatic behavior. This does not grant access.
+   */
+  cyberAccessProgram?: CyberAccessProgram | null;
 };
 
 export type TurnSteerParams = {
   threadId: string;
   clientUserMessageId?: string | null;
-  input: Array<UserInput>; /**
+  input: Array<UserInput>;
+  /**
+   * Optional metadata to enrich Codex's ResponsesAPI turn metadata.
+   *
+   * Entries are flattened into the JSON string sent as
+   * `client_metadata["x-codex-turn-metadata"]` on ResponsesAPI HTTP and websocket requests.
+   *
+   * They are not sent as top-level ResponsesAPI `client_metadata` keys, and reserved keys
+   * such as `session_id`, `thread_id`, `turn_id`, and `window_id` cannot be overridden.
+   */
+  responsesapiClientMetadata?: { [key in string]?: string } | null;
+  /**
+   * Optional client-provided context fragments keyed by an opaque source identifier.
+   */
+  additionalContext?: { [key in string]?: AdditionalContextEntry } | null;
+  /**
    * Required active turn id precondition. The request fails when it does not
    * match the currently active turn.
    */
@@ -338,38 +824,6 @@ export type ImageGenerationItem = {
   failure: ImageGenerationFailure | null;
   savedPath?: AbsolutePathBuf;
 };
-
-/**
- * A UTF-8 path for preserving raw path compatibility at the app-server API
- * boundary while Codex migrates to [`PathUri`].
- *
- * Supports storing arbitrary strings read from the API and converting to and
- * from [`PathUri`] using an explicitly selected native path convention.
- *
- * When converting from [`PathUri`], "native" refers to the supplied
- * [`PathConvention`], which may be foreign to the operating system running
- * this process. The inner string is private so path-producing code must use a
- * path conversion method instead of bypassing the intended conversion
- * boundary. Non-UTF-8 paths are converted to UTF-8 lossily because this API
- * value is serialized as a JSON string.
- *
- * Deserialization and [`Self::from_string`] accept any UTF-8 string without
- * interpreting or validating it. Use [`Self::from_string`] when a caller
- * already owns legacy app-server path text and needs to preserve its wire
- * spelling; use [`Self::from_path`], [`Self::from_abs_path`], or
- * [`Self::from_path_uri`] when converting an actual path value. Relative
- * path text remains valid until an operation such as [`Self::to_path_uri`]
- * requires an absolute path.
- */
-export type LegacyAppPathString = string;
-
-/**
- * Classifies an assistant message as interim commentary or final answer text.
- *
- * Providers do not emit this consistently, so callers must treat `None` as
- * "phase unknown" and keep compatibility behavior for legacy models.
- */
-export type MessagePhase = "commentary" | "final_answer";
 
 /**
  * Display item emitted by the interruptible `clock.sleep` tool.
@@ -694,6 +1148,21 @@ export type ItemStartedNotification = {
   startedAtMs: number;
 };
 
+export type ReasoningSummaryPartAddedNotification = {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  summaryIndex: number;
+};
+
+export type ReasoningSummaryTextDeltaNotification = {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  delta: string;
+  summaryIndex: number;
+};
+
 export type NonSteerableTurnKind = "review" | "compact";
 
 /**
@@ -749,8 +1218,6 @@ export type TurnError = {
   misalignment: MisalignmentErrorDetails | null;
 };
 
-export type TurnItemsView = "notLoaded" | "summary" | "full";
-
 export type TurnStatus = "completed" | "interrupted" | "failed" | "inProgress";
 
 export type Turn = {
@@ -794,10 +1261,35 @@ export type ServerNotification =
   | { method: "turn/completed"; params: TurnCompletedNotification }
   | { method: "item/started"; params: ItemStartedNotification }
   | { method: "item/completed"; params: ItemCompletedNotification }
+  | { method: "item/agentMessage/delta"; params: AgentMessageDeltaNotification }
   | {
-      method: "item/agentMessage/delta";
-      params: AgentMessageDeltaNotification;
+      method: "item/reasoning/summaryTextDelta";
+      params: ReasoningSummaryTextDeltaNotification;
+    }
+  | {
+      method: "item/reasoning/summaryPartAdded";
+      params: ReasoningSummaryPartAddedNotification;
     };
+
+export type DynamicToolCallParams = {
+  threadId: string;
+  turnId: string;
+  callId: string;
+  namespace: string | null;
+  tool: string;
+  arguments: JsonValue;
+};
+
+export type ServerRequest = {
+  method: "item/tool/call";
+  id: RequestId;
+  params: DynamicToolCallParams;
+};
+
+export type DynamicToolCallResponse = {
+  contentItems: Array<DynamicToolCallOutputContentItem>;
+  success: boolean;
+};
 
 export type InitializeResponse = {
   userAgent: string;
@@ -815,6 +1307,19 @@ export type InitializeResponse = {
    * `"macos"`, `"linux"`, or `"windows"`.
    */
   platformOs: string;
+};
+
+export type ActivePermissionProfile = {
+  /**
+   * Identifier from `default_permissions` or the implicit built-in default,
+   * such as `:workspace` or a user-defined `[permissions.<id>]` profile.
+   */
+  id: string;
+  /**
+   * Parent profile identifier from the selected permissions profile's
+   * `extends` setting, when present.
+   */
+  extends: string | null;
 };
 
 export type GitInfo = {
@@ -856,7 +1361,19 @@ export type SessionSource =
   | { subAgent: SubAgentSource }
   | "unknown";
 
-export type ThreadHistoryMode = "legacy" | "paginated";
+/**
+ * An environment selected by a loaded thread, independent of connection status.
+ */
+export type ThreadEnvironment = {
+  environmentId: string;
+  cwd: LegacyAppPathString;
+  runtimeWorkspaceRoots: Array<LegacyAppPathString>;
+};
+
+/**
+ * Extra app-server data for a thread.
+ */
+export type ThreadExtra = Record<string, never>;
 
 /**
  * Extensible visual presentation for a custom thread section.
@@ -896,88 +1413,134 @@ export type Thread = {
   /**
    * Identifier for this thread. Codex-generated thread IDs are UUIDv7.
    */
-  id: string; /**
+  id: string;
+  /**
+   * Current environments for a loaded thread, in priority order, primary first.
+   * `null` means the thread is not loaded or the server does not expose its selection.
+   * An empty list means no environments are selected. This does not report connection status.
+   */
+  environments: Array<ThreadEnvironment> | null;
+  /**
+   * Optional implementation-specific thread data.
+   */
+  extra: ThreadExtra | null;
+  /**
    * Session id shared by threads that belong to the same session tree.
    */
-  sessionId: string; /**
+  sessionId: string;
+  /**
    * Source thread id when this thread was created by forking another thread.
    */
-  forkedFromId: string | null; /**
+  forkedFromId: string | null;
+  /**
    * The ID of the parent thread. This will only be set if this thread is a subagent.
    */
-  parentThreadId: string | null; /**
+  parentThreadId: string | null;
+  /**
    * Usually the first user message in the thread, if available.
    */
-  preview: string; /**
+  preview: string;
+  /**
    * Whether the thread is ephemeral and should not be materialized on disk.
    */
-  ephemeral: boolean; /**
+  ephemeral: boolean;
+  /**
    * The independently persisted section selected for this thread, if any.
    */
-  section: ThreadSection | null; /**
+  section: ThreadSection | null;
+  /**
    * Unix timestamp in seconds when the thread entered its current section.
    */
-  sectionEnteredAt: number | null; /**
+  sectionEnteredAt: number | null;
+  /**
    * Canonical project assignment owned by app-server, if any.
    */
-  projectId: string | null; /**
+  projectId: string | null;
+  /**
    * Persisted thread history contract selected when this thread was created.
    */
-  historyMode: ThreadHistoryMode; /**
+  historyMode: ThreadHistoryMode;
+  /**
    * Model provider used for this thread (for example, 'openai').
    */
-  modelProvider: string; /**
+  modelProvider: string;
+  /**
    * Current configured model when loaded, otherwise the latest persisted model.
    * Null when unavailable. This is not per-turn execution telemetry.
    */
-  model: string | null; /**
+  model: string | null;
+  /**
    * Current configured reasoning effort when loaded, otherwise the latest persisted effort.
    * Null when unset or unavailable. This is not per-turn execution telemetry.
    */
-  reasoningEffort: ReasoningEffort | null; /**
+  reasoningEffort: ReasoningEffort | null;
+  /**
    * Unix timestamp (in seconds) when the thread was created.
    */
-  createdAt: number; /**
+  createdAt: number;
+  /**
    * Unix timestamp (in seconds) when the thread was last updated.
    */
-  updatedAt: number; /**
+  updatedAt: number;
+  /**
    * Unix timestamp (in seconds) used for thread recency ordering.
    */
-  recencyAt: number | null; /**
+  recencyAt: number | null;
+  /**
    * Current runtime status for the thread.
    */
-  status: ThreadStatus; /**
+  status: ThreadStatus;
+  /**
    * [UNSTABLE] Path to the thread on disk.
    */
-  path: string | null; /**
+  path: string | null;
+  /**
    * Working directory captured for the thread.
    */
-  cwd: AbsolutePathBuf; /**
+  cwd: AbsolutePathBuf;
+  /**
    * Version of the CLI that created the thread.
    */
-  cliVersion: string; /**
+  cliVersion: string;
+  /**
    * Originator recorded when the thread was created, independent of its current client or executor.
    * Null when the recorded originator is unavailable.
    */
-  originator: string | null; /**
+  originator: string | null;
+  /**
    * Origin of the thread (CLI, VSCode, codex exec, codex app-server, etc.).
    */
-  source: SessionSource; /**
+  source: SessionSource;
+  /**
+   * Whether the app server accepts direct turn input for this loaded thread.
+   * `None` means the capability is unavailable, such as for an unloaded stored thread.
+   */
+  canAcceptDirectInput: boolean | null;
+  /**
    * Optional analytics source classification for this thread.
    */
-  threadSource: ThreadSource | null; /**
+  threadSource: ThreadSource | null;
+  /**
    * Optional random unique nickname assigned to an AgentControl-spawned sub-agent.
    */
-  agentNickname: string | null; /**
+  agentNickname: string | null;
+  /**
    * Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
    */
-  agentRole: string | null; /**
+  agentRole: string | null;
+  /**
    * Optional Git metadata captured when the thread was created.
    */
-  gitInfo: GitInfo | null; /**
+  gitInfo: GitInfo | null;
+  /**
    * Optional user-facing thread title.
    */
-  name: string | null; /**
+  name: string | null;
+  /**
+   * Saved Daybreak choice, independent of turn execution. Null if unset.
+   */
+  daybreakEnabled: boolean | null;
+  /**
    * Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read`
    * (when `includeTurns` is true) responses.
    * For all other responses and notifications returning a Thread,
@@ -991,19 +1554,42 @@ export type ThreadStartResponse = {
   model: string;
   modelProvider: string;
   serviceTier: string | null;
-  cwd: AbsolutePathBuf; /**
+  cwd: AbsolutePathBuf;
+  /**
+   * Thread-scoped runtime workspace roots used to materialize
+   * `:workspace_roots`.
+   */
+  runtimeWorkspaceRoots: Array<AbsolutePathBuf>;
+  /**
    * Environment-native paths to instruction source files currently loaded for this thread.
    */
   instructionSources: Array<LegacyAppPathString>;
-  approvalPolicy: AskForApproval; /**
+  approvalPolicy: AskForApproval;
+  /**
    * Reviewer currently used for approval requests on this thread.
    */
-  approvalsReviewer: ApprovalsReviewer; /**
+  approvalsReviewer: ApprovalsReviewer;
+  /**
    * Legacy sandbox policy retained for compatibility. Experimental clients
    * should prefer `activePermissionProfile` for profile provenance.
    */
   sandbox: SandboxPolicy;
+  /**
+   * Named or implicit built-in profile that produced the active
+   * permissions, when known.
+   */
+  activePermissionProfile: ActivePermissionProfile | null;
   reasoningEffort: ReasoningEffort | null;
+  /**
+   * @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
+   */
+  multiAgentMode: MultiAgentMode;
+};
+
+export type TurnsPage = {
+  data: Array<Turn>;
+  nextCursor: string | null;
+  backwardsCursor: string | null;
 };
 
 export type ThreadResumeResponse = {
@@ -1011,25 +1597,48 @@ export type ThreadResumeResponse = {
   model: string;
   modelProvider: string;
   serviceTier: string | null;
-  cwd: AbsolutePathBuf; /**
+  cwd: AbsolutePathBuf;
+  /**
+   * Thread-scoped runtime workspace roots used to materialize
+   * `:workspace_roots`.
+   */
+  runtimeWorkspaceRoots: Array<AbsolutePathBuf>;
+  /**
    * Environment-native paths to instruction source files currently loaded for this thread.
    */
   instructionSources: Array<LegacyAppPathString>;
-  approvalPolicy: AskForApproval; /**
+  approvalPolicy: AskForApproval;
+  /**
    * Reviewer currently used for approval requests on this thread.
    */
-  approvalsReviewer: ApprovalsReviewer; /**
+  approvalsReviewer: ApprovalsReviewer;
+  /**
    * Legacy sandbox policy retained for compatibility. Experimental clients
    * should prefer `activePermissionProfile` for profile provenance.
    */
   sandbox: SandboxPolicy;
-  reasoningEffort: ReasoningEffort | null; /**
+  /**
+   * Named or implicit built-in profile that produced the active
+   * permissions, when known.
+   */
+  activePermissionProfile: ActivePermissionProfile | null;
+  reasoningEffort: ReasoningEffort | null;
+  /**
+   * @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
+   */
+  multiAgentMode: MultiAgentMode;
+  /**
+   * `thread/turns/list` page returned when requested by `initialTurnsPage`.
+   */
+  initialTurnsPage: TurnsPage | null;
+  /**
    * Opaque cursor for hydrating paginated turns backwards.
    *
    * Pass this as `cursor` to `thread/turns/list` with
    * `sortDirection: "desc"`. The first page includes the turn identified by the cursor.
    */
-  turnsBackwardsCursor: string | null; /**
+  turnsBackwardsCursor: string | null;
+  /**
    * Opaque cursor for hydrating paginated items backwards.
    *
    * Pass this as `cursor` to `thread/items/list` with
