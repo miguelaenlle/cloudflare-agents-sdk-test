@@ -7,6 +7,7 @@ import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { pushSyncTool } from "../approval.ts";
 import { AppServer, within } from "../app-server.ts";
 
 // Real pinned Codex, fake model endpoint: no OpenAI credentials or paid inference.
@@ -16,14 +17,18 @@ test(
   async () => {
     const home = await mkdtemp(join(tmpdir(), "cf-native-"));
     let requests = 0;
+    let toolMode = false;
+    let toolIssued = false;
+    let toolInput;
     const model = createServer(async (request, response) => {
       if (request.url !== "/v1/responses") {
         response.writeHead(404).end();
         return;
       }
       assert.equal(request.headers.authorization, undefined);
-      for await (const _chunk of request) {
-      }
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      if (toolMode) toolInput = JSON.parse(body);
       requests++;
       response.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -49,7 +54,33 @@ test(
       send("response.created", {
         response: { id: `resp_${requests}`, status: "in_progress", output: [] },
       });
-      if (requests > 1) return; // Hold generation open for steering and Stop.
+      if (toolMode && !toolIssued) {
+        toolIssued = true;
+        const call = {
+          type: "function_call",
+          id: "fc_test",
+          call_id: "call_test",
+          name: "push_sync",
+          arguments: JSON.stringify({
+            baseSha: "a".repeat(40),
+            proposedSha: "b".repeat(40),
+          }),
+          status: "completed",
+        };
+        send("response.output_item.added", { output_index: 0, item: call });
+        send("response.output_item.done", { output_index: 0, item: call });
+        send("response.completed", {
+          response: {
+            id: `resp_${requests}`,
+            status: "completed",
+            output: [call],
+            usage: { input_tokens: 10, output_tokens: 6, total_tokens: 16 },
+          },
+        });
+        response.end();
+        return;
+      }
+      if (requests > 1 && !toolMode) return; // Hold generation open for steering and Stop.
       send("response.output_item.added", {
         output_index: 0,
         item: { ...item, status: "in_progress", content: [] },
@@ -95,7 +126,7 @@ test(
     )
       .replace("/tmp/codex-logs", join(home, "logs"))
       .replace(
-        "https://api.openai.com/v1",
+        "http://openai.internal/v1",
         `http://127.0.0.1:${model.address().port}/v1`,
       );
     await writeFile(join(home, "config.toml"), config);
@@ -219,6 +250,47 @@ test(
         includeTurns: true,
       });
       assert.equal(current.thread.turns.at(-1).status, "interrupted");
+      toolMode = true;
+      const toolThread = (
+        await client.request("thread/start", {
+          cwd: home,
+          model: "gpt-5.4",
+          approvalPolicy: "never",
+          dynamicTools: [pushSyncTool],
+        })
+      ).thread;
+      let called;
+      client.toolHandler = async (params) => {
+        called = params;
+        return {
+          success: true,
+          contentItems: [
+            { type: "inputText", text: "Approved, simulation only." },
+          ],
+        };
+      };
+      const toolDone = completed();
+      await client.request("turn/start", {
+        threadId: toolThread.id,
+        input: [
+          { type: "text", text: "Request push_sync.", text_elements: [] },
+        ],
+      });
+      assert.equal((await toolDone).status, "completed");
+      assert.equal(called.tool, "push_sync");
+      assert.ok(
+        JSON.stringify(toolInput.input).includes("Approved, simulation only."),
+      );
+      client.close();
+      client = await connect();
+      const restored = await client.request("thread/resume", {
+        threadId: toolThread.id,
+      });
+      assert.ok(
+        restored.thread.turns[0].items.some(
+          (item) => item.type === "dynamicToolCall" && item.success,
+        ),
+      );
     } catch (error) {
       console.error(logs.slice(-4000));
       throw error;
