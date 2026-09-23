@@ -2,13 +2,13 @@
 
 Review the stack in order: [#2](https://github.com/miguelaenlle/cloudflare-agents-sdk-test/pull/2) → [#3](https://github.com/miguelaenlle/cloudflare-agents-sdk-test/pull/3) → [#4](https://github.com/miguelaenlle/cloudflare-agents-sdk-test/pull/4) → [#5](https://github.com/miguelaenlle/cloudflare-agents-sdk-test/pull/5) → [#6](https://github.com/miguelaenlle/cloudflare-agents-sdk-test/pull/6).
 
-| Layer | Responsibility | Start reading |
-| --- | --- | --- |
+| Layer  | Responsibility                                                                                                                                                     | Start reading                                                                                               |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
 | 1 / #2 | Browser, relay provider, conversation and approval contracts. Includes reasoning, steering, stale-tab and approval rendering; server integration lands in layer 5. | `packages/chat-contract/src/index.ts`, `apps/web/client/app.tsx`, `apps/web/server/providers/cloudflare.ts` |
-| 2 / #3 | Native app-server RPC and typed event translation, including dynamic-tool plumbing. | `apps/agent/app-server.ts`, `apps/agent/codex-events.ts` |
-| 3 / #4 | Sandbox startup, model and Git credential injection, backups and local runtime. | `apps/agent/codex.ts`, `apps/agent/outbound.ts`, `apps/agent/sandbox.ts` |
-| 4 / #5 | DO coordination, turn controls, revision enforcement, diagnostics and durable approvals across shutdown/restore. | `apps/agent/agent.ts`, `apps/agent/codex-turn.ts`, `apps/agent/approval.ts` |
-| 5 / #6 | Conversation persistence and relay routes, trusted Git publication, recovery, complete-stack tests and operating documentation. | `apps/web/server/server.ts`, `apps/web/server/conversations.ts`, `apps/web/server/publish.ts` |
+| 2 / #3 | Native app-server RPC and typed event translation, including dynamic-tool plumbing.                                                                                | `apps/agent/app-server.ts`, `apps/agent/codex-events.ts`                                                    |
+| 3 / #4 | Sandbox startup, model and Git credential injection, backups and local runtime.                                                                                    | `apps/agent/codex.ts`, `apps/agent/outbound.ts`, `apps/agent/sandbox.ts`                                    |
+| 4 / #5 | DO coordination, turn controls, revision enforcement, diagnostics and durable approvals across shutdown/restore.                                                   | `apps/agent/agent.ts`, `apps/agent/codex-turn.ts`, `apps/agent/approval.ts`                                 |
+| 5 / #6 | Conversation persistence and relay routes, trusted Git publication, recovery, complete-stack tests and operating documentation.                                    | `apps/web/server/server.ts`, `apps/web/server/conversations.ts`, `apps/web/server/publish.ts`               |
 
 These are review layers of one prototype, not five independently deployable releases. Use the top branch `codex/review-05-integration-tests` for execution. Existing commits and review history are retained through merges; no rebasing or force-pushing is required. The former documentation-only PR #1 is superseded by layer 5. `codex/prototype` remains a compatible full-stack checkout.
 
