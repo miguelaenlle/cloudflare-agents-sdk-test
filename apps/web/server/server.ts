@@ -9,6 +9,8 @@ import {
 } from "@playground/chat-contract";
 import { createCloudflareProvider } from "./providers/cloudflare.ts";
 import {
+  publicationSnapshot,
+  retryPublications,
   listConversations,
   createConversation,
   hasConversation,
@@ -70,7 +72,10 @@ function routes(
   app.get(`${base}/snapshot`, async (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.json(
-      await provider(request.params).getSnapshot(clientSignal(response)),
+      await publicationSnapshot(
+        conversationId(request.params),
+        await provider(request.params).getSnapshot(clientSignal(response)),
+      ),
     );
   });
   app.get(`${base}/history`, async (request, response) => {
@@ -120,6 +125,7 @@ function routes(
     const outcome = await recordDecision(
       conversationId(request.params),
       parsed.data,
+      approval,
     );
     await chat.decide(outcome, AbortSignal.timeout(30_000));
     deliveredDecision(outcome.id);
@@ -178,6 +184,7 @@ const deliveryTimer = setInterval(async () => {
   if (delivering) return;
   delivering = true;
   try {
+    await retryPublications();
     for (const { conversationId, input } of pendingDecisions()) {
       try {
         await createCloudflareProvider(

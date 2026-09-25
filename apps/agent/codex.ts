@@ -24,7 +24,6 @@ export type CodexState = {
   approvalDelivery?: string;
   approvalPreparing?: boolean;
   approvalReceipts?: Record<string, { digest: string; approved: boolean }>;
-
   sandbox?: {
     id: string;
     phase:
@@ -54,9 +53,14 @@ export async function connectCodex(
   sandbox: CodexSandbox,
   state: CodexState,
   {
+    repository,
     recovery = false,
     assertCurrent = () => {},
-  }: { recovery?: boolean; assertCurrent?: () => void } = {},
+  }: {
+    repository?: string;
+    recovery?: boolean;
+    assertCurrent?: () => void;
+  } = {},
 ) {
   // Expiration can interleave with SDK awaits; stop before issuing another operation.
   assertCurrent();
@@ -67,8 +71,12 @@ export async function connectCodex(
   if (!warm) {
     if (state.checkpoint) await sandbox.restoreBackup(state.checkpoint.backup);
     else {
+      if (repository && !/^[\w.-]+\/[\w.-]+$/.test(repository))
+        throw new Error("Invalid configured GitHub repository.");
       const initialized = await sandbox.exec(
-        "mkdir -p /workspace/repo /workspace/codex && git init /workspace/repo",
+        repository
+          ? `mkdir -p /workspace/codex && git clone https://github.com/${repository}.git /workspace/repo`
+          : "mkdir -p /workspace/repo /workspace/codex && git init /workspace/repo",
       );
       if (!initialized.success)
         throw new Error("Could not initialize workspace.");

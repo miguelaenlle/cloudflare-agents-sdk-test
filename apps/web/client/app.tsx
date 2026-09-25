@@ -210,18 +210,40 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
       {approval && (
         <section aria-label="Publication approval">
           <h2>Review changes · {approval.status}</h2>
-          <p>Approval is simulated: no Git push or Course Sync will run.</p>
+          <p>
+            Approve publishes these changes to the configured test repository.
+            Course Sync is simulated.
+          </p>
           <p>
             Base <code>{approval.baseSha}</code> → proposed{" "}
             <code>{approval.proposedSha}</code>
           </p>
           <pre>{approval.diff}</pre>
+          {snapshot.publication && (
+            <p>
+              {snapshot.publication.repository} · {snapshot.publication.branch}{" "}
+              · {snapshot.publication.status}
+              {snapshot.publication.error && `: ${snapshot.publication.error}`}
+            </p>
+          )}
           {approval.status === "pending" ? (
             <div className="actions">
-              <button disabled={sending} onClick={() => void decide(true)}>
+              <button
+                disabled={
+                  sending ||
+                  snapshot.publication?.status === "invalid" ||
+                  snapshot.publication?.status === "publishing"
+                }
+                onClick={() => void decide(true)}
+              >
                 Approve
               </button>
-              <button disabled={sending} onClick={() => void decide(false)}>
+              <button
+                disabled={
+                  sending || snapshot.publication?.status === "publishing"
+                }
+                onClick={() => void decide(false)}
+              >
                 Deny
               </button>
             </div>

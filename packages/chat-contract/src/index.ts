@@ -82,6 +82,12 @@ export type ChatSnapshot = {
   revision: number;
   blocked?: boolean;
   approval?: Approval;
+  publication?: {
+    repository: string;
+    branch: string;
+    status: "ready" | "publishing" | "invalid";
+    error?: string;
+  };
 };
 export class ChatError extends Error {
   readonly status: number;
