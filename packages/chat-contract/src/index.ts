@@ -38,6 +38,10 @@ export interface ChatConnection {
 
 export interface ChatProvider {
   getSnapshot(signal: AbortSignal): Promise<ChatSnapshot>;
+  decide(
+    input: ApprovalDecision & { result: string },
+    signal: AbortSignal,
+  ): Promise<void>;
   getDiagnostics(signal: AbortSignal): Promise<SandboxDiagnostics>;
   getHistory(signal: AbortSignal): Promise<UIMessage[]>;
   send(input: SendRequest, signal: AbortSignal): Promise<void>;
@@ -53,8 +57,32 @@ export function conversationApi(id: string) {
     snapshot: `${chat}/snapshot`,
     diagnostics: `${chat}/diagnostics`,
     cancel: `${chat}/cancel`,
+    approval: `${chat}/approval`,
   };
 }
+export const approvalSchema = z.object({
+  id: z.uuid(),
+  baseSha: z.string().regex(/^[a-f0-9]{40}$/),
+  proposedSha: z.string().regex(/^[a-f0-9]{40}$/),
+  diff: z.string().max(262144),
+  digest: z.string(),
+  status: z.enum(["pending", "approved", "denied"]),
+  result: z.string().optional(),
+});
+export type Approval = z.infer<typeof approvalSchema>;
+export const approvalDecisionSchema = z.object({
+  id: z.uuid(),
+  expectedRevision: z.number().int().nonnegative(),
+  digest: z.string(),
+  approved: z.boolean(),
+});
+export type ApprovalDecision = z.infer<typeof approvalDecisionSchema>;
+export type ChatSnapshot = {
+  messages: UIMessage[];
+  revision: number;
+  blocked?: boolean;
+  approval?: Approval;
+};
 export class ChatError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
@@ -63,4 +91,6 @@ export class ChatError extends Error {
   }
 }
 
-export type ChatSnapshot = { messages: UIMessage[]; revision: number };
+export const approvalOutcomeSchema = approvalDecisionSchema.extend({
+  result: z.string().min(1).max(2000),
+});

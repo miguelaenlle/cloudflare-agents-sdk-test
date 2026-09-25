@@ -111,6 +111,7 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
   });
   const busy = status === "submitted" || status === "streaming";
   const stale = revision !== snapshot.revision;
+  const approval = snapshot.approval;
   function draft(text: string) {
     setInput(text);
     sessionStorage.setItem(`draft:${id}`, text);
@@ -123,7 +124,7 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
     setMessages(next.messages);
     void resumeStream();
   }
-  // Other-tab revisions can change while this tab has no active stream.
+  // Approvals and other-tab revisions can change while this tab has no active stream.
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -177,11 +178,68 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
       setSending(false);
     }
   }
+  async function decide(approved: boolean) {
+    if (!approval) return;
+    setSending(true);
+    setFailure("");
+    try {
+      await request(api.approval, {
+        id: approval.id,
+        digest: approval.digest,
+        expectedRevision: snapshot.revision,
+        approved,
+      });
+      await refresh();
+    } catch (error) {
+      setFailure(String(error));
+    } finally {
+      setSending(false);
+    }
+  }
   return (
     <>
-      <p role="status">{busy ? "Working…" : "Ready"}</p>
+      <p role="status">
+        {approval?.status === "pending"
+          ? "Waiting for approval"
+          : busy
+            ? "Working…"
+            : "Ready"}
+      </p>
       <SandboxStatus api={api.diagnostics} />
       <Transcript messages={messages} />
+      {approval && (
+        <section aria-label="Publication approval">
+          <h2>Review changes · {approval.status}</h2>
+          <p>Approval is simulated: no Git push or Course Sync will run.</p>
+          <p>
+            Base <code>{approval.baseSha}</code> → proposed{" "}
+            <code>{approval.proposedSha}</code>
+          </p>
+          <pre>{approval.diff}</pre>
+          {approval.status === "pending" ? (
+            <div className="actions">
+              <button disabled={sending} onClick={() => void decide(true)}>
+                Approve
+              </button>
+              <button disabled={sending} onClick={() => void decide(false)}>
+                Deny
+              </button>
+            </div>
+          ) : (
+            <>
+              <p>{approval.result}</p>
+              {snapshot.blocked && (
+                <button
+                  disabled={sending}
+                  onClick={() => void decide(approval.status === "approved")}
+                >
+                  Retry result delivery
+                </button>
+              )}
+            </>
+          )}
+        </section>
+      )}
       {stale && (
         <p role="alert">
           This conversation changed. Refresh history before sending. Your draft
@@ -206,7 +264,11 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
           >
             Refresh history
           </button>
-          <button disabled={sending || stale || !input.trim()}>Send</button>
+          <button
+            disabled={sending || stale || snapshot.blocked || !input.trim()}
+          >
+            Send
+          </button>
           <button
             type="button"
             onClick={() =>
