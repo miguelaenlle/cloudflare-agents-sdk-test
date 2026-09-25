@@ -6,6 +6,7 @@ import {
   type UIMessageChunk,
 } from "ai";
 import {
+  GITHUB_REPOSITORY,
   approvalOutcomeSchema,
   ChatError,
   type ApprovalDecision,
@@ -13,6 +14,7 @@ import {
   type SendRequest,
   type SandboxDiagnostics,
 } from "@playground/chat-contract";
+import { cleanupError } from "./cleanup-error.ts";
 import { AppServer, AppServerError, within } from "./app-server.ts";
 import type { Sandbox } from "./sandbox.ts";
 import { openCodexTurn, type CodexTurn } from "./codex-turn.ts";
@@ -32,9 +34,9 @@ import type { DynamicToolCallResponse, Turn } from "./protocol.ts";
 export interface Env {
   Sandbox: DurableObjectNamespace<Sandbox>;
   Chat: DurableObjectNamespace<Chat>;
+  BACKUP_BUCKET: R2Bucket;
   CODEX_MODEL?: string;
   RELAY_TOKEN?: string;
-  GITHUB_REPOSITORY?: string;
   LOCAL_DEV?: string;
   UI_ORIGIN: string;
 }
@@ -43,6 +45,7 @@ type Expiration = {
   reason: "idle" | "interaction" | "retry";
   waitingSince?: number;
   attempt?: number;
+  retryOf?: string;
 };
 const MAX_CLEANUP_ATTEMPTS = 3;
 const messageOf = (error: unknown) =>
@@ -152,11 +155,31 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         );
       }
     }
+    if (request.method === "POST" && path.endsWith("/cleanup")) {
+      const sandbox = this.state.sandbox;
+      if (
+        !sandbox?.cleanup?.error ||
+        !["waiting_for_user", "cleanup_failed"].includes(sandbox.phase)
+      )
+        return Response.json(
+          { error: "No failed cleanup to retry." },
+          { status: 409 },
+        );
+      this.ctx.waitUntil(
+        this.expireSandbox({
+          id: sandbox.id,
+          reason: sandbox.phase === "cleanup_failed" ? "retry" : "idle",
+          waitingSince: sandbox.waitingSince,
+        }),
+      );
+      return new Response(null, { status: 202 });
+    }
     if (request.method === "GET" && path.endsWith("/diagnostics")) {
       const sandbox = this.state.sandbox;
       return Response.json(
         {
           state: sandbox?.phase ?? "absent",
+          cleanup: sandbox?.cleanup,
           idleExpiresAt:
             sandbox?.phase === "waiting_for_user" &&
             sandbox.waitingSince !== undefined
@@ -349,6 +372,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
           ...this.state.sandbox!,
           phase: "waiting_for_agent",
           waitingSince: undefined,
+          cleanup: undefined,
         },
       });
       await this.interaction();
@@ -442,18 +466,65 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     return { persist: false, continue: false };
   }
 
+  private saveCheckpoint(checkpoint: NonNullable<CodexState["checkpoint"]>) {
+    const previous = this.state.checkpoint?.backup.id;
+    this.setState({
+      ...this.state,
+      checkpoint,
+      obsoleteCheckpoints: [
+        ...new Set([
+          ...(this.state.obsoleteCheckpoints ?? []),
+          ...(previous && previous !== checkpoint.backup.id ? [previous] : []),
+        ]),
+      ],
+    });
+  }
+
+  async pruneCheckpoints() {
+    // A warm restored filesystem may still depend on the previous backup's overlay.
+    if (this.state.sandbox) return;
+    for (const id of this.state.obsoleteCheckpoints ?? []) {
+      if (id === this.state.checkpoint?.backup.id) continue;
+      try {
+        // Object layout belongs to the pinned Sandbox SDK 0.12.9.
+        await within(
+          this.env.BACKUP_BUCKET.delete([
+            `backups/${id}/data.sqsh`,
+            `backups/${id}/meta.json`,
+          ]),
+          10_000,
+          "Backup deletion timed out.",
+        );
+      } catch {
+        console.error(
+          "Could not remove superseded checkpoint; retrying in 60 seconds.",
+        );
+        await this.schedule(60, "pruneCheckpoints");
+        return;
+      }
+      this.setState({
+        ...this.state,
+        obsoleteCheckpoints: this.state.obsoleteCheckpoints?.filter(
+          (candidate) => candidate !== id,
+        ),
+      });
+    }
+  }
+
   private async checkpoint(id: string) {
     const sandbox = this.sandbox(id);
-    if (!(await sandbox.exists("/tmp/codex-app-server-ready")).exists)
-      throw new ContainerLost();
-    this.ensureUsable(id);
     const threadId = this.state.threadId;
-    const backup = await checkpointCodex(
-      sandbox,
-      this.env.LOCAL_DEV === "true",
+    const backup = await within(
+      (async () => {
+        if (!(await sandbox.exists("/tmp/codex-app-server-ready")).exists)
+          throw new ContainerLost();
+        this.ensureUsable(id);
+        return checkpointCodex(sandbox, this.env.LOCAL_DEV === "true");
+      })(),
+      60_000,
+      "Backup timed out.",
     );
-    if (this.usable(id))
-      this.setState({ ...this.state, checkpoint: { backup, threadId } });
+    if (this.usable(id)) this.saveCheckpoint({ backup, threadId });
   }
 
   private async finishRun(run: Run, status: Run["status"]) {
@@ -592,6 +663,8 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         "Sandbox destruction unconfirmed.",
       );
       if (this.state.sandbox?.id !== id) return;
+      if (this.state.obsoleteCheckpoints?.length)
+        await this.schedule(60, "pruneCheckpoints");
       this.setState({
         ...this.state,
         sandbox: undefined,
@@ -601,6 +674,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             ? { ...this.state.run, status: "interrupted" }
             : this.state.run,
       });
+      await this.pruneCheckpoints();
     } catch (error) {
       if (this.state.sandbox?.id === id)
         this.setState({
@@ -617,6 +691,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     if (!["idle", "interaction", "retry"].includes(reason)) return;
     const state = this.state.sandbox;
     if (!state || state.id !== id) return;
+    if (expiration.retryOf && expiration.retryOf !== state.cleanup?.id) return;
     if (
       reason === "idle" &&
       (state.phase !== "waiting_for_user" ||
@@ -631,11 +706,29 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       return;
     if (reason === "retry" && state.phase !== "cleanup_failed") return;
     let checkpointOnly = reason === "idle";
+    const cleanup = {
+      id: crypto.randomUUID(),
+      attempts: attempt + 1,
+      retryAt: null,
+    };
+    let stage: "stop" | "backup" | "destroy" =
+      reason === "retry" ? "destroy" : "stop";
+    const reportStage = () => {
+      if (this.state.sandbox?.id === id)
+        this.setState({
+          ...this.state,
+          sandbox: {
+            ...this.state.sandbox,
+            cleanup: { ...cleanup, stage },
+          },
+        });
+    };
+    reportStage();
     try {
       if (reason === "idle") {
         this.setState({
           ...this.state,
-          sandbox: { ...state, phase: "suspending" },
+          sandbox: { ...this.state.sandbox!, phase: "suspending" },
         });
         if (
           this.state.approval?.status === "pending" &&
@@ -662,18 +755,24 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             5000,
             "Could not stop pending approval turn.",
           );
-          await this.chatTask;
+          await within(
+            this.chatTask ?? Promise.resolve(),
+            5_000,
+            "Chat shutdown timed out.",
+          );
         }
         this.setState({
           ...this.state,
-          sandbox: { ...state, phase: "suspending" },
+          sandbox: { ...this.state.sandbox!, phase: "suspending" },
         });
+        stage = "backup";
+        reportStage();
         await this.checkpoint(id);
         if (!this.usable(id)) return;
       } else if (reason === "interaction") {
         this.setState({
           ...this.state,
-          sandbox: { ...state, phase: "destroying" },
+          sandbox: { ...this.state.sandbox!, phase: "destroying" },
         });
         const active = this.active;
         const run = this.state.run;
@@ -695,18 +794,17 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             "Deadline checkpoint timed out.",
           );
           if (this.state.sandbox?.id === id)
-            this.setState({
-              ...this.state,
-              checkpoint: { backup, threadId: this.state.threadId },
-            });
+            this.saveCheckpoint({ backup, threadId: this.state.threadId });
         } catch {
           /* Expiration must not wait indefinitely for a final checkpoint. */
         }
       }
       checkpointOnly = false;
+      stage = "destroy";
+      reportStage();
       await this.destroyGeneration(id);
     } catch (error) {
-      console.error("Sandbox cleanup failed:", messageOf(error));
+      console.error("Sandbox cleanup failed:", cleanupError(stage, error));
       if (this.state.sandbox?.id !== id) return;
       if (checkpointOnly) {
         if (!this.usable(id)) return;
@@ -715,11 +813,26 @@ export class Chat extends AIChatAgent<Env, CodexState> {
           sandbox: { ...this.state.sandbox, phase: "waiting_for_user" },
         });
       }
-      if (attempt + 1 < MAX_CLEANUP_ATTEMPTS)
+      const retryAt =
+        attempt + 1 < MAX_CLEANUP_ATTEMPTS ? this.now() + 30_000 : null;
+      this.setState({
+        ...this.state,
+        sandbox: {
+          ...this.state.sandbox!,
+          cleanup: {
+            ...cleanup,
+            stage,
+            error: cleanupError(stage, error),
+            retryAt,
+          },
+        },
+      });
+      if (retryAt !== null)
         await this.schedule(30, "expireSandbox", {
           ...expiration,
           reason: checkpointOnly ? "idle" : "retry",
           attempt: attempt + 1,
+          retryOf: cleanup.id,
         });
     }
   }
@@ -772,6 +885,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         ...sandbox,
         phase: this.state.sandbox ? "waiting_for_agent" : "starting",
         waitingSince: undefined,
+        cleanup: undefined,
       },
     });
     this.turnInProgress = true;
@@ -810,7 +924,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               this.sandbox(sandbox.id),
               this.state,
               {
-                repository: this.env.GITHUB_REPOSITORY,
+                repository: GITHUB_REPOSITORY,
                 assertCurrent: () => this.ensureUsable(sandbox.id),
               },
             );

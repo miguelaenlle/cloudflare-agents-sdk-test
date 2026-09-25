@@ -3,14 +3,13 @@ import { promisify } from "node:util";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createHash } from "node:crypto";
-import type { Approval } from "@playground/chat-contract";
+import { GITHUB_REPOSITORY, type Approval } from "@playground/chat-contract";
 
 const exec = promisify(execFile);
 export const EMPTY_BASE = "0".repeat(40);
-export const TEST_REPOSITORY = "miguelaenlle/course-agent-push-sync-test";
 export type Destination = { repository: string; branch: string };
 export function destination(): Destination {
-  const repository = process.env.PUSH_REPOSITORY ?? TEST_REPOSITORY;
+  const repository = GITHUB_REPOSITORY;
   const branch = process.env.PUSH_BRANCH ?? "main";
   if (
     !/^[\w.-]+\/[\w.-]+$/.test(repository) ||

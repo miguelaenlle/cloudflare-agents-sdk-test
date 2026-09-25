@@ -21,7 +21,6 @@ Keep the existing `CODEX_API_KEY` and `RELAY_TOKEN` setup from [testing.md](test
 
    ```dotenv
    CODEX_API_KEY=your-openai-key
-   GITHUB_REPOSITORY=miguelaenlle/course-agent-push-sync-test
    GITHUB_TOKEN=your-repository-pat
    ```
 
@@ -30,7 +29,6 @@ Keep the existing `CODEX_API_KEY` and `RELAY_TOKEN` setup from [testing.md](test
    ```dotenv
    AGENT_URL=http://localhost:8790
    GITHUB_TOKEN=your-repository-pat
-   PUSH_REPOSITORY=miguelaenlle/course-agent-push-sync-test
    PUSH_BRANCH=main
    ```
 
@@ -39,7 +37,7 @@ Keep the existing `CODEX_API_KEY` and `RELAY_TOKEN` setup from [testing.md](test
 
 ## Cloudflare sandbox
 
-Set `vars.GITHUB_REPOSITORY` in `apps/agent/wrangler.jsonc` to `miguelaenlle/course-agent-push-sync-test` and set the shared PAT as a Worker secret:
+The shared `GITHUB_REPOSITORY` constant in `packages/chat-contract/src/index.ts` selects the prototype repository for cloning, outbound Git access and approved publication. Repository selection is not a Wrangler variable. Set the shared PAT as a Worker secret:
 
 ```sh
 pnpm --filter @playground/agent exec wrangler secret put GITHUB_TOKEN --config wrangler.jsonc

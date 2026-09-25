@@ -90,6 +90,10 @@ function routes(
       await provider(request.params).getDiagnostics(clientSignal(response)),
     );
   });
+  app.post(`${base}/cleanup`, async (request, response) => {
+    await provider(request.params).retryCleanup(clientSignal(response));
+    response.sendStatus(202);
+  });
   app.post(base, async (request, response) => {
     const parsed = sendRequestSchema.safeParse(request.body);
     if (!parsed.success) {

@@ -155,6 +155,7 @@ try {
         event.operation === "backup",
     ),
   );
+  const firstCheckpointId = expired.checkpoint.backup.id;
   const restored = await send(newMessage("Continue after idle restoration."));
   for await (const _ of restored) {
   }
@@ -188,6 +189,78 @@ try {
   ).json();
   assert.equal(retained.sandbox.phase, "waiting_for_user");
   assert.equal(retained.sandbox.id, before.sandbox.id);
+  assert.equal(retained.checkpoint.backup.id, firstCheckpointId);
+  const beforeReplacement = await (
+    await fetch(`${fixture}/backup-objects`)
+  ).json();
+  assert.ok(
+    beforeReplacement.includes(`backups/${firstCheckpointId}/data.sqsh`),
+  );
+  const failedDiagnostics = await diagnostics();
+  assert.equal(failedDiagnostics.cleanup.stage, "backup");
+  assert.equal(failedDiagnostics.cleanup.attempts, 1);
+  assert.match(failedDiagnostics.cleanup.error, /backup failed/);
+  assert.ok(failedDiagnostics.cleanup.retryAt);
+  // Exhaust automatic retries using the fixture clock, then recover via the public relay endpoint.
+  for (let attempt = 2; attempt <= 3; attempt++) {
+    await fetch(`${fixture}/fail-backup`, { method: "POST" });
+    await fetch(`${fixture}/advance`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ milliseconds: 31_000 }),
+    });
+    assert.equal((await diagnostics()).cleanup.attempts, attempt);
+  }
+  assert.equal((await diagnostics()).cleanup.retryAt, null);
+  await fetch(`${fixture}/fail-destroy`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ attempts: 1 }),
+  });
+  assert.equal((await fetch(`${api}/cleanup`, { method: "POST" })).status, 202);
+  for (
+    let i = 0;
+    i < 100 && (await diagnostics()).state !== "cleanup_failed";
+    i++
+  )
+    await delay(100);
+  assert.equal((await diagnostics()).state, "cleanup_failed");
+  const unconfirmed = await (await fetch(`${fixture}/state`)).json();
+  assert.notEqual(unconfirmed.checkpoint.backup.id, firstCheckpointId);
+  assert.deepEqual(
+    (await (await fetch(`${fixture}/backup-objects`)).json()).sort(),
+    [
+      `backups/${firstCheckpointId}/data.sqsh`,
+      `backups/${firstCheckpointId}/meta.json`,
+      `backups/${unconfirmed.checkpoint.backup.id}/data.sqsh`,
+      `backups/${unconfirmed.checkpoint.backup.id}/meta.json`,
+    ].sort(),
+  );
+  assert.equal((await fetch(`${api}/cleanup`, { method: "POST" })).status, 202);
+  for (let i = 0; i < 100 && (await diagnostics()).state !== "absent"; i++)
+    await delay(100);
+  assert.equal((await diagnostics()).state, "absent");
+  assert.equal((await diagnostics()).cleanup, undefined);
+  const replacement = await (await fetch(`${fixture}/state`)).json();
+  assert.notEqual(replacement.checkpoint.backup.id, firstCheckpointId);
+  for (let i = 0; i < 50; i++) {
+    const keys = await (await fetch(`${fixture}/backup-objects`)).json();
+    if (keys.length === 2) break;
+    await delay(100);
+  }
+  assert.deepEqual(
+    (await (await fetch(`${fixture}/backup-objects`)).json()).sort(),
+    [
+      `backups/${replacement.checkpoint.backup.id}/data.sqsh`,
+      `backups/${replacement.checkpoint.backup.id}/meta.json`,
+    ],
+  );
+  assert.equal((await fetch(`${api}/cleanup`, { method: "POST" })).status, 409);
+  const afterRetry = await send(newMessage("Continue after cleanup retry."));
+  for await (const _ of afterRetry) {
+  }
+  assert.equal((await diagnostics()).state, "waiting_for_user");
+
   await fetch(`${fixture}/fail-backup`, { method: "POST" });
   const forced = await (
     await fetch(`${fixture}/expire`, { method: "POST" })

@@ -159,7 +159,15 @@ pnpm --filter @playground/agent exec wrangler secret put R2_SECRET_ACCESS_KEY --
 pnpm deploy
 ```
 
+The configuration allows up to five concurrent sandbox containers. Each warm conversation occupies one slot until its sandbox shuts down; closing its browser tab does not free the slot. If startup reports the running-container limit, wait for idle cleanup or increase `containers[].max_instances` and redeploy. Workspace commands and Codex readiness each have a 60-second timeout; Cloudflare container allocation uses the SDK's separate startup/retry budget.
+
 This builds/uploads the container and deploys the Worker. On the first deployment, allow several minutes for the container image to provision before sending a prompt. No automated deployment is added. If upgrading a running prototype, finish or stop its active turn before deploying. Backups expire after 30 days; configure the R2 lifecycle rule described in the [README](../README.md).
+
+After deploying HTTPS egress changes, use a **new conversation** so the container starts with interception and its CA trust configured. Keep `enableInternet = false`; the allowlist permits the configured R2 hostname, GitHub, and the model proxy. Confirm `CLOUDFLARE_ACCOUNT_ID` is your actual account ID before deploying.
+
+To verify suspension, create a file, let the conversation idle, and watch the diagnostics advance through stop, backup, and destroy to `absent`. Check the `codex-playground-backups` bucket, then send another message and confirm the file is restored. Repeat with a pending approval: the review card must survive suspension and its decision must reach the resumed agent.
+
+On cleanup failure, diagnostics retain a safe error, stage, attempt count, and next retry time. The system makes three attempts, 30 seconds apart; afterward use **Retry cleanup**. Failed idle backups retain the sandbox. Backup waiting is bounded at 60 seconds, chat shutdown at five seconds after interruption, and destruction at 30 seconds. A timeout stops waiting; an underlying SDK upload may still finish, but it cannot install a late checkpoint or trigger destruction. The separate interaction deadline still permits destruction if its final backup fails. Error details intentionally omit signed URLs and raw process output.
 
 Set the root `.env.local` to the actual URL printed by Wrangler:
 
@@ -194,3 +202,9 @@ See [feature setup and acceptance checks](conversations-and-approvals.md#manual-
 ## Real Git pushes
 
 [Configure the shared repository read/write PAT and test an empty repository](push-sync-testing.md). Course Sync remains simulated.
+
+## Checkpoint retention
+
+Each conversation references one latest checkpoint. A successful replacement queues the previous backup for deletion; its archive and metadata are deleted only after sandbox destruction is confirmed, because a restored workspace may still use the previous backup. Failed uploads preserve the last checkpoint. Failed deletions remain in durable state and retry after 60 seconds (or the next destruction if the conversation has resumed).
+
+This applies to replacements from this version onward. Previously orphaned backup IDs are no longer associated with conversations in DO state and are not retroactively deleted. Keep the R2 lifecycle rule for those objects and uploads abandoned before their reference was saved. One SDK checkpoint contains two R2 objects, `data.sqsh` and `meta.json`.

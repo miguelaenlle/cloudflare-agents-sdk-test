@@ -3,6 +3,8 @@ import { forwardOpenAI, forwardGitHub } from "./outbound.ts";
 
 export class Sandbox extends CloudflareSandbox {
   enableInternet = false;
+  // Presigned R2 uploads use HTTPS; the SDK configures trust for its interception CA.
+  interceptHttps = true;
   allowedHosts: string[];
 
   constructor(
@@ -25,10 +27,8 @@ export class Sandbox extends CloudflareSandbox {
 }
 
 Sandbox.outboundByHost = {
-  "github.com": (
-    request,
-    env: { GITHUB_REPOSITORY?: string; GITHUB_TOKEN?: string },
-  ) => forwardGitHub(request, env),
+  "github.com": (request, env: { GITHUB_TOKEN?: string }) =>
+    forwardGitHub(request, env),
   "openai.internal": (request, env: { CODEX_API_KEY: string }) =>
     forwardOpenAI(request, env),
 };

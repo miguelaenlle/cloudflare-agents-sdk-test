@@ -276,7 +276,8 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
     resume: true,
   });
   const busy = status === "submitted" || status === "streaming";
-  const stale = revision !== snapshot.revision;
+  // Our pending send/approval reserves a revision before its response arrives.
+  const stale = !sending && revision !== snapshot.revision;
   const approval = snapshot.approval;
   function draft(text: string) {
     setInput(text);
@@ -371,7 +372,7 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
             ? "Working…"
             : "Ready"}
       </p>
-      <SandboxStatus api={api.diagnostics} />
+      <SandboxStatus api={api.diagnostics} retryApi={api.cleanup} />
       <Transcript
         messages={messages}
         snapshot={snapshot}

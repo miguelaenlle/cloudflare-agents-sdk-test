@@ -350,13 +350,19 @@ export class TestSandbox extends DurableObject {
         path.startsWith("/workspace/"),
       ),
     );
+    const id = crypto.randomUUID();
+    const bucket = (this.env as { BACKUP_BUCKET: R2Bucket }).BACKUP_BUCKET;
+    await bucket.put(`backups/${id}/data.sqsh`, JSON.stringify(state.backup));
+    await bucket.put(`backups/${id}/meta.json`, JSON.stringify({ id }));
     await this.save(state);
-    return { id: "test-backup", dir: "/workspace" };
+    return { id, dir: "/workspace" };
   }
-  async restoreBackup() {
+  async restoreBackup(backup: { id: string }) {
     const state = await this.state();
-    if (!state.backup) throw new Error("No backup");
-    state.files = { ...state.backup };
+    const bucket = (this.env as { BACKUP_BUCKET: R2Bucket }).BACKUP_BUCKET;
+    const archive = await bucket.get(`backups/${backup.id}/data.sqsh`);
+    if (!archive) throw new Error("No backup");
+    state.files = await archive.json<Record<string, string>>();
     state.restores++;
     // The saved native session is idle. Work lost since that checkpoint is not replayed.
     state.turns = state.turns.filter((turn) => turn.status !== "inProgress");

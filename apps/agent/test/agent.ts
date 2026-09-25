@@ -80,6 +80,7 @@ export class Chat extends ProductionChat {
         reason: string;
       }>()) {
         if (
+          schedule.callback === "expireSandbox" &&
           schedule.payload.id === lifecycle.id &&
           schedule.payload.reason === "interaction"
         )
@@ -139,6 +140,10 @@ export class Chat extends ProductionChat {
     }
     if (path.endsWith("/test/schedules"))
       return Response.json(this.getSchedules());
+    if (path.endsWith("/test/backup-objects")) {
+      const objects = await this.env.BACKUP_BUCKET.list({ prefix: "backups/" });
+      return Response.json(objects.objects.map((object) => object.key));
+    }
     if (path.endsWith("/test/state")) return Response.json(this.state);
     if (path.endsWith("/test/backups"))
       return Response.json(await this.fixture().backupEvents());

@@ -1,3 +1,4 @@
+import { cleanupError } from "../cleanup-error.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { UIMessageChunk } from "ai";
@@ -70,6 +71,60 @@ test("recovery never starts or restores a missing container", async () => {
     ContainerLost,
   );
 });
+test("startup explains container capacity failures without exposing raw errors", async () => {
+  const sandbox = {
+    exists: async () => {
+      throw new Error(
+        "Maximum number of running container instances exceeded. private-test-key",
+      );
+    },
+  } as unknown as CodexSandbox;
+  await assert.rejects(connectCodex(sandbox, {}), (error: Error) => {
+    assert.match(error.message, /allocating the container/);
+    assert.match(error.message, /running-container limit is reached/);
+    assert.match(error.message, /max_instances/);
+    assert.doesNotMatch(error.message, /private-test-key/);
+    return true;
+  });
+});
+
+test("startup identifies backup failures without exposing arbitrary SDK output", async () => {
+  const sandbox = {
+    exists: async () => ({ exists: false }),
+    restoreBackup: async () => {
+      throw new Error("private-test-key");
+    },
+  } as unknown as CodexSandbox;
+  await assert.rejects(
+    connectCodex(sandbox, {
+      checkpoint: { backup: { id: "backup", dir: "/workspace" } },
+    }),
+    (error: Error) => {
+      assert.match(error.message, /restoring the workspace backup/);
+      assert.doesNotMatch(error.message, /private-test-key/);
+      return true;
+    },
+  );
+});
+
+test("startup bounds app-server readiness and reports its timeout", async () => {
+  const sandbox = {
+    exists: async () => ({ exists: true }),
+    getProcess: async () => ({
+      status: "starting",
+      waitForPort: async (port: number, options: unknown) => {
+        assert.equal(port, 4500);
+        assert.deepEqual(options, { path: "/readyz", timeout: 60_000 });
+        throw new Error("Process timed out");
+      },
+    }),
+  } as unknown as CodexSandbox;
+  await assert.rejects(
+    connectCodex(sandbox, {}),
+    /readiness.*60-second limit.*timed out/,
+  );
+});
+
 test("credential handler injects only into allowed OpenAI requests", async () => {
   let calls = 0;
   const send: typeof fetch = async (request) => {
@@ -232,7 +287,6 @@ test("steering splits live text and reasoning without duplicating completion sna
 test("Git credential injection only permits configured repository reads and blocks redirects", async () => {
   let calls = 0;
   const env = {
-    GITHUB_REPOSITORY: "owner/course",
     GITHUB_TOKEN: "private-token",
   };
   const send: typeof fetch = async (input) => {
@@ -240,7 +294,7 @@ test("Git credential injection only permits configured repository reads and bloc
     assert.ok(input instanceof Request);
     assert.equal(
       input.url,
-      "https://github.com/owner/course.git/info/refs?service=git-upload-pack",
+      "https://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-upload-pack",
     );
     assert.equal(
       input.headers.get("Authorization"),
@@ -254,7 +308,7 @@ test("Git credential injection only permits configured repository reads and bloc
       (
         await forwardGitHub(
           new Request(
-            `${scheme}://github.com/owner/course.git/info/refs?service=git-upload-pack`,
+            `${scheme}://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-upload-pack`,
             { headers: { cookie: "untrusted" } },
           ),
           env,
@@ -266,9 +320,9 @@ test("Git credential injection only permits configured repository reads and bloc
   }
   for (const url of [
     "https://github.com/other/repo.git/info/refs?service=git-upload-pack",
-    "https://github.com/owner/course.git/git-receive-pack",
-    "https://github.com/owner/course.git/info/refs?service=git-receive-pack",
-    "https://github.com/owner/course.git/info/refs?service=git-upload-pack&other=1",
+    "https://github.com/miguelaenlle/course-agent-push-sync-test.git/git-receive-pack",
+    "https://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-receive-pack",
+    "https://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-upload-pack&other=1",
   ]) {
     assert.equal(
       (await forwardGitHub(new Request(url), env, send)).status,
@@ -280,7 +334,7 @@ test("Git credential injection only permits configured repository reads and bloc
     (
       await forwardGitHub(
         new Request(
-          "https://github.com/owner/course.git/info/refs?service=git-upload-pack",
+          "https://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-upload-pack",
         ),
         env,
         async () =>
@@ -318,4 +372,31 @@ test("approval capture preserves file bytes even when exec stdout is trimmed", a
   assert.equal(result.diff, diff);
   assert.equal(deleted, path);
   assert.match(path, /^\/tmp\/approval-[\w-]+\.patch$/);
+});
+
+test("cleanup diagnostics classify failures without retaining credentials or signed URLs", () => {
+  assert.match(
+    cleanupError(
+      "backup",
+      new Error("curl: (28) Failed to connect to host?signature=secret"),
+    ),
+    /connect to R2/,
+  );
+  assert.match(
+    cleanupError("backup", new Error("curl: (60) SSL certificate failure")),
+    /TLS verification/,
+  );
+  assert.match(
+    cleanupError("backup", new Error("403 AccessDenied secret")),
+    /bucket permissions/,
+  );
+  assert.match(
+    cleanupError("stop", new Error("Stop timed out")),
+    /stop timed out/,
+  );
+  for (const stage of ["stop", "backup", "destroy"] as const)
+    assert.doesNotMatch(
+      cleanupError(stage, new Error("https://r2.test?signature=secret")),
+      /secret|signature|https/,
+    );
 });

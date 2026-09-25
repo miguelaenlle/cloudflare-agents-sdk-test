@@ -30,12 +30,48 @@ function Expiration({
   );
 }
 
-export function SandboxStatus({ api }: { api: string }) {
+export function SandboxStatus({
+  api,
+  retryApi,
+}: {
+  api: string;
+  retryApi: string;
+}) {
   const [diagnostics, setDiagnostics] = useState<SandboxDiagnostics | null>(
     null,
   );
   const [unavailable, setUnavailable] = useState(false);
   const [now, setNow] = useState(Date.now);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState("");
+
+  async function retryCleanup() {
+    setRetrying(true);
+    setRetryError("");
+    try {
+      const response = await fetch(retryApi, {
+        method: "POST",
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok)
+        throw new Error(
+          "Could not retry cleanup. Refresh diagnostics and try again.",
+        );
+      const next = await fetch(api, {
+        signal: AbortSignal.timeout(5000),
+        cache: "no-store",
+      });
+      if (!next.ok)
+        throw new Error("Cleanup requested, but diagnostics are unavailable.");
+      setDiagnostics(sandboxDiagnosticsSchema.parse(await next.json()));
+    } catch (error) {
+      setRetryError(
+        error instanceof Error ? error.message : "Cleanup retry failed.",
+      );
+    } finally {
+      setRetrying(false);
+    }
+  }
 
   // Read-only polling also observes lifecycle changes when no chat stream is attached.
   useEffect(() => {
@@ -81,11 +117,41 @@ export function SandboxStatus({ api }: { api: string }) {
           <div>
             State: <code>{diagnostics.state}</code>
           </div>
-          <Expiration
-            label="Idle expiration"
-            at={diagnostics.idleExpiresAt}
-            now={now}
-          />
+          {diagnostics.cleanup?.error ? (
+            <div role="alert">
+              <strong>
+                {diagnostics.cleanup.stage === "destroy"
+                  ? "Sandbox destruction unconfirmed."
+                  : "Cleanup failed; sandbox retained."}
+              </strong>
+              <div>{diagnostics.cleanup.error}</div>
+              <div>
+                Attempts: {diagnostics.cleanup.attempts}.{" "}
+                {diagnostics.cleanup.retryAt === null
+                  ? "Automatic retries exhausted."
+                  : `Next retry: ${new Date(diagnostics.cleanup.retryAt).toLocaleTimeString()}.`}
+              </div>
+              <button
+                type="button"
+                disabled={retrying}
+                onClick={() => void retryCleanup()}
+              >
+                {retrying ? "Requesting cleanup…" : "Retry cleanup"}
+              </button>
+            </div>
+          ) : (
+            <>
+              {diagnostics.cleanup && (
+                <div>Cleanup stage: {diagnostics.cleanup.stage}</div>
+              )}
+              <Expiration
+                label="Idle expiration"
+                at={diagnostics.idleExpiresAt}
+                now={now}
+              />
+            </>
+          )}
+          {retryError && <p role="alert">{retryError}</p>}
           <Expiration
             label="Interaction expiration"
             at={diagnostics.interactionExpiresAt}

@@ -89,7 +89,7 @@ See [real-push setup and constraints](push-sync-testing.md). PL applies the stor
 
 ## Git and credentials
 
-Set Worker variable `GITHUB_REPOSITORY=owner/repository` (without `.git`) and Worker secret `GITHUB_TOKEN` using a fine-grained GitHub token with Contents: Read and write for that repository. Configure the same `GITHUB_TOKEN` on the PL relay for approved pushes; the Worker still restricts sandbox traffic to read-only Git endpoints. New sandboxes clone it into `/workspace/repo`. Existing warm workspaces/backups are not rewritten; create a new conversation to change the course repository.
+The shared `GITHUB_REPOSITORY` constant in `packages/chat-contract/src/index.ts` selects the prototype repository (without `.git`) for sandbox cloning, the outbound allowlist and relay publication. In PrairieLearn this will come from the authorized course, not deployment configuration. Set Worker secret `GITHUB_TOKEN` using a fine-grained GitHub token with Contents: Read and write for that repository, and configure the same token on the relay. Existing warm workspaces/backups are not rewritten; create a new conversation after changing the repository constant.
 
 The outbound handler injects Basic authorization outside the sandbox for exactly the repository's smart-HTTP `info/refs?service=git-upload-pack` and `git-upload-pack` endpoints. This covers HTTPS clone/fetch/pull. It denies pushes, other repositories, redirects, SSH, Git LFS, submodules on other repositories, and arbitrary GitHub API requests. The prototype has **one configured course repository per Worker deployment**; conversation isolation does not imply separate repository scopes. The token never goes into a container environment, Git config, backup, or tool result.
 
@@ -98,8 +98,8 @@ Production Worker HTTP and WebSocket entry points require a shared `RELAY_TOKEN`
 ## Manual testing
 
 1. Install dependencies with `pnpm install --frozen-lockfile`. Keep using the existing Docker/Worker/relay/UI setup in [testing.md](testing.md).
-2. For local inference, put `CODEX_API_KEY`, optionally `GITHUB_TOKEN`, and `GITHUB_REPOSITORY` in ignored `apps/agent/.dev.vars`. Run `pnpm dev:agent`, `pnpm dev:server:local`, and `pnpm dev` in separate terminals. No deployment is required.
-3. For Cloudflare, add `GITHUB_REPOSITORY` to Worker vars if testing a real repository; set `GITHUB_TOKEN` and `RELAY_TOKEN` using `wrangler secret put`. Put the same `RELAY_TOKEN` in root `.env.local`. Manually run `pnpm deploy`, then restart `pnpm dev:server`. The new relay authentication requirement is intentional; an old relay without the token receives 401.
+2. For local inference, put `CODEX_API_KEY` and `GITHUB_TOKEN` in ignored `apps/agent/.dev.vars`. Run `pnpm dev:agent`, `pnpm dev:server:local`, and `pnpm dev` in separate terminals. No deployment is required.
+3. For Cloudflare, set `GITHUB_TOKEN` and `RELAY_TOKEN` using `wrangler secret put`. Put the same `RELAY_TOKEN` in root `.env.local`. Manually run `pnpm deploy`, then restart `pnpm dev:server`. The new relay authentication requirement is intentional; an old relay without the token receives 401.
 4. Click **New conversation**. Existing native threads keep their original dynamic-tool definitions; use a new thread for `push_sync` testing. Ask it to do a multi-step task, send a correction while active, and inspect the steering marker and optional reasoning summary. Reload and check persistence.
 5. Duplicate the tab. Send in one tab. The other should report stale state, retain any draft, and disable Send until **Refresh history**. Create another conversation and confirm its history is independent.
 6. With a configured repository, ask for `git fetch origin` / `git pull --ff-only`; check success. Requests to another repository or push endpoints must fail. Credentials must not appear in the remote URL or environment.

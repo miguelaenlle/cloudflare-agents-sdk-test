@@ -1,3 +1,5 @@
+import { GITHUB_REPOSITORY } from "@playground/chat-contract";
+
 // This executes in Workers, never inside the Linux container.
 export async function forwardOpenAI(
   request: Request,
@@ -36,10 +38,10 @@ export async function forwardOpenAI(
 
 export async function forwardGitHub(
   request: Request,
-  env: { GITHUB_REPOSITORY?: string; GITHUB_TOKEN?: string },
+  env: { GITHUB_TOKEN?: string },
   send: typeof fetch = fetch,
 ): Promise<Response> {
-  const repo = env.GITHUB_REPOSITORY;
+  const repo = GITHUB_REPOSITORY;
   const url = new URL(request.url);
   if (
     !repo ||

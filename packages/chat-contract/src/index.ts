@@ -1,6 +1,9 @@
 import type { UIMessage, UIMessageChunk } from "ai";
 import { z } from "zod";
 
+// Prototype course configuration; PrairieLearn will resolve this from the authorized course.
+export const GITHUB_REPOSITORY = "miguelaenlle/course-agent-push-sync-test";
+
 export const CONVERSATION_ID = "playground";
 export const CHAT_API = "/api/chat";
 export const HISTORY_API = `${CHAT_API}/history`;
@@ -15,6 +18,15 @@ export const sendRequestSchema = z.object({
 });
 export type SendRequest = z.infer<typeof sendRequestSchema>;
 
+export const cleanupDiagnosticsSchema = z.object({
+  id: z.string(),
+  stage: z.enum(["stop", "backup", "destroy"]),
+  attempts: z.number().int().positive(),
+  error: z.string().optional(),
+  retryAt: z.number().nullable(),
+});
+export type CleanupDiagnostics = z.infer<typeof cleanupDiagnosticsSchema>;
+
 export const sandboxDiagnosticsSchema = z.object({
   state: z.enum([
     "absent",
@@ -25,6 +37,7 @@ export const sandboxDiagnosticsSchema = z.object({
     "destroying",
     "cleanup_failed",
   ]),
+  cleanup: cleanupDiagnosticsSchema.optional(),
   idleExpiresAt: z.number().nullable(),
   interactionExpiresAt: z.number().nullable(),
 });
@@ -43,6 +56,7 @@ export interface ChatProvider {
     signal: AbortSignal,
   ): Promise<void>;
   getDiagnostics(signal: AbortSignal): Promise<SandboxDiagnostics>;
+  retryCleanup(signal: AbortSignal): Promise<void>;
   getHistory(signal: AbortSignal): Promise<UIMessage[]>;
   send(input: SendRequest, signal: AbortSignal): Promise<void>;
   cancel(signal: AbortSignal): Promise<void>;
@@ -56,6 +70,7 @@ export function conversationApi(id: string) {
     history: `${chat}/history`,
     snapshot: `${chat}/snapshot`,
     diagnostics: `${chat}/diagnostics`,
+    cleanup: `${chat}/cleanup`,
     cancel: `${chat}/cancel`,
     approval: `${chat}/approval`,
   };

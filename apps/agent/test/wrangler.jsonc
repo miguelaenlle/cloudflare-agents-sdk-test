@@ -14,6 +14,7 @@
       { "name": "TestSandbox", "class_name": "TestSandbox" },
     ],
   },
+  "r2_buckets": [{ "binding": "BACKUP_BUCKET", "bucket_name": "test-backups" }],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Chat", "TestSandbox"] },
   ],

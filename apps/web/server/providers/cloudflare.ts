@@ -86,6 +86,9 @@ export function createCloudflareProvider(
       const response = await request("diagnostics", "GET", signal);
       return sandboxDiagnosticsSchema.parse(await response.json());
     },
+    async retryCleanup(signal) {
+      await request("cleanup", "POST", signal);
+    },
     async getHistory(signal) {
       const response = await request("get-messages", "GET", signal);
       const messages: unknown = await response.json();
