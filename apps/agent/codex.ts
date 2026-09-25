@@ -18,6 +18,7 @@ export type Run = {
   status: "running" | "completed" | "cancelled" | "failed" | "interrupted";
 };
 export type CodexState = {
+  revision?: number;
   sandbox?: {
     id: string;
     phase:
