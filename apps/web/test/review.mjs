@@ -167,18 +167,37 @@ try {
 
   const before = await (await fetch(`${fixture}/state`)).json();
   await fetch(`${fixture}/stale-idle`);
-  assert.equal((await (await fetch(`${fixture}/state`)).json()).sandbox.id, before.sandbox.id);
-  await fetch(`${fixture}/expire-old`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id: "old-generation"})});
-  assert.equal((await (await fetch(`${fixture}/state`)).json()).sandbox.id, before.sandbox.id);
-  await fetch(`${fixture}/fail-backup`, {method: "POST"});
-  const retained = await (await fetch(`${fixture}/advance`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({milliseconds: 601000})})).json();
+  assert.equal(
+    (await (await fetch(`${fixture}/state`)).json()).sandbox.id,
+    before.sandbox.id,
+  );
+  await fetch(`${fixture}/expire-old`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: "old-generation" }),
+  });
+  assert.equal(
+    (await (await fetch(`${fixture}/state`)).json()).sandbox.id,
+    before.sandbox.id,
+  );
+  await fetch(`${fixture}/fail-backup`, { method: "POST" });
+  const retained = await (
+    await fetch(`${fixture}/advance`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ milliseconds: 601000 }),
+    })
+  ).json();
   assert.equal(retained.sandbox.phase, "waiting_for_user");
   assert.equal(retained.sandbox.id, before.sandbox.id);
-  await fetch(`${fixture}/fail-backup`, {method: "POST"});
-  const forced = await (await fetch(`${fixture}/expire`, {method: "POST"})).json();
+  await fetch(`${fixture}/fail-backup`, { method: "POST" });
+  const forced = await (
+    await fetch(`${fixture}/expire`, { method: "POST" })
+  ).json();
   assert.equal(forced.sandbox, undefined);
-  console.log("Passed: stale callbacks cannot destroy a new generation; idle backup failure retains the box, deadline failure still destroys it.");
-
+  console.log(
+    "Passed: stale callbacks cannot destroy a new generation; idle backup failure retains the box, deadline failure still destroys it.",
+  );
 } catch (error) {
   console.error(logs.slice(-12_000));
   throw error;
