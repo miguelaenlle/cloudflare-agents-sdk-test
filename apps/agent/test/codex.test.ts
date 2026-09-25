@@ -195,3 +195,35 @@ test("model redirects are blocked without exposing the destination", async () =>
   assert.equal(response.status, 502);
   assert.equal(response.headers.has("Location"), false);
 });
+
+test("steering splits live text and reasoning without duplicating completion snapshots", () => {
+  const chunks: UIMessageChunk[] = [];
+  const events = new CodexEvents((chunk) => chunks.push(chunk), "r");
+  events.accept({
+    method: "item/agentMessage/delta",
+    params: { threadId: "t", turnId: "u", itemId: "text", delta: "Hello " },
+  });
+  events.accept({
+    method: "item/reasoning/summaryTextDelta",
+    params: {
+      threadId: "t",
+      turnId: "u",
+      itemId: "thought",
+      summaryIndex: 0,
+      delta: "Checking",
+    },
+  });
+  events.steering("user-2", "Use a different approach.");
+  events.item(text);
+  events.finish();
+  assert.equal(
+    chunks
+      .filter((c) => c.type === "text-delta")
+      .map((c) => c.delta)
+      .join(""),
+    "Hello world",
+  );
+  const marker = chunks.findIndex((c) => c.type === "data-steering");
+  assert.ok(chunks.slice(0, marker).some((c) => c.type === "reasoning-end"));
+  assert.ok(chunks.slice(marker + 1).some((c) => c.type === "text-start"));
+});

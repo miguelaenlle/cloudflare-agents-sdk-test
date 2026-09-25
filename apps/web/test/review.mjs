@@ -107,10 +107,6 @@ try {
   await ready(`${api}/history`);
   assert.deepEqual(await history(), []);
   const first = await firstText(await send());
-  assert.equal(
-    (await submit(newMessage("Do not start a second turn."))).status,
-    409,
-  );
   await stopServer();
   await assert.rejects(async () => {
     while (!(await first.read()).done) {}
@@ -250,6 +246,34 @@ try {
   );
   console.log(
     "Passed: independent conversation history, stale revision rejection and catalog persistence.",
+  );
+
+  const steered = await firstText(
+    await send(newMessage("Start a steerable turn.")),
+  );
+  const correction = newMessage("Use the updated instructions.");
+  assert.equal((await submit(correction)).status, 204);
+  assert.equal((await submit(correction)).status, 204);
+  let marker = false;
+  while (true) {
+    const next = await steered.read();
+    if (next.done) break;
+    if (
+      next.value.type === "data-steering" &&
+      next.value.data.id === correction.id
+    )
+      marker = true;
+  }
+  assert.ok(marker);
+  assert.ok(
+    (await history()).some((m) =>
+      m.parts.some(
+        (p) => p.type === "data-steering" && p.data.id === correction.id,
+      ),
+    ),
+  );
+  console.log(
+    "Passed: steering acknowledgment is interleaved and persisted without duplicate submission.",
   );
 } catch (error) {
   console.error(logs.slice(-12_000));

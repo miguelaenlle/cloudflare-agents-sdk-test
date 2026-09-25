@@ -1,7 +1,7 @@
 import type { UIMessageChunk } from "ai";
 import type { AppServer } from "./app-server.ts";
 import { CodexEvents } from "./codex-events.ts";
-import type { Turn } from "./protocol.ts";
+import type { Turn, TurnSteerParams } from "./protocol.ts";
 
 export type CodexTurn = Awaited<ReturnType<typeof openCodexTurn>>;
 
@@ -61,11 +61,23 @@ export async function openCodexTurn(
         threadId: thread.id,
         // Cloudflare owns isolation and outbound network restrictions.
         sandboxPolicy: { type: "externalSandbox", networkAccess: "restricted" },
+        summary: "auto",
         clientUserMessageId: messageId,
         input: [{ type: "text", text: prompt, text_elements: [] }],
       });
       turnId = turn.id;
       return turn;
+    },
+    async steer(input: TurnSteerParams) {
+      const result = await control(client.request("turn/steer", input));
+      events.steering(
+        input.clientUserMessageId ?? crypto.randomUUID(),
+        input.input
+          .filter((p) => p.type === "text")
+          .map((p) => p.text)
+          .join("\n"),
+      );
+      return result;
     },
     interrupt(turnId: string) {
       return control(
