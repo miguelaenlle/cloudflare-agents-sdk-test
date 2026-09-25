@@ -6,7 +6,9 @@ import {
   type UIMessageChunk,
 } from "ai";
 import {
+  approvalOutcomeSchema,
   ChatError,
+  type ApprovalDecision,
   sendRequestSchema,
   type SendRequest,
   type SandboxDiagnostics,
@@ -24,7 +26,8 @@ import {
   type CodexState,
   type Run,
 } from "./codex.ts";
-import type { Turn } from "./protocol.ts";
+import { captureApproval, toolResult } from "./approval.ts";
+import type { DynamicToolCallResponse, Turn } from "./protocol.ts";
 
 export interface Env {
   Sandbox: DurableObjectNamespace<Sandbox>;
@@ -56,6 +59,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
   private acceptance?: { resolve(): void; reject(error: unknown): void };
   private turnInProgress = false;
   private recovery?: Promise<void>;
+  private approvalResult?: (result: DynamicToolCallResponse) => void;
 
   protected get interactionTimeoutMs() {
     return USER_IDLE_MS;
@@ -113,9 +117,39 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         {
           messages: this.messages,
           revision: this.state.revision ?? 0,
+          blocked:
+            !!this.state.approvalDelivery ||
+            !!this.state.approvalPreparing ||
+            this.state.approval?.status === "pending",
+          approval: this.state.approval,
+          approvals: [
+            ...(this.state.approvalHistory ?? []),
+            ...(this.state.approval ? [this.state.approval] : []),
+          ],
         },
         { headers: { "Cache-Control": "no-store" } },
       );
+    }
+    if (request.method === "POST" && path.endsWith("/approval")) {
+      const parsed = approvalOutcomeSchema.safeParse(
+        await request.json().catch(() => null),
+      );
+      if (!parsed.success)
+        return Response.json(
+          { error: "Invalid approval decision." },
+          { status: 400 },
+        );
+      const operation = this.controlTail.then(() => this.decide(parsed.data));
+      this.controlTail = operation.catch(() => {});
+      try {
+        await operation;
+        return new Response(null, { status: 204 });
+      } catch (error) {
+        return Response.json(
+          { error: messageOf(error) },
+          { status: error instanceof ChatError ? error.status : 503 },
+        );
+      }
     }
     if (request.method === "GET" && path.endsWith("/diagnostics")) {
       const sandbox = this.state.sandbox;
@@ -167,13 +201,22 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     }
   }
 
-  private async send(input: SendRequest) {
+  private async send(input: SendRequest, continuation = false) {
     if (this.messages.some((message) => message.id === input.id)) return;
-    {
+    if (!continuation) {
       if (input.expectedRevision !== (this.state.revision ?? 0))
         throw new ChatError(
           409,
           "This conversation changed in another tab. Refresh history; your draft is preserved.",
+        );
+      if (
+        this.state.approval?.status === "pending" ||
+        this.state.approvalDelivery ||
+        this.state.approvalPreparing
+      )
+        throw new ChatError(
+          409,
+          "Resolve the pending approval before sending another message.",
         );
     }
     // Reserve the revision before async submission: an uncertain acknowledgment must not accept another stale send.
@@ -181,6 +224,9 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     const message = {
       id: input.id,
       role: "user" as const,
+      ...(continuation
+        ? { metadata: { source: "approval-result", approvalId: input.id } }
+        : {}),
       parts: [{ type: "text" as const, text: input.text }],
     };
     const run = this.state.run;
@@ -244,6 +290,130 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     } finally {
       this.acceptance = undefined;
     }
+  }
+
+  private async decide(input: ApprovalDecision & { result: string }) {
+    const receipt = this.state.approvalReceipts?.[input.id];
+    if (receipt) {
+      if (
+        receipt.digest !== input.digest ||
+        receipt.approved !== input.approved
+      )
+        throw new ChatError(409, "A different decision was already recorded.");
+      return;
+    }
+    const approval = this.state.approval;
+    if (
+      !approval ||
+      approval.id !== input.id ||
+      approval.digest !== input.digest
+    )
+      throw new ChatError(409, "This approval is no longer current.");
+    if (approval.status !== "pending") {
+      if ((approval.status === "approved") !== input.approved)
+        throw new ChatError(409, "A different decision was already recorded.");
+      if (!this.state.approvalDelivery) return;
+    } else {
+      if (input.expectedRevision !== (this.state.revision ?? 0))
+        throw new ChatError(
+          409,
+          "Conversation changed. Refresh before deciding.",
+        );
+      this.setState({
+        ...this.state,
+        revision: (this.state.revision ?? 0) + 1,
+        approvalDelivery: approval.id,
+        approval: {
+          ...approval,
+          status: input.approved ? "approved" : "denied",
+          result: input.result,
+        },
+      });
+    }
+    if (
+      this.state.sandbox &&
+      ["suspending", "destroying", "cleanup_failed"].includes(
+        this.state.sandbox.phase,
+      )
+    )
+      throw new ChatError(
+        409,
+        "Sandbox cleanup is pending. Retry result delivery after cleanup.",
+      );
+    const result = this.state.approval!.result!;
+    if (this.approvalResult && this.active && !this.active.terminal) {
+      this.setState({
+        ...this.state,
+        sandbox: {
+          ...this.state.sandbox!,
+          phase: "waiting_for_agent",
+          waitingSince: undefined,
+        },
+      });
+      await this.interaction();
+      this.approvalResult(toolResult(result));
+      this.approvalResult = undefined;
+      this.setState({
+        ...this.state,
+        approvalDelivery: undefined,
+        approvalReceipts: {
+          ...this.state.approvalReceipts,
+          [input.id]: { digest: input.digest, approved: input.approved },
+        },
+      });
+      return;
+    }
+    // A stopped app-server cannot receive an old RPC response. Resume its thread with the durable outcome instead.
+    await this.send(
+      {
+        id: approval.id,
+        text: `push_sync result for operation ${approval.id}: ${result}`,
+        expectedRevision: this.state.revision ?? 0,
+      },
+      true,
+    );
+    this.setState({
+      ...this.state,
+      approvalDelivery: undefined,
+      approvalReceipts: {
+        ...this.state.approvalReceipts,
+        [input.id]: { digest: input.digest, approved: input.approved },
+      },
+    });
+  }
+
+  private async requestApproval(args: unknown, captured: (id: string) => void) {
+    if (
+      this.state.approval?.status === "pending" ||
+      this.state.approvalPreparing
+    )
+      throw new Error("An approval is already pending.");
+    const run = this.state.run!;
+    this.setState({ ...this.state, approvalPreparing: true });
+    let approval;
+    try {
+      approval = await captureApproval(this.sandbox(run.sandboxId), args);
+    } finally {
+      this.setState({ ...this.state, approvalPreparing: false });
+    }
+    this.ensureUsable(run.sandboxId);
+    if (this.state.run?.id !== run.id || !this.active || this.active.terminal)
+      throw new Error("Approval turn is no longer active.");
+    const result = new Promise<DynamicToolCallResponse>((resolve) => {
+      this.approvalResult = resolve;
+    });
+    this.setState({
+      ...this.state,
+      approval,
+      approvalHistory: [
+        ...(this.state.approvalHistory ?? []),
+        ...(this.state.approval ? [this.state.approval] : []),
+      ],
+    });
+    captured(approval.id);
+    // The turn is blocked on a native tool response, so the same idle policy applies as waiting for a user prompt.
+    await this.finishRun(run, "running");
+    return result;
   }
 
   private async cancel() {
@@ -466,6 +636,33 @@ export class Chat extends AIChatAgent<Env, CodexState> {
           ...this.state,
           sandbox: { ...state, phase: "suspending" },
         });
+        if (
+          this.state.approval?.status === "pending" &&
+          this.state.run?.status === "running" &&
+          !this.active
+        )
+          await this.reconcile();
+        if (this.state.sandbox?.id !== id) return;
+        if (
+          this.active &&
+          this.state.run?.turnId &&
+          this.state.approval?.status === "pending"
+        ) {
+          const active = this.active;
+          const turnId = this.state.run.turnId;
+          this.approvalResult?.(
+            toolResult(
+              "Approval remains pending. Pause now; the decision will be delivered after resumption.",
+            ),
+          );
+          this.approvalResult = undefined;
+          await within(
+            active.interrupt(turnId).then(() => active.completed),
+            5000,
+            "Could not stop pending approval turn.",
+          );
+          await this.chatTask;
+        }
         this.setState({
           ...this.state,
           sandbox: { ...state, phase: "suspending" },
@@ -622,6 +819,20 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               model: this.env.CODEX_MODEL,
               runId: run.id,
               write,
+              onPushSync: (params) => {
+                if (
+                  params.tool !== "push_sync" ||
+                  params.threadId !== this.state.threadId ||
+                  params.turnId !== this.state.run?.turnId
+                )
+                  throw new Error("Unknown tool request.");
+                return Promise.race([
+                  this.requestApproval(params.arguments, (id) =>
+                    write({ type: "data-approval", id, data: { id } }),
+                  ),
+                  client!.disconnected,
+                ]);
+              },
               onTurnStarted: (turnId) =>
                 this.setRun({ ...this.state.run!, turnId }),
             });
@@ -662,6 +873,12 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             await execution?.close();
             client?.close();
             this.active = undefined;
+            this.approvalResult?.(
+              toolResult(
+                "Turn ended. Approval decision will be delivered on continuation.",
+              ),
+            );
+            this.approvalResult = undefined;
             if (!this.usable(run.sandboxId))
               failure = new Error(expiredMessage);
             if (failure) {

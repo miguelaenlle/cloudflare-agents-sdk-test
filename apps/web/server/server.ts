@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   ChatError,
   sendRequestSchema,
+  approvalDecisionSchema,
   type ChatProvider,
 } from "@playground/chat-contract";
 import { createCloudflareProvider } from "./providers/cloudflare.ts";
@@ -11,6 +12,9 @@ import {
   listConversations,
   createConversation,
   hasConversation,
+  recordDecision,
+  pendingDecisions,
+  deliveredDecision,
 } from "./conversations.ts";
 
 const config = z
@@ -96,6 +100,31 @@ function routes(
     await provider(request.params).cancel(clientSignal(response));
     response.status(204).end();
   });
+  app.post(`${base}/approval`, async (request, response) => {
+    const parsed = approvalDecisionSchema.safeParse(request.body);
+    if (!parsed.success) {
+      response.status(400).send("Invalid approval decision.");
+      return;
+    }
+    const chat = provider(request.params);
+    const snapshot = await chat.getSnapshot(clientSignal(response));
+    const approval = snapshot.approval;
+    if (
+      !approval ||
+      approval.id !== parsed.data.id ||
+      approval.digest !== parsed.data.digest ||
+      (approval.status === "pending" &&
+        snapshot.revision !== parsed.data.expectedRevision)
+    )
+      throw new ChatError(409, "Approval changed. Refresh before deciding.");
+    const outcome = await recordDecision(
+      conversationId(request.params),
+      parsed.data,
+    );
+    await chat.decide(outcome, AbortSignal.timeout(30_000));
+    deliveredDecision(outcome.id);
+    response.status(204).end();
+  });
   app.get(`${base}/:chatId/stream`, async (request, response) => {
     if (request.params.chatId !== conversationId(request.params))
       throw new ChatError(404, "Conversation not found.");
@@ -143,6 +172,28 @@ const handleError: ErrorRequestHandler = (error, _request, response, _next) => {
     .send("Agent unavailable. Check the backend terminal and reconnect.");
 };
 app.use(handleError);
+let delivering = false;
+// Durable result delivery continues after a browser disconnect or relay restart.
+const deliveryTimer = setInterval(async () => {
+  if (delivering) return;
+  delivering = true;
+  try {
+    for (const { conversationId, input } of pendingDecisions()) {
+      try {
+        await createCloudflareProvider(
+          new URL(config.AGENT_URL),
+          conversationId,
+        ).decide(input, AbortSignal.timeout(30_000));
+        deliveredDecision(input.id);
+      } catch {
+        /* Keep the receipt for retry, including while sandbox cleanup is finishing. */
+      }
+    }
+  } finally {
+    delivering = false;
+  }
+}, 2000);
+deliveryTimer.unref();
 app.listen(config.PORT, "127.0.0.1", () =>
   console.log(`Chat relay listening on http://127.0.0.1:${config.PORT}`),
 );
