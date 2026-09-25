@@ -801,16 +801,16 @@ try {
   await fetch(`http://127.0.0.1:8791/agents/chat/${created.id}/test/approval`, {
     method: "POST",
   });
-  let history;
+  let proposalHistory;
   for (let i = 0; i < 50; i++) {
-    history = await (await fetch(`${otherApi}/snapshot`)).json();
-    if (history.approvals.length === 2) break;
+    proposalHistory = await (await fetch(`${otherApi}/snapshot`)).json();
+    if (proposalHistory.approvals.length === 2) break;
     await delay(100);
   }
-  assert.equal(history.approvals.length, 2);
-  assert.equal(history.approvals[0].id, deny.id);
-  assert.equal(history.approvals[0].status, "denied");
-  assert.equal(history.approvals[1].status, "pending");
+  assert.equal(proposalHistory.approvals.length, 2);
+  assert.equal(proposalHistory.approvals[0].id, deny.id);
+  assert.equal(proposalHistory.approvals[0].status, "denied");
+  assert.equal(proposalHistory.approvals[1].status, "pending");
   console.log(
     "Passed: warm denial is a native tool result, relay restart retains catalog, tampered/conflicting decisions are rejected.",
   );
