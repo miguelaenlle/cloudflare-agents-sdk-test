@@ -7,7 +7,7 @@
     "dev:server": "node --env-file=../../.env.local --experimental-strip-types server/server.ts",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test": "node test/review.mjs",
+    "test": "node test/review.mjs && node test/relay.mjs",
     "dev:server:local": "AGENT_URL=http://localhost:8790 node --experimental-strip-types server/server.ts"
   },
   "dependencies": {

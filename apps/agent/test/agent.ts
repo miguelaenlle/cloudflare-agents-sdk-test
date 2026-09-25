@@ -36,6 +36,10 @@ export class Chat extends ProductionChat {
   }
   override async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
+    if (path.endsWith("/test/approval")) {
+      await this.fixture().requestApproval();
+      return new Response(null, { status: 204 });
+    }
     if (path.endsWith("/test/run")) {
       await this.persistMessages([
         {

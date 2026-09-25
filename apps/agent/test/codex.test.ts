@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { UIMessageChunk } from "ai";
+import { captureApproval } from "../approval.ts";
 import { CodexEvents } from "../codex-events.ts";
 import {
   checkpointCodex,
@@ -226,4 +227,30 @@ test("steering splits live text and reasoning without duplicating completion sna
   const marker = chunks.findIndex((c) => c.type === "data-steering");
   assert.ok(chunks.slice(0, marker).some((c) => c.type === "reasoning-end"));
   assert.ok(chunks.slice(marker + 1).some((c) => c.type === "text-start"));
+});
+
+test("approval capture preserves file bytes even when exec stdout is trimmed", async () => {
+  const diff = "diff --git a/a b/a\n+é  \n\\ No newline at end of file\n";
+  let path = "";
+  let deleted = "";
+  const sandbox = {
+    exec: async (command: string) => {
+      path = command.split(" > ")[1]!;
+      return { success: true, stdout: diff.trimEnd() };
+    },
+    readFile: async (requested: string) => {
+      assert.equal(requested, path);
+      return { content: diff };
+    },
+    deleteFile: async (requested: string) => {
+      deleted = requested;
+    },
+  } as unknown as CodexSandbox;
+  const result = await captureApproval(sandbox, {
+    baseSha: "0".repeat(40),
+    proposedSha: "a".repeat(40),
+  });
+  assert.equal(result.diff, diff);
+  assert.equal(deleted, path);
+  assert.match(path, /^\/tmp\/approval-[\w-]+\.patch$/);
 });

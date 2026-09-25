@@ -1,6 +1,6 @@
-# Steering and richer streaming
+# Durable approvals with simulated publication
 
-This is layer 4 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
+This is layer 5 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
 
 ## Local inference
 
@@ -21,3 +21,7 @@ The relay stores a local SQLite conversation catalog. Each ID routes to its own 
 ## Steering and richer streaming
 
 Send during execution steers the active native turn. Only confirmed completion permits falling back to a new turn; uncertain acknowledgments are not replayed. Steering markers split live output into segments. Reasoning summaries are rendered separately; these are the model-provided summaries, not hidden reasoning.
+
+## Durable approval
+
+The agent calls `push_sync` with base/proposed commit SHAs. Persist the exact diff outside the sandbox and hold the native tool response pending a decision. Ordinary sends are blocked. After idle cleanup, the saved approval remains actionable and its outcome is delivered to a restored continuation. Warm decisions resolve the live tool result. Relay decision records retry delivery after restart. The layer-5 publisher is explicitly simulated; no GitHub credential is needed and no push occurs.

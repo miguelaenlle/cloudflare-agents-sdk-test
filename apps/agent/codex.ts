@@ -1,4 +1,5 @@
 import type { DirectoryBackup, getSandbox } from "@cloudflare/sandbox";
+import type { Approval } from "@playground/chat-contract";
 import { AppServer } from "./app-server.ts";
 
 export type CodexSandbox = ReturnType<typeof getSandbox>;
@@ -19,6 +20,12 @@ export type Run = {
 };
 export type CodexState = {
   revision?: number;
+  approval?: Approval;
+  approvalHistory?: Approval[];
+  approvalDelivery?: string;
+  approvalPreparing?: boolean;
+  approvalReceipts?: Record<string, { digest: string; approved: boolean }>;
+
   sandbox?: {
     id: string;
     phase:

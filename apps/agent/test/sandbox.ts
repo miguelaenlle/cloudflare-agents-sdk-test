@@ -3,6 +3,8 @@ import type { ThreadItem, Turn } from "../protocol.ts";
 
 type State = {
   files: Record<string, string>;
+  waitingTool?: boolean;
+  toolResults?: unknown[];
   backup?: Record<string, string>;
   backupEvents: string[];
   running: boolean;
@@ -71,6 +73,7 @@ export class TestSandbox extends DurableObject {
     const state = await this.state();
     if (
       !state.running ||
+      state.waitingTool ||
       request.headers.get("Authorization") !==
         `Bearer ${state.files["/tmp/codex-app-server-token"]}`
     )
@@ -81,6 +84,10 @@ export class TestSandbox extends DurableObject {
     server.addEventListener("close", () => this.sockets.delete(server));
     server.addEventListener("message", (event) => {
       const frame = JSON.parse(String(event.data));
+      if (!frame.method && frame.id === "approval-call") {
+        void this.acceptToolResult(frame.result);
+        return;
+      }
       void this.rpc(frame.method, frame.params ?? {})
         .then(async (result) => {
           const state = await this.state();
@@ -214,6 +221,7 @@ export class TestSandbox extends DurableObject {
     const turn = state.turns.at(-1);
     if (
       !state.running ||
+      state.waitingTool ||
       state.ignoreCancellation ||
       turn?.status !== "inProgress" ||
       Date.now() < turn.startedAt! * 1000 + 8000
@@ -250,8 +258,50 @@ export class TestSandbox extends DurableObject {
     if (content === undefined) throw new Error(`Missing fixture file: ${path}`);
     return { content };
   }
-  async exec() {
-    return { success: true };
+  async deleteFile(path: string) {
+    const state = await this.state();
+    delete state.files[path];
+    await this.save(state);
+  }
+  async exec(command: string) {
+    const path = command.match(/ > (\/tmp\/approval-[\w-]+\.patch)$/)?.[1];
+    if (path)
+      await this.writeFile(
+        path,
+        "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n",
+      );
+    return {
+      success: true,
+      stdout:
+        "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n",
+    };
+  }
+  async requestApproval() {
+    const state = await this.state();
+    state.waitingTool = true;
+    await this.save(state);
+    for (const socket of this.sockets)
+      socket.send(
+        JSON.stringify({
+          id: "approval-call",
+          method: "item/tool/call",
+          params: {
+            threadId: "native-thread",
+            turnId: state.turns.at(-1)!.id,
+            callId: "approval-call",
+            namespace: null,
+            tool: "push_sync",
+            arguments: { baseSha: "a".repeat(40), proposedSha: "b".repeat(40) },
+          },
+        }),
+      );
+  }
+  private async acceptToolResult(result: unknown) {
+    const state = await this.state();
+    state.toolResults = [...(state.toolResults ?? []), result];
+    state.waitingTool = false;
+    await this.save(state);
+    await this.ctx.storage.setAlarm(Date.now() + 100);
   }
   async startProcess(_command: string, _options: { processId: string }) {
     const state = await this.state();
@@ -350,8 +400,15 @@ export class TestSandbox extends DurableObject {
     return (await this.state()).backupEvents;
   }
   async inspect() {
-    const { launches, restores, destroys, running, steers, turns } =
-      await this.state();
+    const {
+      launches,
+      restores,
+      destroys,
+      running,
+      steers,
+      turns,
+      toolResults,
+    } = await this.state();
     return {
       launches,
       restores,
@@ -359,6 +416,7 @@ export class TestSandbox extends DurableObject {
       running,
       steers,
       turns: turns.length,
+      toolResults,
     };
   }
 }
