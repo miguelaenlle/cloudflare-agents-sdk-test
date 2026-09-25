@@ -20,11 +20,28 @@ export interface ChatConnection {
 }
 
 export interface ChatProvider {
+  getDiagnostics(signal: AbortSignal): Promise<SandboxDiagnostics>;
   getHistory(signal: AbortSignal): Promise<UIMessage[]>;
   send(input: SendRequest, signal: AbortSignal): Promise<void>;
   cancel(signal: AbortSignal): Promise<void>;
   connect(signal: AbortSignal): Promise<ChatConnection>;
 }
+export const sandboxDiagnosticsSchema = z.object({
+  state: z.enum([
+    "absent",
+    "starting",
+    "waiting_for_agent",
+    "waiting_for_user",
+    "suspending",
+    "destroying",
+    "cleanup_failed",
+  ]),
+  idleExpiresAt: z.number().nullable(),
+  interactionExpiresAt: z.number().nullable(),
+});
+export type SandboxDiagnostics = z.infer<typeof sandboxDiagnosticsSchema>;
+
+export const DIAGNOSTICS_API = `${CHAT_API}/diagnostics`;
 export class ChatError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {

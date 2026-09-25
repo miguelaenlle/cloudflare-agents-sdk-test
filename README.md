@@ -1,6 +1,6 @@
-# Minimal working Codex chat
+# Sandbox lifecycle and recovery
 
-This is layer 1 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
+This is layer 2 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
 
 ## Local inference
 
@@ -10,6 +10,6 @@ Run `pnpm dev:agent`, `pnpm dev:server`, and `pnpm dev` in separate terminals. O
 
 Run `pnpm typecheck`, `pnpm build`, and `pnpm test` for this layer. The tests use a local Worker/DO with a simulated sandbox and a relay on ports 8791/4318; they make no paid model calls.
 
-## Scope and limitations
+## Lifecycle
 
-One persistent conversation, native Codex text/tool output and independently reconnectable HTTP/SSE subscribers. Additional sends during a running turn are rejected. Stop can interrupt a live native turn. An uncertain submission is never replayed automatically. A lost process/DO can leave the conversation blocked; use fresh development state until the next lifecycle layer adds reconciliation. SDK idle shutdown can lose workspace files: this layer has no backup/restore or application deadlines yet. This is a foundation for local review, not the cloud acceptance release.
+After ten minutes waiting for the user, back up before destroying. After six hours without accepted user interaction, attempt a bounded final backup and destroy. Restore the workspace/native thread on the next prompt. Diagnostics show state and countdowns. Unexpected loss can lose work since the last backup. Basic Stop is hardened with reconciliation and durable cleanup in this layer. Test idle restoration by creating a file, waiting ten minutes, then reading it in the next turn.

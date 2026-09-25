@@ -9,6 +9,7 @@ import {
   HISTORY_API,
 } from "@playground/chat-contract";
 import "./style.css";
+import { SandboxStatus } from "./sandbox-status.tsx";
 
 const transport = new DefaultChatTransport({ api: CHAT_API });
 const RECONNECT_DELAY_MS = 2_000;
@@ -153,6 +154,7 @@ function App({ initialMessages }: { initialMessages: UIMessage[] }) {
         {status === "error" ? "Reconnecting…" : busy ? "Working…" : "Ready"}
       </p>
 
+      <SandboxStatus api="/api/chat/diagnostics" />
       <Transcript messages={messages} />
 
       {error && <p role="alert">{error.message}</p>}
