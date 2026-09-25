@@ -1,33 +1,25 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport, validateUIMessages, type UIMessage } from "ai";
-import {
-  CANCEL_API,
-  CHAT_API,
-  CONVERSATION_ID,
-  HISTORY_API,
-} from "@playground/chat-contract";
-import "./style.css";
+import { DefaultChatTransport, type UIMessage } from "ai";
+import { conversationApi, type ChatSnapshot } from "@playground/chat-contract";
 import { SandboxStatus } from "./sandbox-status.tsx";
+import "./style.css";
 
-const transport = new DefaultChatTransport({ api: CHAT_API });
-const RECONNECT_DELAY_MS = 2_000;
-const DEMO_PROMPT =
-  "Create a small hello.txt file, run a shell command that waits 60 seconds, then read the file and report the result.";
-
-async function loadHistory(signal?: AbortSignal): Promise<UIMessage[]> {
-  const response = await fetch(HISTORY_API, { signal });
-  if (!response.ok)
-    throw new Error(
-      "Could not load history. Check that the local backend is running and AGENT_URL is set.",
-    );
-  const messages: unknown = await response.json();
-  // An empty history is valid, although the SDK validates nonempty chat requests.
-  if (Array.isArray(messages) && messages.length === 0) return [];
-  return validateUIMessages({ messages });
+async function request<T>(url: string, body?: unknown): Promise<T> {
+  const response = await fetch(
+    url,
+    body === undefined
+      ? { cache: "no-store" }
+      : {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+  );
+  if (!response.ok) throw new Error(await response.text());
+  return response.status === 204 ? (undefined as T) : response.json();
 }
-
 function Transcript({ messages }: { messages: UIMessage[] }) {
   return (
     <section aria-label="Conversation">
@@ -59,161 +51,215 @@ function Transcript({ messages }: { messages: UIMessage[] }) {
   );
 }
 
-function App({ initialMessages }: { initialMessages: UIMessage[] }) {
-  const [input, setInput] = useState("");
-  const [cancelError, setCancelError] = useState("");
+function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
+  const api = conversationApi(id);
+  const [transport] = useState(
+    () => new DefaultChatTransport({ api: api.chat }),
+  );
+  const [snapshot, setSnapshot] = useState(initial);
+  const [revision, setRevision] = useState(initial.revision);
+  const [input, setInput] = useState(
+    () => sessionStorage.getItem(`draft:${id}`) ?? "",
+  );
+  const [failure, setFailure] = useState("");
   const [sending, setSending] = useState(false);
-  const [sendError, setSendError] = useState("");
-  const [cancelling, setCancelling] = useState(false);
   const { messages, stop, status, error, setMessages, resumeStream } = useChat({
-    id: CONVERSATION_ID,
-    messages: initialMessages,
+    id,
+    messages: initial.messages,
     transport,
     resume: true,
   });
   const busy = status === "submitted" || status === "streaming";
-  // Reattach through a replacement webserver after a broken SSE connection.
+  const stale = revision !== snapshot.revision;
+  function draft(text: string) {
+    setInput(text);
+    sessionStorage.setItem(`draft:${id}`, text);
+  }
+  async function refresh() {
+    await stop();
+    const next = await request<ChatSnapshot>(api.snapshot);
+    setSnapshot(next);
+    setRevision(next.revision);
+    setMessages(next.messages);
+    void resumeStream();
+  }
+  // Other-tab revisions can change while this tab has no active stream.
   useEffect(() => {
-    if (status !== "error") return;
-    const attempt = new AbortController();
+    let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
-    async function reconnect() {
+    async function poll() {
       try {
-        const saved = await loadHistory(attempt.signal);
-        if (attempt.signal.aborted) return;
-        setMessages(saved);
-        await resumeStream();
-      } catch {
-        if (!attempt.signal.aborted)
-          timer = setTimeout(reconnect, RECONNECT_DELAY_MS);
+        const next = await request<ChatSnapshot>(api.snapshot);
+        if (disposed) return;
+        setSnapshot(next);
+        if (!busy) {
+          setMessages(next.messages);
+          void resumeStream();
+        }
+      } catch (error) {
+        if (!disposed) setFailure(String(error));
+      } finally {
+        if (!disposed) timer = setTimeout(poll, 2000);
       }
     }
-    timer = setTimeout(reconnect, RECONNECT_DELAY_MS);
+    timer = setTimeout(poll, 2000);
     return () => {
-      attempt.abort();
+      disposed = true;
       clearTimeout(timer);
     };
-  }, [status, error, setMessages, resumeStream]);
-
-  async function cancelTurn() {
-    setCancelError("");
-    setCancelling(true);
-    try {
-      const response = await fetch(CANCEL_API, { method: "POST" });
-      if (!response.ok) throw new Error("Could not confirm Stop. Try again.");
-    } catch (error) {
-      setCancelError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setCancelling(false);
-    }
-  }
-
-  async function send(text: string) {
-    if (!text.trim() || sending) return;
+  }, [id, busy, setMessages, resumeStream]);
+  async function send(event: FormEvent) {
+    event.preventDefault();
+    if (!input.trim() || sending || stale) return;
     setSending(true);
-    setSendError("");
-    // Replace this subscriber, not the agent turn. Replay also picks up messages from other tabs.
+    setFailure("");
     await stop();
     try {
-      const response = await fetch(CHAT_API, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: crypto.randomUUID(), text }),
+      await request(api.chat, {
+        id: crypto.randomUUID(),
+        text: input,
+        expectedRevision: revision,
       });
-      if (!response.ok)
-        throw new Error(
-          "Message acceptance was not confirmed. Check history before retrying.",
-        );
-      setInput("");
+      draft("");
+      await refresh();
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : String(error));
-    } finally {
+      setFailure(String(error));
+      // Do not advance the draft's revision on rejection or uncertain acceptance.
       try {
-        setMessages(await loadHistory());
-        // Submission is complete; stream consumption continues independently.
+        const next = await request<ChatSnapshot>(api.snapshot);
+        setSnapshot(next);
+        setMessages(next.messages);
         void resumeStream();
-      } catch (error) {
-        setSendError(error instanceof Error ? error.message : String(error));
+      } catch {
+        /* The explicit Refresh button retries. */
       }
+    } finally {
       setSending(false);
     }
   }
-
-  function submitMessage(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    void send(input.trim());
-  }
-
   return (
-    <main>
-      <h1>Agent chat</h1>
-      <p>
-        One persistent conversation. Reload or reopen this page to reconnect.
-      </p>
-      <p role="status">
-        {status === "error" ? "Reconnecting…" : busy ? "Working…" : "Ready"}
-      </p>
-
-      <SandboxStatus api="/api/chat/diagnostics" />
+    <>
+      <p role="status">{busy ? "Working…" : "Ready"}</p>
+      <SandboxStatus api={api.diagnostics} />
       <Transcript messages={messages} />
-
-      {error && <p role="alert">{error.message}</p>}
-      {cancelError && <p role="alert">{cancelError}</p>}
-      {sendError && <p role="alert">{sendError}</p>}
-      <form onSubmit={submitMessage}>
+      {stale && (
+        <p role="alert">
+          This conversation changed. Refresh history before sending. Your draft
+          is preserved.
+        </p>
+      )}
+      {(failure || error) && <p role="alert">{failure || error?.message}</p>}
+      <form onSubmit={send}>
         <label htmlFor="message">Message</label>
         <textarea
           id="message"
           rows={3}
           value={input}
-          onChange={(event) => setInput(event.target.value)}
+          onChange={(event) => draft(event.target.value)}
         />
         <div className="actions">
-          <button type="button" onClick={() => window.location.reload()}>
-            Reconnect / refresh history
-          </button>
-          <button disabled={sending || busy || !input.trim()}>Send</button>
           <button
             type="button"
-            disabled={cancelling}
-            onClick={() => void cancelTurn()}
+            onClick={() =>
+              void refresh().catch((error) => setFailure(String(error)))
+            }
+          >
+            Refresh history
+          </button>
+          <button disabled={sending || busy || stale || !input.trim()}>
+            Send
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void request(api.cancel, {}).catch((error) =>
+                setFailure(String(error)),
+              )
+            }
           >
             Stop
           </button>
-          <button
-            type="button"
-            disabled={sending || busy}
-            onClick={() => void send(DEMO_PROMPT)}
-          >
-            Run one-minute task
-          </button>
         </div>
       </form>
-      <p className="hint">
-        Once the tool starts, close this tab. Come back after a minute to see
-        its result.
-      </p>
+    </>
+  );
+}
+function App() {
+  const [conversations, setConversations] = useState<
+    { id: string; title: string }[]
+  >([]);
+  const [id, setId] = useState(
+    new URLSearchParams(location.search).get("conversation") ?? "playground",
+  );
+  const [loaded, setLoaded] = useState<{
+    id: string;
+    snapshot: ChatSnapshot;
+  }>();
+  const [failure, setFailure] = useState("");
+  // Conversation identity is in the URL so copying a tab opens the same durable conversation.
+  useEffect(() => {
+    let disposed = false;
+    setLoaded(undefined);
+    const url = new URL(location.href);
+    url.searchParams.set("conversation", id);
+    history.replaceState(null, "", url);
+    void Promise.all([
+      request<{ id: string; title: string }[]>("/api/conversations"),
+      request<ChatSnapshot>(conversationApi(id).snapshot),
+    ])
+      .then(([list, snapshot]) => {
+        if (!disposed) {
+          setConversations(list);
+          setLoaded({ id, snapshot });
+        }
+      })
+      .catch((error) => {
+        if (!disposed) setFailure(String(error));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [id]);
+  async function create() {
+    const value = await request<{ id: string }>("/api/conversations", {
+      title: `Conversation ${conversations.length + 1}`,
+    });
+    setId(value.id);
+  }
+  return (
+    <main>
+      <h1>Agent chat</h1>
+      <div className="actions">
+        <select
+          aria-label="Conversation"
+          value={id}
+          onChange={(event) => setId(event.target.value)}
+        >
+          {conversations.map((conversation) => (
+            <option key={conversation.id} value={conversation.id}>
+              {conversation.title}
+            </option>
+          ))}
+        </select>
+        <button
+          onClick={() =>
+            void create().catch((error) => setFailure(String(error)))
+          }
+        >
+          New conversation
+        </button>
+      </div>
+      {failure && <p role="alert">{failure}</p>}
+      {loaded ? (
+        <Conversation
+          key={loaded.id}
+          id={loaded.id}
+          initial={loaded.snapshot}
+        />
+      ) : (
+        <p>Loading…</p>
+      )}
     </main>
   );
 }
-
-const root = createRoot(document.getElementById("root")!);
-
-async function initialize() {
-  root.render(<main>Loading conversation…</main>);
-  try {
-    const messages = await loadHistory();
-    root.render(<App initialMessages={messages} />);
-  } catch (error) {
-    root.render(
-      <main>
-        <p role="alert">
-          {error instanceof Error ? error.message : String(error)}
-        </p>
-        <button onClick={() => void initialize()}>Retry</button>
-      </main>,
-    );
-  }
-}
-
-void initialize();
+createRoot(document.getElementById("root")!).render(<App />);

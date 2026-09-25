@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   CONVERSATION_ID,
   ChatError,
+  type ChatSnapshot,
   sandboxDiagnosticsSchema,
   type ChatConnection,
   type ChatProvider,
@@ -59,6 +60,17 @@ export function createCloudflareProvider(
   }
 
   return {
+    async getSnapshot(signal) {
+      const response = await request("snapshot", "GET", signal);
+      const value = (await response.json()) as ChatSnapshot;
+      const messages = value.messages.length
+        ? await validateUIMessages({ messages: value.messages })
+        : [];
+      return {
+        messages,
+        revision: z.number().int().nonnegative().parse(value.revision),
+      };
+    },
     async getDiagnostics(signal) {
       const response = await request("diagnostics", "GET", signal);
       return sandboxDiagnosticsSchema.parse(await response.json());
