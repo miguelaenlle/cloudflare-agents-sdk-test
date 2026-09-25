@@ -107,6 +107,16 @@ export class Chat extends AIChatAgent<Env, CodexState> {
 
   override async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
+    if (request.method === "GET" && path.endsWith("/snapshot")) {
+      await this.controlTail;
+      return Response.json(
+        {
+          messages: this.messages,
+          revision: this.state.revision ?? 0,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
     if (request.method === "GET" && path.endsWith("/diagnostics")) {
       const sandbox = this.state.sandbox;
       return Response.json(
@@ -159,6 +169,15 @@ export class Chat extends AIChatAgent<Env, CodexState> {
 
   private async send(input: SendRequest) {
     if (this.messages.some((message) => message.id === input.id)) return;
+    {
+      if (input.expectedRevision !== (this.state.revision ?? 0))
+        throw new ChatError(
+          409,
+          "This conversation changed in another tab. Refresh history; your draft is preserved.",
+        );
+    }
+    // Reserve the revision before async submission: an uncertain acknowledgment must not accept another stale send.
+    this.setState({ ...this.state, revision: (this.state.revision ?? 0) + 1 });
     const message = {
       id: input.id,
       role: "user" as const,

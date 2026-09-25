@@ -1,6 +1,6 @@
 # Feature review stack
 
-This checkout is layer 2: Sandbox lifecycle and recovery. Each layer includes its own running application and tests. The original PRs #2–#6 remain available for testing; the obsolete feature stack #7–#12 is closed.
+This checkout is layer 3: Conversation identity and concurrency. Each layer includes its own running application and tests. The original PRs #2–#6 remain available for testing; the obsolete feature stack #7–#12 is closed.
 
 | Layer | Branch | Review question |
 | --- | --- | --- |

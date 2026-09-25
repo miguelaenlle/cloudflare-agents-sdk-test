@@ -81,6 +81,8 @@ const submit = async (input = newMessage()) =>
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      expectedRevision: (await (await fetch(`${api}/snapshot`)).json())
+        .revision,
       ...input,
     }),
   });
@@ -197,6 +199,57 @@ try {
   assert.equal(forced.sandbox, undefined);
   console.log(
     "Passed: stale callbacks cannot destroy a new generation; idle backup failure retains the box, deadline failure still destroys it.",
+  );
+
+  const created = await (
+    await fetch("http://localhost:4318/api/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Independent conversation" }),
+    })
+  ).json();
+  const other = `http://localhost:4318/api/conversations/${created.id}/chat`;
+  assert.deepEqual(
+    (await (await fetch(`${other}/snapshot`)).json()).messages,
+    [],
+  );
+  const post = (input) =>
+    fetch(other, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+  assert.equal(
+    (
+      await post({
+        id: crypto.randomUUID(),
+        text: "Hello",
+        expectedRevision: 0,
+      })
+    ).status,
+    204,
+  );
+  assert.equal(
+    (
+      await post({
+        id: crypto.randomUUID(),
+        text: "Stale tab",
+        expectedRevision: 0,
+      })
+    ).status,
+    409,
+  );
+  await fetch(`${other}/cancel`, { method: "POST" });
+  await stopServer();
+  startServer();
+  await ready(`${api}/history`);
+  assert.ok(
+    (
+      await (await fetch("http://localhost:4318/api/conversations")).json()
+    ).some((c) => c.id === created.id),
+  );
+  console.log(
+    "Passed: independent conversation history, stale revision rejection and catalog persistence.",
   );
 } catch (error) {
   console.error(logs.slice(-12_000));
