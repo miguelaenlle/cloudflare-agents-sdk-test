@@ -101,6 +101,7 @@ export class AppServer {
               "item/started",
               "item/completed",
               "item/agentMessage/delta",
+              "item/reasoning/summaryTextDelta",
             ].includes(frame.method)
           ) {
             // Authenticated, version-pinned protocol; generated types describe the payload.
