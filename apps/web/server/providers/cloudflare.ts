@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   CONVERSATION_ID,
   ChatError,
+  sandboxDiagnosticsSchema,
   type ChatConnection,
   type ChatProvider,
 } from "@playground/chat-contract";
@@ -58,6 +59,10 @@ export function createCloudflareProvider(
   }
 
   return {
+    async getDiagnostics(signal) {
+      const response = await request("diagnostics", "GET", signal);
+      return sandboxDiagnosticsSchema.parse(await response.json());
+    },
     async getHistory(signal) {
       const response = await request("get-messages", "GET", signal);
       const messages: unknown = await response.json();
