@@ -1,0 +1,57 @@
+body {
+  margin: 0;
+  font:
+    16px/1.5 system-ui,
+    sans-serif;
+  color: #222;
+  background: #fff;
+}
+main {
+  max-width: 760px;
+  margin: 32px auto;
+  padding: 0 20px;
+}
+h1 {
+  font-size: 24px;
+}
+article {
+  border-top: 1px solid #ddd;
+  padding: 16px 0;
+}
+.message {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  font: inherit;
+  margin: 6px 0 12px;
+  padding: 8px;
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+button {
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+button:disabled {
+  cursor: default;
+}
+.hint {
+  color: #555;
+  font-size: 14px;
+}
+[role="alert"] {
+  color: #a00;
+}
