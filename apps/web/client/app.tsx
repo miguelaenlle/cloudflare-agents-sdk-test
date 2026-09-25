@@ -73,7 +73,7 @@ function ApprovalCard({
       </details>
       {approval.status === "pending" ? (
         <>
-          <p>Approval is simulated; no Git push or Course Sync will run.</p>
+          <p>Approve publishes this patch. Course Sync is simulated.</p>
           {publication?.error && <p role="alert">{publication.error}</p>}
           <div className="actions">
             <button

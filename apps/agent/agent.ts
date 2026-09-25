@@ -34,6 +34,7 @@ export interface Env {
   Chat: DurableObjectNamespace<Chat>;
   CODEX_MODEL?: string;
   RELAY_TOKEN?: string;
+  GITHUB_REPOSITORY?: string;
   LOCAL_DEV?: string;
   UI_ORIGIN: string;
 }
@@ -809,6 +810,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               this.sandbox(sandbox.id),
               this.state,
               {
+                repository: this.env.GITHUB_REPOSITORY,
                 assertCurrent: () => this.ensureUsable(sandbox.id),
               },
             );

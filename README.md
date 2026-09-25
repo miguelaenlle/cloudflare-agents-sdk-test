@@ -1,6 +1,6 @@
-# Durable approvals with simulated publication
+# Real Git publication
 
-This is layer 5 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
+This is layer 6 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
 
 ## Local inference
 
@@ -25,3 +25,7 @@ Send during execution steers the active native turn. Only confirmed completion p
 ## Durable approval
 
 The agent calls `push_sync` with base/proposed commit SHAs. Persist the exact diff outside the sandbox and hold the native tool response pending a decision. Ordinary sends are blocked. After idle cleanup, the saved approval remains actionable and its outcome is delivered to a restored continuation. Warm decisions resolve the live tool result. Relay decision records retry delivery after restart. The layer-5 publisher is explicitly simulated; no GitHub credential is needed and no push occurs.
+
+## Publication
+
+Real publication replaces the simulated operation. A shared repository-scoped PAT permits trusted Git pushes and sandbox read-only clone/fetch/pull through outbound injection. The relay validates the approved patch, builds a deterministic commit and reconciles uncertain remote outcomes. Course Sync remains simulated. See [push-sync-testing.md](docs/push-sync-testing.md) and [testing.md](docs/testing.md).

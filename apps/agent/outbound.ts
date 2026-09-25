@@ -33,3 +33,58 @@ export async function forwardOpenAI(
     return new Response("Model request failed", { status: 502 });
   }
 }
+
+export async function forwardGitHub(
+  request: Request,
+  env: { GITHUB_REPOSITORY?: string; GITHUB_TOKEN?: string },
+  send: typeof fetch = fetch,
+): Promise<Response> {
+  const repo = env.GITHUB_REPOSITORY;
+  const url = new URL(request.url);
+  if (
+    !repo ||
+    !/^[\w.-]+\/[\w.-]+$/.test(repo) ||
+    !["https://github.com", "http://github.com"].includes(url.origin)
+  )
+    return new Response("Forbidden", { status: 403 });
+  const discovery =
+    request.method === "GET" &&
+    url.pathname === `/${repo}.git/info/refs` &&
+    url.search === "?service=git-upload-pack";
+  const upload =
+    request.method === "POST" &&
+    url.pathname === `/${repo}.git/git-upload-pack` &&
+    !url.search;
+  if (!discovery && !upload)
+    return new Response("Only read-only Git access is allowed", {
+      status: 403,
+    });
+  if (!env.GITHUB_TOKEN)
+    return new Response("Git credentials unavailable", { status: 503 });
+  const headers = new Headers();
+  headers.set(
+    "Authorization",
+    `Basic ${btoa(`x-access-token:${env.GITHUB_TOKEN}`)}`,
+  );
+  for (const name of ["content-type", "accept", "git-protocol", "user-agent"]) {
+    const value = request.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  try {
+    const result = await send(
+      new Request(`https://github.com${url.pathname}${url.search}`, {
+        method: request.method,
+        headers,
+        body: request.body,
+        redirect: "manual",
+      }),
+    );
+    if (result.status >= 300 && result.status < 400) {
+      await result.body?.cancel();
+      return new Response("Git redirect blocked", { status: 502 });
+    }
+    return result;
+  } catch {
+    return new Response("Git request failed", { status: 502 });
+  }
+}
