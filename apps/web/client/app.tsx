@@ -20,37 +20,77 @@ async function request<T>(url: string, body?: unknown): Promise<T> {
   if (!response.ok) throw new Error(await response.text());
   return response.status === 204 ? (undefined as T) : response.json();
 }
+function steering(
+  part: UIMessage["parts"][number],
+): { id: string; text: string } | undefined {
+  if (
+    part.type !== "data-steering" ||
+    typeof part.data !== "object" ||
+    !part.data
+  )
+    return;
+  if (
+    !("id" in part.data) ||
+    !("text" in part.data) ||
+    typeof part.data.id !== "string" ||
+    typeof part.data.text !== "string"
+  )
+    return;
+  return { id: part.data.id, text: part.data.text };
+}
 function Transcript({ messages }: { messages: UIMessage[] }) {
+  const interleaved = new Set(
+    messages.flatMap((message) =>
+      message.parts.flatMap((part) => {
+        const value = steering(part);
+        return value ? [value.id] : [];
+      }),
+    ),
+  );
   return (
     <section aria-label="Conversation">
-      {messages.length === 0 && <p>No messages yet.</p>}
-      {messages.map((message) => (
-        <article key={message.id}>
-          <strong>{message.role}</strong>
-          {message.parts.map((part, index) => {
-            if (part.type === "text") {
-              return (
-                <p className="message" key={index}>
-                  {part.text}
-                </p>
-              );
-            }
-            if (part.type.startsWith("tool-") || part.type === "dynamic-tool") {
-              return (
-                <details key={index} open>
-                  <summary>Tool activity</summary>
-                  <pre>{JSON.stringify(part, null, 2)}</pre>
-                </details>
-              );
-            }
-            return null;
-          })}
-        </article>
-      ))}
+      {!messages.length && <p>No messages yet.</p>}
+      {messages
+        .filter((message) => !interleaved.has(message.id))
+        .map((message) => (
+          <article key={message.id}>
+            <strong>{message.role}</strong>
+            {message.parts.map((part, index) => {
+              const correction = steering(part);
+              if (correction)
+                return (
+                  <blockquote key={index}>
+                    <strong>User · steering</strong>
+                    <p className="message">{correction.text}</p>
+                  </blockquote>
+                );
+              if (part.type === "text")
+                return (
+                  <p className="message" key={index}>
+                    {part.text}
+                  </p>
+                );
+              if (part.type === "reasoning")
+                return (
+                  <details key={index}>
+                    <summary>Reasoning summary</summary>
+                    <p className="message">{part.text}</p>
+                  </details>
+                );
+              if (part.type.startsWith("tool-") || part.type === "dynamic-tool")
+                return (
+                  <details key={index}>
+                    <summary>Tool activity</summary>
+                    <pre>{JSON.stringify(part, null, 2)}</pre>
+                  </details>
+                );
+              return null;
+            })}
+          </article>
+        ))}
     </section>
   );
 }
-
 function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
   const api = conversationApi(id);
   const [transport] = useState(
@@ -166,9 +206,7 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
           >
             Refresh history
           </button>
-          <button disabled={sending || busy || stale || !input.trim()}>
-            Send
-          </button>
+          <button disabled={sending || stale || !input.trim()}>Send</button>
           <button
             type="button"
             onClick={() =>

@@ -11,7 +11,7 @@ import {
   type SendRequest,
   type SandboxDiagnostics,
 } from "@playground/chat-contract";
-import { AppServer, within } from "./app-server.ts";
+import { AppServer, AppServerError, within } from "./app-server.ts";
 import type { Sandbox } from "./sandbox.ts";
 import { openCodexTurn, type CodexTurn } from "./codex-turn.ts";
 import {
@@ -185,11 +185,36 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     };
     const run = this.state.run;
     const active = this.active;
-    if (active && !active.terminal)
-      throw new ChatError(
-        409,
-        "A turn is running. Stop it or wait before sending.",
-      );
+    if (active && !active.terminal && run?.threadId && run.turnId) {
+      this.ensureUsable(run.sandboxId);
+      let steered = false;
+      try {
+        await active.steer({
+          threadId: run.threadId,
+          expectedTurnId: run.turnId,
+          clientUserMessageId: input.id,
+          input: [{ type: "text", text: input.text, text_elements: [] }],
+        });
+        steered = true;
+      } catch (error) {
+        // Only a rejected RPC plus a confirmed terminal turn allows start instead.
+        // A timeout/disconnect can hide acceptance and must never resubmit the message.
+        if (!(error instanceof AppServerError)) throw error;
+        if (!active.terminal) {
+          const { thread } = await active.client.request("thread/read", {
+            threadId: run.threadId,
+            includeTurns: true,
+          });
+          const turn = thread.turns.find((turn) => turn.id === run.turnId);
+          if (!turn || turn.status === "inProgress") throw error;
+        }
+      }
+      if (steered) {
+        await this.persistMessages([...this.messages, message]);
+        await this.interaction();
+        return;
+      }
+    }
     // Finish transcript persistence before the next turn can own the stream.
     await this.chatTask;
     let resolve!: () => void;
