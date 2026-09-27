@@ -71,7 +71,7 @@ test("recovery never starts or restores a missing container", async () => {
     ContainerLost,
   );
 });
-test("startup reports the stage without guessing from capacity error text", async () => {
+test("startup sanitizes errors without guessing from capacity error text", async () => {
   const sandbox = {
     exists: async () => {
       throw new Error(
@@ -80,14 +80,14 @@ test("startup reports the stage without guessing from capacity error text", asyn
     },
   } as unknown as CodexSandbox;
   await assert.rejects(connectCodex(sandbox, {}), (error: Error) => {
-    assert.match(error.message, /allocating the container/);
+    assert.match(error.message, /Sandbox startup failed/);
     assert.match(error.message, /Check Worker and container logs/);
     assert.doesNotMatch(error.message, /private-test-key/);
     return true;
   });
 });
 
-test("startup identifies backup failures without exposing arbitrary SDK output", async () => {
+test("startup sanitizes backup failures without exposing arbitrary SDK output", async () => {
   const sandbox = {
     exists: async () => ({ exists: false }),
     restoreBackup: async () => {
@@ -99,7 +99,7 @@ test("startup identifies backup failures without exposing arbitrary SDK output",
       checkpoint: { backup: { id: "backup", dir: "/workspace" } },
     }),
     (error: Error) => {
-      assert.match(error.message, /restoring the workspace backup/);
+      assert.match(error.message, /Sandbox startup failed/);
       assert.doesNotMatch(error.message, /private-test-key/);
       return true;
     },
@@ -122,7 +122,7 @@ test("startup bounds app-server readiness and reports its timeout", async () => 
   } as unknown as CodexSandbox;
   await assert.rejects(
     connectCodex(sandbox, {}),
-    /readiness.*60-second limit.*timed out/,
+    /Sandbox startup failed.*timed out/,
   );
 });
 
@@ -433,7 +433,7 @@ for (const name of ["BackupNotFoundError", "BackupExpiredError"]) {
           },
         },
       ),
-      /initializing the Git workspace/,
+      /Sandbox startup failed/,
     );
     assert.equal(initialized, true);
     assert.match(warning, /uncommitted files and Codex session context/);
@@ -458,6 +458,6 @@ test("transient restore failure never discards the checkpoint or initializes fre
       },
       { onCheckpointUnavailable: () => assert.fail("Must not discard") },
     ),
-    /restoring the workspace backup/,
+    /Sandbox startup failed/,
   );
 });
