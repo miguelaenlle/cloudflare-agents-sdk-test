@@ -35,26 +35,26 @@ export async function captureApproval(
   const path = `/tmp/approval-${crypto.randomUUID()}.json`;
   let captured: { diff: string; files: Approval["files"] };
   // Read immutable blobs instead of the worktree; later edits cannot change the reviewed payload.
-  const script = `import json, subprocess
-base = "${baseSha === "0".repeat(40) ? "4b825dc642cb6eb9a060e54bf8d69288fbee4904" : baseSha}"
-proposed = "${proposedSha}"
-def git(*args):
-    return subprocess.check_output(["git", "-C", "/workspace/repo", *args])
-raw = git("diff", "--raw", "--no-renames", "-z", base, proposed).split(b"\\0")
-files = []
-for i in range(0, len(raw)-1, 2):
-    meta = raw[i].decode().split()
-    path = raw[i+1].decode()
-    old, new = meta[0][1:], meta[1]
-    content = None if new == "000000" else git("show", proposed + ":" + path).decode("utf-8")
-    files.append(dict(path=path, content=content, mode=new, previousMode=old))
-diff = git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, proposed).decode("utf-8")
-with open("${path}", "w") as f:
-    json.dump(dict(diff=diff, files=files), f)
+  const script = `const { execFileSync } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const base = "${baseSha === "0".repeat(40) ? "4b825dc642cb6eb9a060e54bf8d69288fbee4904" : baseSha}";
+const proposed = "${proposedSha}";
+const utf8 = new TextDecoder("utf-8", { fatal: true });
+const git = (...args) => utf8.decode(execFileSync("git", ["-C", "/workspace/repo", ...args]));
+const raw = git("diff", "--raw", "--no-renames", "-z", base, proposed).split("\\0");
+const files = [];
+for (let i = 0; i < raw.length - 1; i += 2) {
+  const [previousMode, mode] = raw[i].slice(1).split(" ");
+  const path = raw[i + 1];
+  const content = mode === "000000" ? null : git("show", proposed + ":" + path);
+  files.push({ path, content, mode, previousMode });
+}
+const diff = git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, proposed);
+writeFileSync("${path}", JSON.stringify({ diff, files }));
 `;
   try {
     const result = await sandbox.exec(
-      `python3 - <<'CAPTURE'\n${script}\nCAPTURE`,
+      `node - <<'CAPTURE'\n${script}\nCAPTURE`,
       { timeout: 10000 },
     );
     if (!result.success)
