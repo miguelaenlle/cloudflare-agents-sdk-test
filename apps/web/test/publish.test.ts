@@ -1,4 +1,4 @@
-import { proposalContent } from "@playground/chat-contract";
+import { ChatError, proposalContent } from "@playground/chat-contract";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -112,7 +112,10 @@ test("retry rediscovers a lost commit acknowledgment after main advances", async
   });
   value.candidate = await publisher.prepare(value);
   fake.loseAck();
-  await assert.rejects(publisher.push(value), /response lost/);
+  await assert.rejects(
+    publisher.push(value),
+    /publication outcome is unconfirmed/,
+  );
   fake.advance();
   assert.equal(await publisher.push(value), "c".repeat(40));
   assert.equal(fake.pushes(), 1);
@@ -149,4 +152,38 @@ test("proposal tampering and unsupported modes are rejected before publication",
     )
     .digest("hex");
   await assert.rejects(publisher.prepare(value), /ordinary text/);
+});
+
+test("GitHub failures expose safe actionable errors", async () => {
+  const value = job();
+  const publisher = new Publisher(value.destination, {
+    token: "test",
+    fetch: async () =>
+      new Response("private upstream contents", { status: 403 }),
+  });
+  await assert.rejects(publisher.prepare(value), (error: unknown) => {
+    assert.ok(error instanceof ChatError);
+    assert.equal(error.status, 502);
+    assert.match(error.message, /403.*repository access/);
+    assert.doesNotMatch(error.message, /private upstream/);
+    return true;
+  });
+});
+
+test("JSONB property reordering preserves the approved digest", async () => {
+  const value = job();
+  const file = value.approval.files[0];
+  value.approval.files = [
+    {
+      mode: file.mode,
+      previousMode: file.previousMode,
+      content: file.content,
+      path: file.path,
+    },
+  ];
+  const publisher = new Publisher(value.destination, {
+    token: "test",
+    fetch: github(value).fetcher,
+  });
+  assert.equal(await publisher.prepare(value), value.approval.digest);
 });

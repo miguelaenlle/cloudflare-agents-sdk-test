@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { createTwoFilesPatch } from "diff";
 import {
+  ChatError,
   proposalContent,
   GITHUB_REPOSITORY,
   type Approval,
@@ -48,10 +49,16 @@ export class Publisher {
         body: body ? JSON.stringify(body) : undefined,
         signal: AbortSignal.timeout(30_000),
       },
-    );
+    ).catch(() => {
+      throw new ChatError(
+        502,
+        "GitHub connection failed; publication outcome is unconfirmed. Retry completion.",
+      );
+    });
     // Do not forward provider response text: request errors can contain credentials or repository contents.
     if (!response.ok)
-      throw new Error(
+      throw new ChatError(
+        502,
         `GitHub request failed (${response.status}). Check repository access and branch protection, then Retry.`,
       );
     return response.json();
@@ -168,7 +175,8 @@ export class Publisher {
       };
       const history = result.data?.repository?.ref?.target.history;
       if (result.errors || !history)
-        throw new Error(
+        throw new ChatError(
+          502,
           "Could not inspect GitHub branch history. Initialize the branch and check access.",
         );
       for (const commit of history.nodes) {
@@ -228,8 +236,9 @@ export class Publisher {
       data?: { createCommitOnBranch?: { commit: { oid: string } } };
     };
     if (result.errors || !result.data?.createCommitOnBranch)
-      throw new Error(
-        "GitHub did not confirm publication. Retry to reconcile; if main changed, deny and prepare a new proposal.",
+      throw new ChatError(
+        502,
+        "GitHub did not confirm publication. Retry completion to reconcile the outcome.",
       );
     return result.data.createCommitOnBranch.commit.oid;
   }
