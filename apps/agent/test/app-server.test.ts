@@ -85,3 +85,23 @@ test("RPC rejections remain distinguishable from uncertain disconnects", async (
   );
   client.close();
 });
+
+test("initialization negotiates experimental tools before completing the handshake", async () => {
+  const socket = new FakeSocket();
+  const client = new AppServer(socket);
+  const initialized = client.initialize();
+  assert.equal(socket.sent[0].method, "initialize");
+  assert.deepEqual(socket.sent[0].params, {
+    capabilities: { experimentalApi: true, requestAttestation: false },
+    clientInfo: {
+      name: "pl_sandbox_prototype",
+      title: "PL sandbox prototype",
+      version: "1",
+    },
+  });
+  assert.equal(socket.sent.length, 1);
+  socket.receive({ id: socket.sent[0].id, result: { userAgent: "test" } });
+  await initialized;
+  assert.equal(socket.sent[1].method, "initialized");
+  client.close();
+});

@@ -203,7 +203,8 @@ export class AppServer {
 
   async initialize() {
     await this.request("initialize", {
-      capabilities: null,
+      // Dynamic host tools require this opt-in before thread/start.
+      capabilities: { experimentalApi: true, requestAttestation: false },
       clientInfo: {
         name: "pl_sandbox_prototype",
         title: "PL sandbox prototype",
