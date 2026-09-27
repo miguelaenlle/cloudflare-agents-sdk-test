@@ -44,6 +44,14 @@ export class Chat extends ProductionChat {
       this.setState({ ...this.state, ...{ approvalPreparing: true } });
       return new Response(null, { status: 204 });
     }
+    if (path.endsWith("/test/host-tool")) {
+      const { name, input } = await request.json<{
+        name: string;
+        input: Record<string, string>;
+      }>();
+      await this.fixture().requestApproval(name, input);
+      return new Response(null, { status: 204 });
+    }
     if (path.endsWith("/test/approval")) {
       await this.fixture().requestApproval();
       return new Response(null, { status: 204 });

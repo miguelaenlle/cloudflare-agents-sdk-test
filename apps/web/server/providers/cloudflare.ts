@@ -1,3 +1,4 @@
+import { executeHostTool } from "../host-tools.ts";
 import WebSocket from "ws";
 import { once } from "node:events";
 import { WebSocketChatTransport } from "agents/chat/transport";
@@ -65,9 +66,12 @@ export function createCloudflareProvider(
       const url = new URL(agentUrl);
       url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
       const socket = new WebSocket(url, {
-        headers: process.env.RELAY_TOKEN
-          ? { Authorization: `Bearer ${process.env.RELAY_TOKEN}` }
-          : {},
+        headers: {
+          "X-Host-Tools": "1",
+          ...(process.env.RELAY_TOKEN
+            ? { Authorization: `Bearer ${process.env.RELAY_TOKEN}` }
+            : {}),
+        },
       });
       const close = () => socket.close();
       signal.addEventListener("abort", close, { once: true });
@@ -78,6 +82,18 @@ export function createCloudflareProvider(
         } catch {
           close();
           failed();
+          return;
+        }
+        if (message.type === "host-tool-call") {
+          void executeHostTool(message)
+            .then((result) => {
+              if (socket.readyState === WebSocket.OPEN)
+                socket.send(JSON.stringify(result));
+            })
+            .catch(() => {
+              close();
+              failed();
+            });
           return;
         }
         // SDK broadcasts durable state and message updates; tokens continue over the separate AI SDK stream.

@@ -1,3 +1,4 @@
+import { hostToolDefinitions } from "@playground/chat-contract";
 import type { UIMessageChunk } from "ai";
 import type { AppServer } from "./app-server.ts";
 import { CodexEvents } from "./codex-events.ts";
@@ -19,12 +20,16 @@ export async function openCodexTurn(
     runId,
     write,
     onTurnStarted,
+    onToolCall,
   }: {
     threadId?: string;
     model?: string;
     runId: string;
     write: (chunk: UIMessageChunk) => void;
     onTurnStarted: (turnId: string) => void;
+    onToolCall: (
+      params: DynamicToolCallParams,
+    ) => Promise<DynamicToolCallResponse>;
   },
 ) {
   const options = {
@@ -34,10 +39,24 @@ export async function openCodexTurn(
   };
   const { thread } = threadId
     ? await client.request("thread/resume", { ...options, threadId })
-    : await client.request("thread/start", options);
+    : await client.request("thread/start", {
+        ...options,
+        dynamicTools: hostToolDefinitions,
+      });
   if (thread.turns.some((turn) => turn.status === "inProgress"))
     throw new Error("Native thread still has an active turn.");
 
+  client.toolHandler = (params) => {
+    if (
+      params.threadId !== thread.id ||
+      params.turnId !== turnId ||
+      execution.terminal
+    )
+      return Promise.reject(
+        new Error("Tool call does not belong to the active turn."),
+      );
+    return onToolCall(params);
+  };
   const events = new CodexEvents(write, runId);
   const controls = new Set<Promise<unknown>>();
   async function control<T>(request: Promise<T>): Promise<T> {
@@ -94,6 +113,7 @@ export async function openCodexTurn(
     async close() {
       // A terminal notification can precede the acknowledgment of Stop or steering.
       await Promise.allSettled(controls);
+      client.toolHandler = undefined;
       unsubscribe();
       events.finish();
     },
