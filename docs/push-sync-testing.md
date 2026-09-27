@@ -1,81 +1,45 @@
-# Test real pushes with simulated Course Sync
+# Test real publication with simulated Course Sync
 
-Test repository: [miguelaenlle/course-agent-push-sync-test](https://github.com/miguelaenlle/course-agent-push-sync-test). It is private and was created empty, without an initial commit. The configured target branch is `main`.
+Target: `miguelaenlle/course-agent-push-sync-test`, branch `main`. Initialize `main` with a README commit before testing. The publisher requires an existing branch.
 
-## Credentials you create
+## Configuration
 
-Create **one fine-grained GitHub PAT** scoped only to this repository, with **Repository Contents: Read and write**. Configure the same value as `GITHUB_TOKEN` in both trusted services:
+Use one fine-grained PAT scoped to this test repository with Contents: Read and write. Set the same `GITHUB_TOKEN` in the Worker secret (or local `.dev.vars`) and relay environment. The Worker only authorizes repository reads; the sandbox never receives the PAT. GitHub writes occur only in the trusted relay after approval.
 
-| Location                                                             | Use                                                  |
-| -------------------------------------------------------------------- | ---------------------------------------------------- |
-| Cloudflare Worker secret (local development: `apps/agent/.dev.vars`) | Injected only into allowed clone/fetch/pull requests |
-| PL relay environment (`.env.local`)                                  | Publishes explicitly approved patches                |
+The relay also needs `DATABASE_URL` pointing to a dedicated Postgres database. Set `AGENT_URL` and `RELAY_TOKEN` for the Worker you are testing. Do not set `PUSH_MODE=simulated` when testing real commits; Course Sync remains simulated regardless.
 
-The PAT has write permission, but the Worker outbound handler still rejects all push endpoints. The sandbox never receives the PAT itself. No Actions, Administration, or Workflows permission is needed. Do not put the PAT in Docker, the sandbox, the browser, Git remote URLs, tracked files, or Wrangler's plaintext `vars`.
+Follow [testing.md](testing.md) to start the local or deployed Worker, relay and UI. Deployment remains manual.
 
-Keep the existing `CODEX_API_KEY` and `RELAY_TOKEN` setup from [testing.md](testing.md).
+## Happy path
 
-## Local inference
+Ask Codex to create an ordinary UTF-8 text file, commit it locally, and call `push_sync` with the original base SHA and proposed SHA. The relay captures no mutable worktree state: the tool payload contains final committed file contents and deletions.
 
-1. In ignored `apps/agent/.dev.vars`, set:
+Before approval, check the raw diff in the card. The relay generates this diff against GitHub base blobs using the exact saved file contents that will be published. The sandbox-provided visual diff is not used to apply changes.
 
-   ```dotenv
-   CODEX_API_KEY=your-openai-key
-   GITHUB_TOKEN=your-repository-pat
-   ```
+Approve, then verify:
 
-2. In ignored root `.env.local`, set:
+- GitHub main has a new commit containing the reviewed files.
+- The commit message identifies the approval operation and content digest.
+- The card remains in place and shows the approved decision/result.
+- The agent receives the result and is instructed to fetch, reconcile and pull.
+- Course Sync reports `sync would go here`.
+- The relay has created no Git checkout or patch files.
 
-   ```dotenv
-   AGENT_URL=http://localhost:8790
-   GITHUB_TOKEN=your-repository-pat
-   PUSH_BRANCH=main
-   ```
+The GitHub SHA can differ from Codex's local proposed SHA. The agent must reconcile its checkout to the published commit while preserving newer edits before pulling.
 
-3. Run Docker, then `pnpm dev:agent`, **`pnpm dev:server`**, and `pnpm dev` in separate terminals. Use `dev:server` here because it loads `.env.local`; `dev:server:local` expects exported environment variables.
-4. Open `http://localhost:4315` and create a **new conversation**. Old workspaces retain their existing repository and native tool definitions.
+## Recovery checks
 
-## Cloudflare sandbox
+- **Deny:** no GitHub write or simulated sync should occur.
+- **Suspend:** let the pending tool reach idle cleanup and confirm the sandbox becomes absent. The approval remains visible. Approve or deny afterward; ordinary Send must not bypass the gate.
+- **Restart:** stop the relay during completion. Restart, refresh and press **Retry completion**. The stored verdict cannot be changed.
+- **Lost write acknowledgment:** the automated fake GitHub test creates a commit and loses its response. Retry finds the existing operation in branch history, even after another commit is appended.
+- **Concurrent main change:** a proposal cannot overwrite another commit. It reports the conflict to the agent, which must fetch and prepare a new proposal.
+- **Concurrent Retry:** the database claim permits one active completion attempt. A second caller receives a retryable busy response.
 
-The shared `GITHUB_REPOSITORY` constant in `packages/chat-contract/src/index.ts` selects the prototype repository for cloning, outbound Git access and approved publication. Repository selection is not a Wrangler variable. Set the shared PAT as a Worker secret:
+No background job completes abandoned publication operations. The user must explicitly Retry after an error; that is an intentional prototype tradeoff.
 
-```sh
-pnpm --filter @playground/agent exec wrangler secret put GITHUB_TOKEN --config wrangler.jsonc
-pnpm deploy
-```
+## Supported scope
 
-Keep `GITHUB_TOKEN` in root `.env.local` on the relay, along with `AGENT_URL` pointing to the deployed Worker and matching `RELAY_TOKEN`. Restart `pnpm dev:server`. Use the same PAT value in both places. Cloudflare enforces read-only sandbox access through its outbound request allowlist.
+GitHub `createCommitOnBranch` performs the commit/ref update using `expectedHeadOid`. Publication uses APIs only. This version supports ordinary text files and deletions, with a 256 KiB proposal bound. Executable-mode changes, symlinks, submodules, binary data and `.github/` changes are rejected. Do not force-push/rewrite the test branch while recovering an operation.
 
-## First proposal in the empty repository
-
-Ask the agent:
-
-> The remote repository is empty. Configure a local Git author identity if needed. Create hello.txt containing “First approved change”, commit it locally, and call push_sync. Use forty zeros (0000000000000000000000000000000000000000) as baseSha and the full local commit SHA as proposedSha. Wait for my approval. Do not push directly.
-
-The all-zero base means the configured remote branch must not yet exist. PL validates the exact patch in its own index and prepares a root commit. Before you approve, the GitHub repository remains empty.
-
-Review the diff and displayed repository/branch. Click **Approve**. Expect:
-
-- A real commit on GitHub's `main` branch containing exactly the approved patch.
-- The relay prints the pushed SHA and **“sync would go here”**.
-- Codex receives the real published SHA, the simulated sync status, and instructions to fetch, reconcile its checkout, then `git pull --ff-only` before continuing.
-
-PL creates its own commit from the approved patch, so its SHA can differ from the sandbox's proposed commit. For the first root commit, the two local histories can be unrelated. The agent must reconcile onto the published commit, preserving any newer edits, before pulling; a blind pull from the original local root is insufficient.
-
-## Follow-up checks
-
-- **Deny:** propose another change and deny it. GitHub must remain unchanged.
-- **Suspend:** leave a pending approval for ten minutes until the sandbox is absent. The stored patch remains actionable; approve, confirm the push, and check the restored agent receives the result.
-- **Stale base:** change the remote branch separately after the diff appears, then approve. PL must report a conflict and must not overwrite the remote change.
-- **Duplicate:** repeat an approval request/reload during publishing. The same operation must produce at most one commit.
-- **Relay restart:** restart after approving. The persisted publication job and result outbox resume work and reconcile the prepared SHA with the remote before retrying.
-
-Invalid proposals show an error and disable Approve; Deny remains available. Correct missing credentials/configuration and restart the relay before retrying validation, or deny and request a new proposal. Unknown network outcomes remain queued until the remote can be checked; they are not treated as confirmed push failures.
-
-## Implementation boundaries
-
-`apps/web/server/publish.ts` validates the hash/base, applies the patch in a separate trusted Git index, builds a deterministic candidate commit, rechecks the remote, and performs a normal non-force Git push. No proposed course files are executed or checked out on the relay. Git helpers, global configuration, hooks, and HTTP redirects are disabled. The PAT is supplied through child-process configuration, not arguments or saved Git configuration; Git errors are sanitized.
-
-`apps/web/server/conversations.ts` pins the repository, branch, patch and candidate SHA in SQLite before approval/push, records decisions, and resumes interrupted jobs. Keep `.data/chat.sqlite` **and** `.data/publish/` together on the same durable local disk. This is still a single-host prototype; production PrairieLearn needs shared durable storage and user/course authorization.
-
-Only regular text-file patches up to 256 KiB are supported. Binary patches, symlinks, submodules, path escapes, and `.github/` configuration are rejected. Course Sync is a printout, not a real PrairieLearn operation. Automated tests set `PUSH_MODE=simulated` for the sandbox fixture, and separately test actual Git pushes against a disposable local bare repository. Normal operation defaults to real publication and requires the PAT; it does not fall back to a user's GitHub CLI credentials.
+Automated tests mock GitHub, including failures after its external effect, and exercise the workflow against real local Postgres. They do not contact GitHub. Real GitHub and Cloudflare acceptance is manual.

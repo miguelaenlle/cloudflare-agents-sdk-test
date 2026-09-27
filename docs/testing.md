@@ -115,7 +115,7 @@ Open **http://localhost:4315**. The Worker listens on **8790**, the relay on **4
 
 Codex turns use `externalSandbox`: the Cloudflare container provides isolation and its outbound handler restricts network access. Codex does not create an inner Bubblewrap sandbox, so no custom Docker seccomp profile is needed. Agent commands can modify writable container files outside the workspace, including the app-server installation; treat the entire container and its output as untrusted.
 
-Try creating a file, reading it on another turn, steering, Stop, and restarting the relay. Then leave the completed conversation idle for ten minutes, observe backup/destruction in the Worker terminal, and ask Codex to read the file after restoration. Backups contain real workspace archives. Local restore extracts them; deployed restore uses an overlay, so keep the deployed acceptance checks below.
+Try creating a file, reading it on another turn, steering, Stop, and restarting the relay. Then leave the completed conversation idle for the configured idle interval, observe backup/destruction in the Worker terminal, and ask Codex to read the file after restoration. Backups contain real workspace archives. Local restore extracts them; deployed restore uses an overlay, so keep the deployed acceptance checks below.
 
 Worker edits reload locally. Container/image edits require Wrangler's `r` rebuild or a restart. A Worker restart may interrupt an active turn through our existing reconciliation policy; it never automatically repeats the prompt. Exiting Wrangler stops local containers, so do not expect unsaved workspace files to survive a dev-server restart. Only completed backups survive alongside DO history.
 
@@ -127,7 +127,7 @@ mv apps/agent/.wrangler/local apps/agent/.wrangler/local.previous
 
 Restart `pnpm dev:agent`. Move DO state and backups together; clearing only one leaves mismatched recovery handles. This reset affects local development only. Do not delete a running Docker container to simulate a graceful shutdown: forced deletion cannot create a final backup.
 
-### Verification performed
+### Earlier container validation (before this review round)
 
 The local Docker smoke test reached real OpenAI inference, rejected an unauthenticated private WebSocket, blocked unrelated outbound hosts, and confirmed no API-key environment variables or `auth.json` in the container. The ten-minute idle alarm created a real local R2 archive and destroyed the container; a new container restored a manually seeded workspace file.
 
@@ -207,7 +207,7 @@ pnpm deploy
 
 The configuration allows up to five concurrent sandbox containers. Each warm conversation occupies one slot until its sandbox shuts down; closing its browser tab does not free the slot. If startup reports the running-container limit, wait for idle cleanup or increase `containers[].max_instances` and redeploy. Workspace commands and Codex readiness each have a 60-second timeout; Cloudflare container allocation uses the SDK's separate startup/retry budget.
 
-This builds/uploads the container and deploys the Worker. On the first deployment, allow several minutes for the container image to provision before sending a prompt. No automated deployment is added. If upgrading a running prototype, finish or stop its active turn before deploying. Backups expire after 30 days; configure the R2 lifecycle rule described in the [README](../README.md).
+This builds/uploads the container and deploys the Worker. On the first deployment, allow several minutes for the container image to provision before sending a prompt. No automated deployment is added. If upgrading a running prototype, finish or stop its active turn before deploying. New checkpoints expire after seven days. If you configured an R2 lifecycle rule for the old 30-day retention period, update that rule manually to seven days.
 
 After deploying HTTPS egress changes, use a **new conversation** so the container starts with interception and its CA trust configured. Keep `enableInternet = false`; the allowlist permits the configured R2 hostname, GitHub, and the model proxy. Confirm `CLOUDFLARE_ACCOUNT_ID` is your actual account ID before deploying.
 
