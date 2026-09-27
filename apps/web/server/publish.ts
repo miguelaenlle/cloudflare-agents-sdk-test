@@ -1,22 +1,18 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { mkdir, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { GITHUB_REPOSITORY, type Approval } from "@playground/chat-contract";
+import { createTwoFilesPatch } from "diff";
+import {
+  proposalContent,
+  GITHUB_REPOSITORY,
+  type Approval,
+} from "@playground/chat-contract";
 
-const exec = promisify(execFile);
 export const EMPTY_BASE = "0".repeat(40);
 export type Destination = { repository: string; branch: string };
 export function destination(): Destination {
-  const repository = GITHUB_REPOSITORY;
-  const branch = process.env.PUSH_BRANCH ?? "main";
-  if (
-    !/^[\w.-]+\/[\w.-]+$/.test(repository) ||
-    !/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(branch)
-  )
-    throw new Error("Invalid publication destination.");
-  return { repository, branch };
+  return {
+    repository: GITHUB_REPOSITORY,
+    branch: process.env.PUSH_BRANCH ?? "main",
+  };
 }
 export type Publication = {
   id: string;
@@ -26,198 +22,215 @@ export type Publication = {
   candidate?: string;
 };
 export class PublishRejected extends Error {}
+
+/** Publish immutable file contents using GitHub APIs. No checkout or Git executable runs in the relay. */
 export class Publisher {
-  private root: string;
-  private remote: string;
-  private env: NodeJS.ProcessEnv;
+  private destination: Destination;
+  private options: { token: string; fetch?: typeof fetch };
   constructor(
-    root: string,
     destination: Destination,
-    options: { token?: string; localRemote?: string } = {},
+    options: { token: string; fetch?: typeof fetch },
   ) {
-    this.root = root;
-    this.remote =
-      options.localRemote ?? `https://github.com/${destination.repository}.git`;
-    // Do not inherit Git helpers/configuration/hooks from the developer's checkout.
-    this.env = {
-      PATH: process.env.PATH,
-      HOME: root,
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_GLOBAL: "/dev/null",
-      GIT_TERMINAL_PROMPT: "0",
-      GIT_ALLOW_PROTOCOL: options.localRemote ? "file" : "https",
-      GIT_CONFIG_COUNT: "4",
-      GIT_CONFIG_KEY_0: "credential.helper",
-      GIT_CONFIG_VALUE_0: "",
-      GIT_CONFIG_KEY_1: "core.hooksPath",
-      GIT_CONFIG_VALUE_1: "/dev/null",
-      GIT_CONFIG_KEY_2: "http.followRedirects",
-      GIT_CONFIG_VALUE_2: "false",
-      GIT_CONFIG_KEY_3: `http.${this.remote}.extraHeader`,
-      GIT_CONFIG_VALUE_3: options.token
-        ? `Authorization: Basic ${Buffer.from(`x-access-token:${options.token}`).toString("base64")}`
-        : "",
-    };
+    this.destination = destination;
+    this.options = options;
   }
-  private async git(
-    directory: string,
-    args: string[],
-    extraEnv: NodeJS.ProcessEnv = {},
-  ) {
-    try {
-      return (
-        await exec("git", ["-C", directory, ...args], {
-          env: { ...this.env, ...extraEnv },
-          timeout: 60_000,
-          maxBuffer: 2_000_000,
-        })
-      ).stdout.trimEnd();
-    } catch {
-      if (args[0] === "apply")
-        throw new PublishRejected(
-          "The saved diff is malformed or does not apply to the base commit. Deny this proposal and request a new one.",
-        );
-      // Git stderr/exec errors can include authentication material. Never expose them to logs or the agent.
+
+  private async request(path: string, body?: unknown) {
+    const response = await (this.options.fetch ?? fetch)(
+      `https://api.github.com${path}`,
+      {
+        method: body ? "POST" : "GET",
+        headers: {
+          Authorization: `Bearer ${this.options.token}`,
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(30_000),
+      },
+    );
+    // Do not forward provider response text: request errors can contain credentials or repository contents.
+    if (!response.ok)
       throw new Error(
-        `Git ${args[0]} failed. Check credentials, repository permissions, branch protection, or remote changes.`,
+        `GitHub request failed (${response.status}). Check repository access and branch protection, then Retry.`,
       );
-    }
+    return response.json();
   }
-  private directory(job: Publication) {
-    return resolve(this.root, job.id);
-  }
-  async remoteHead(job: Publication) {
-    const refs = await this.git(this.directory(job), [
-      "ls-remote",
-      "--heads",
-      this.remote,
-      `refs/heads/${job.destination.branch}`,
-    ]);
-    return refs.split(/\s/)[0] || EMPTY_BASE;
-  }
+
+  /** Verify trusted base blobs and generate the visual diff from exactly the saved publication files. */
   async prepare(job: Publication): Promise<string> {
     const { approval } = job;
     const digest = createHash("sha256")
-      .update(`${approval.baseSha}\n${approval.proposedSha}\n${approval.diff}`)
-      .digest("hex");
-    if (digest !== approval.digest) throw new Error("Proposal hash mismatch.");
-    if (
-      Buffer.byteLength(approval.diff) > 262144 ||
-      approval.diff.includes("GIT binary patch")
-    )
-      throw new Error("Only text patches up to 256 KiB are supported.");
-    const directory = this.directory(job);
-    await mkdir(directory, { recursive: true });
-    await this.git(directory, ["init", "--quiet"]);
-    await this.git(directory, [
-      "check-ref-format",
-      `refs/heads/${job.destination.branch}`,
-    ]);
-    const remote = await this.remoteHead(job);
-    if (remote !== approval.baseSha)
-      throw new Error(
-        "Remote branch changed. Fetch and prepare a new proposal.",
-      );
-    if (remote === EMPTY_BASE)
-      await this.git(directory, ["read-tree", "--empty"]);
-    else {
-      await this.git(directory, [
-        "fetch",
-        "--no-tags",
-        this.remote,
-        `refs/heads/${job.destination.branch}`,
-      ]);
-      if ((await this.git(directory, ["rev-parse", "FETCH_HEAD"])) !== remote)
-        throw new Error("Remote branch changed during validation.");
-      await this.git(directory, ["read-tree", remote]);
-    }
-    await writeFile(resolve(directory, "proposal.patch"), approval.diff, {
-      mode: 0o600,
-    });
-    // Apply to the index only; never execute or check out proposed repository code in PL.
-    await this.git(directory, [
-      "apply",
-      "--cached",
-      "--check",
-      "proposal.patch",
-    ]);
-    await this.git(directory, ["apply", "--cached", "proposal.patch"]);
-    const files = await this.git(directory, ["ls-files", "--stage", "-z"]);
-    for (const file of files.split("\0").filter(Boolean)) {
-      const [metadata, path] = file.split("\t");
-      if (
-        !/^(100644|100755) /.test(metadata!) ||
-        !path ||
-        path.toLowerCase().startsWith(".github/") ||
-        path.split("/").some((component) => component.toLowerCase() === ".git")
+      .update(
+        proposalContent(approval.baseSha, approval.proposedSha, approval.files),
       )
-        throw new Error(
-          "Prototype publication permits regular course files only; GitHub configuration, symlinks and submodules are excluded.",
+      .digest("hex");
+    if (digest !== approval.digest)
+      throw new PublishRejected("Proposal hash mismatch.");
+    if (approval.baseSha === EMPTY_BASE)
+      throw new PublishRejected(
+        "Initialize the test repository with a commit on main before requesting publication.",
+      );
+    const root = `/repos/${this.destination.repository}`;
+    const tree = (await this.request(
+      `${root}/git/trees/${approval.baseSha}?recursive=1`,
+    )) as {
+      truncated: boolean;
+      tree: { path: string; mode: string; sha: string }[];
+    };
+    if (tree.truncated)
+      throw new PublishRejected("Repository tree exceeds prototype limits.");
+    const seen = new Set<string>();
+    let diff = "";
+    let bytes = 0;
+    for (const file of approval.files) {
+      const components = file.path.split("/");
+      if (
+        seen.has(file.path) ||
+        components.some(
+          (p) => !p || p === "." || p === ".." || p.toLowerCase() === ".git",
+        ) ||
+        components[0]?.toLowerCase() === ".github" ||
+        /[\x00-\x1f\\]/.test(file.path)
+      )
+        throw new PublishRejected("Invalid or duplicate publication path.");
+      seen.add(file.path);
+      const previous = tree.tree.find((entry) => entry.path === file.path);
+      // createCommitOnBranch has no file-mode parameter. Keep this prototype to ordinary text files.
+      if (
+        (previous?.mode ?? "000000") !== file.previousMode ||
+        !["000000", "100644"].includes(file.previousMode) ||
+        file.mode !== (file.content === null ? "000000" : "100644")
+      )
+        throw new PublishRejected(
+          "Only ordinary text files are supported; executable files, symlinks, submodules and mode changes need a new proposal.",
         );
+      if (!previous && file.content === null)
+        throw new PublishRejected(
+          "Deleted file is absent from the base commit.",
+        );
+      let before = "";
+      if (previous) {
+        const blob = (await this.request(
+          `${root}/git/blobs/${previous.sha}`,
+        )) as { content: string; encoding: string };
+        if (blob.encoding !== "base64")
+          throw new PublishRejected("Unsupported GitHub blob encoding.");
+        before = new TextDecoder("utf-8", { fatal: true }).decode(
+          Buffer.from(blob.content, "base64"),
+        );
+      }
+      const after = file.content ?? "";
+      bytes += Buffer.byteLength(before) + Buffer.byteLength(after);
+      if (bytes > 262144 || before.includes("\0") || after.includes("\0"))
+        throw new PublishRejected(
+          "Only text proposals up to 256 KiB are supported.",
+        );
+      diff += createTwoFilesPatch(
+        previous ? `a/${file.path}` : "/dev/null",
+        file.content === null ? "/dev/null" : `b/${file.path}`,
+        before,
+        after,
+      );
     }
-    const tree = await this.git(directory, ["write-tree"]);
-    const candidate = await this.git(
-      directory,
-      [
-        "commit-tree",
-        tree,
-        ...(remote === EMPTY_BASE ? [] : ["-p", remote]),
-        "-m",
-        `Approved course-agent change ${job.id}`,
-      ],
-      {
-        GIT_AUTHOR_NAME: "Course agent prototype",
-        GIT_AUTHOR_EMAIL: "course-agent@example.invalid",
-        GIT_COMMITTER_NAME: "Course agent prototype",
-        GIT_COMMITTER_EMAIL: "course-agent@example.invalid",
-        GIT_AUTHOR_DATE: job.createdAt,
-        GIT_COMMITTER_DATE: job.createdAt,
-      },
-    );
-    return candidate;
+    if (!seen.size) throw new PublishRejected("Proposal contains no changes.");
+    approval.diff = diff;
+    return approval.digest;
   }
+
+  /** Find an acknowledged-or-uncertain earlier commit in branch history before attempting another write. */
+  private async published(job: Publication): Promise<string | undefined> {
+    let cursor: string | null = null;
+    let first = true;
+    do {
+      const result = (await this.request("/graphql", {
+        query: `query($owner:String!,$name:String!,$ref:String!,$cursor:String){repository(owner:$owner,name:$name){ref(qualifiedName:$ref){target{... on Commit{history(first:100,after:$cursor){nodes{oid message} pageInfo{hasNextPage endCursor}}}}}}}`,
+        variables: {
+          owner: this.destination.repository.split("/")[0],
+          name: this.destination.repository.split("/")[1],
+          ref: `refs/heads/${this.destination.branch}`,
+          cursor,
+        },
+      })) as {
+        errors?: unknown;
+        data?: {
+          repository?: {
+            ref?: {
+              target: {
+                history: {
+                  nodes: { oid: string; message: string }[];
+                  pageInfo: { hasNextPage: boolean; endCursor: string };
+                };
+              };
+            };
+          };
+        };
+      };
+      const history = result.data?.repository?.ref?.target.history;
+      if (result.errors || !history)
+        throw new Error(
+          "Could not inspect GitHub branch history. Initialize the branch and check access.",
+        );
+      for (const commit of history.nodes) {
+        if (commit.message.trimEnd() === this.message(job)) return commit.oid;
+        if (commit.oid === job.approval.baseSha) {
+          if (first) return;
+          throw new PublishRejected(
+            "Main changed since this proposal. Fetch and prepare a new proposal.",
+          );
+        }
+        first = false;
+      }
+      cursor = history.pageInfo.hasNextPage ? history.pageInfo.endCursor : null;
+    } while (cursor);
+    throw new PublishRejected(
+      "The approved base is no longer in branch history. Prepare a new proposal.",
+    );
+  }
+  private message(job: Publication) {
+    return `Approved course-agent change ${job.id}\n\nProposal: ${job.approval.digest}`;
+  }
+
+  /** expectedHeadOid prevents overwriting concurrent changes. Unknown outcomes remain retryable. */
   async push(job: Publication): Promise<string> {
     if (!job.candidate) throw new Error("Proposal has not been validated.");
-    const head = await this.remoteHead(job);
-    if (head === job.candidate) return job.candidate; // Recovery after a successful push with a lost acknowledgment.
-    if (head !== job.approval.baseSha) {
-      if (head !== EMPTY_BASE) {
-        await this.git(this.directory(job), [
-          "fetch",
-          "--no-tags",
-          this.remote,
-          `refs/heads/${job.destination.branch}`,
-        ]);
-        try {
-          await this.git(this.directory(job), [
-            "merge-base",
-            "--is-ancestor",
-            job.candidate,
-            "FETCH_HEAD",
-          ]);
-          return job.candidate;
-        } catch {
-          /* A different remote history is a conflict. */
-        }
-      }
-      throw new PublishRejected(
-        "Remote branch changed after approval. Prepare a new proposal.",
+    const prior = await this.published(job);
+    if (prior) return prior;
+    const result = (await this.request("/graphql", {
+      query:
+        "mutation($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid}}}",
+      variables: {
+        input: {
+          branch: {
+            repositoryNameWithOwner: job.destination.repository,
+            branchName: job.destination.branch,
+          },
+          expectedHeadOid: job.approval.baseSha,
+          message: {
+            headline: `Approved course-agent change ${job.id}`,
+            body: `Proposal: ${job.approval.digest}`,
+          },
+          fileChanges: {
+            additions: job.approval.files
+              .filter((f) => f.content !== null)
+              .map((f) => ({
+                path: f.path,
+                contents: Buffer.from(f.content!).toString("base64"),
+              })),
+            deletions: job.approval.files
+              .filter((f) => f.content === null)
+              .map((f) => ({ path: f.path })),
+          },
+        },
+      },
+    })) as {
+      errors?: unknown;
+      data?: { createCommitOnBranch?: { commit: { oid: string } } };
+    };
+    if (result.errors || !result.data?.createCommitOnBranch)
+      throw new Error(
+        "GitHub did not confirm publication. Retry to reconcile; if main changed, deny and prepare a new proposal.",
       );
-    }
-    try {
-      await this.git(this.directory(job), [
-        "push",
-        this.remote,
-        `${job.candidate}:refs/heads/${job.destination.branch}`,
-      ]);
-    } catch (error) {
-      const current = await this.remoteHead(job); // Unknown network outcome stays queued until it can be reconciled.
-      if (current === job.candidate) return job.candidate;
-      if (current !== head) return this.push(job);
-      throw new PublishRejected(
-        error instanceof Error ? error.message : "Git push was rejected.",
-      );
-    }
-    return job.candidate;
+    return result.data.createCommitOnBranch.commit.oid;
   }
 }

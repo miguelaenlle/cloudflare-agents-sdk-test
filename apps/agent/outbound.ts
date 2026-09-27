@@ -1,6 +1,7 @@
 import { GITHUB_REPOSITORY } from "@playground/chat-contract";
 
 // This executes in Workers, never inside the Linux container.
+/** Inject the model credential outside the sandbox, only for the allowlisted inference endpoint. */
 export async function forwardOpenAI(
   request: Request,
   env: { CODEX_API_KEY: unknown },
@@ -36,6 +37,7 @@ export async function forwardOpenAI(
   }
 }
 
+/** Allow repository reads with injected credentials; pushes require the trusted relay approval path. */
 export async function forwardGitHub(
   request: Request,
   env: { GITHUB_TOKEN?: string },

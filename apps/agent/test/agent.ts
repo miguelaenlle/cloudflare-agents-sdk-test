@@ -36,6 +36,14 @@ export class Chat extends ProductionChat {
   }
   override async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
+    if (path.endsWith("/test/launch")) {
+      await this.fixture().configureLaunch(await request.json());
+      return new Response(null, { status: 204 });
+    }
+    if (path.endsWith("/test/legacy-approval-lock")) {
+      this.setState({ ...this.state, ...{ approvalPreparing: true } });
+      return new Response(null, { status: 204 });
+    }
     if (path.endsWith("/test/approval")) {
       await this.fixture().requestApproval();
       return new Response(null, { status: 204 });
@@ -140,6 +148,14 @@ export class Chat extends ProductionChat {
     }
     if (path.endsWith("/test/schedules"))
       return Response.json(this.getSchedules());
+    if (path.endsWith("/test/delete-checkpoint")) {
+      const id = this.state.checkpoint!.backup.id;
+      await this.env.BACKUP_BUCKET.delete([
+        `backups/${id}/data.sqsh`,
+        `backups/${id}/meta.json`,
+      ]);
+      return new Response(null, { status: 204 });
+    }
     if (path.endsWith("/test/backup-objects")) {
       const objects = await this.env.BACKUP_BUCKET.list({ prefix: "backups/" });
       return Response.json(objects.objects.map((object) => object.key));

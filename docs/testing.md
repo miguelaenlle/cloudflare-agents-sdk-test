@@ -2,9 +2,55 @@
 
 Use **`codex/review-v2-06-publication`**, the top of the behavior-oriented stack. The original PRs and `codex/prototype` remain unchanged. Commands run from the repository root. Preserve local credentials and Wrangler configuration.
 
+## Updated setup for this review round
+
+The relay now requires PostgreSQL instead of `.data/chat.sqlite`. No old local database is migrated.
+
+```sh
+createdb course_agent
+export DATABASE_URL=postgresql://localhost/course_agent
+pnpm install --frozen-lockfile
+```
+
+Use a separate database, not the production PrairieLearn database. The prototype creates its tables at relay startup. Automated tests create and remove isolated schemas in this database.
+
+### Local, without inference or publication
+
+```sh
+pnpm typecheck
+pnpm --filter @playground/agent test
+pnpm --filter @playground/agent test:native
+pnpm --filter @playground/web exec node --experimental-strip-types --test test/publish.test.ts test/postgres.test.ts
+pnpm --filter @playground/web exec node test/review.mjs
+pnpm --filter @playground/web exec node test/relay.mjs
+```
+
+The two integration suites use ports 8791 and 4318; run them sequentially. GitHub API tests simulate external effects and lost acknowledgments; they do not contact GitHub or push commits.
+
+For browser testing, start the simulated Worker as described below, run the relay with `PUSH_MODE=simulated DATABASE_URL=postgresql://localhost/course_agent`, and start the UI. For real prompts, use the production local Worker and Docker path below instead.
+
+### Cloudflare, deployed manually
+
+1. Keep `DATABASE_URL` on the relay. Set `AGENT_URL` to your deployed Worker URL. Postgres is not a Worker binding.
+2. Put `CODEX_API_KEY`, `GITHUB_TOKEN` and `RELAY_TOKEN` in Worker secrets as appropriate. The relay needs the same relay token and a GitHub token with access to the configured test repository. Never commit those values.
+3. Initialize the test repository's `main` branch with a README commit. The new GitHub API publisher requires an existing branch.
+4. Deploy manually with `pnpm deploy`, then restart the relay and browser. Omit `PUSH_MODE=simulated` only when you want a real GitHub commit. Course Sync remains simulated in either mode.
+5. Use a new conversation: this prototype intentionally has no compatibility migration for the old approval/revision format.
+
+### Review-round acceptance checks
+
+- Open two tabs on one conversation. Send in one; the other receives events, preserves its draft and blocks a stale Send until Refresh history.
+- Inspect browser Network: one snapshot-event SSE connection plus the AI SDK stream; no recurring history/diagnostics requests.
+- Disconnect/reconnect the relay. The event stream reconnects and loads a current snapshot.
+- Request a `push_sync` proposal containing ordinary text files. Verify the displayed diff; executable files and mode changes are intentionally unsupported.
+- Leave approval pending until idle expiration destroys the sandbox. The card remains visible. Ordinary Send stays blocked; approve/deny restores and delivers the outcome.
+- Interrupt the relay during approval, restart, refresh and choose **Retry completion**. The saved verdict cannot change; completed stages are reused and result delivery is deduplicated.
+- For a real push, inspect GitHub and confirm there is one commit for the operation. There should be no new `.data/publish` checkout on the relay.
+- On ordinary idle suspension, confirm only the latest R2 checkpoint remains. Its expiration is seven days. Old deployed objects may remain until their existing lifecycle or cleanup runs.
+
 ## 1. Local automated checks
 
-Prerequisites: Node 22.18+ and pnpm 11. These tests need no API key, Docker, R2, or cloud deployment.
+Prerequisites: Node 22.18+, pnpm 11, and local PostgreSQL. These tests need no API key, Docker, R2, or cloud deployment.
 
 ```sh
 git switch codex/review-v2-06-publication
@@ -34,7 +80,7 @@ Check the production Worker bundle without deploying or building a container:
 pnpm --filter @playground/agent exec wrangler deploy --config wrangler.jsonc --dry-run --containers-rollout=none --outdir dist
 ```
 
-The live prototype uses **ten minutes idle** and **six hours without accepted user interaction**. The six-hour deadline also bounds active work. Simulated lifecycle tests use the production timeout, except for one test-only 30-second case that checks deadline-before-idle ordering.
+The live prototype uses **30 seconds idle (testing setting)** and **six hours without accepted user interaction**. The six-hour deadline also bounds active work. Simulated lifecycle tests use the production timeout, except for one test-only 30-second case that checks deadline-before-idle ordering.
 
 ## Real local development (actual prompts)
 

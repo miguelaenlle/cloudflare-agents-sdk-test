@@ -1,15 +1,15 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import pg from "pg";
 import {
   ChatError,
-  approvalOutcomeSchema,
+  approvalSchema,
   type ApprovalDecision,
   type Approval,
   type ChatSnapshot,
+  type ChatProvider,
+  type SendRequest,
 } from "@playground/chat-contract";
-
 import {
   Publisher,
   PublishRejected,
@@ -17,254 +17,299 @@ import {
   type Publication,
 } from "./publish.ts";
 
-const path = resolve(process.env.CHAT_DB_PATH ?? ".data/chat.sqlite");
-mkdirSync(dirname(path), { recursive: true });
-const db = new DatabaseSync(path);
-db.exec(`PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS approval_decisions (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, payload TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS publications (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, job TEXT NOT NULL, decision TEXT);
-INSERT OR IGNORE INTO conversations VALUES ('playground', 'Playground');`);
-export function listConversations() {
-  return db
-    .prepare("SELECT id, title FROM conversations ORDER BY rowid DESC")
-    .all();
+const blocks = (
+  await readFile(new URL("./conversations.sql", import.meta.url), "utf8")
+)
+  .split(/^-- BLOCK /m)
+  .slice(1);
+const statements = new Map(
+  blocks.map((block) => [
+    block.slice(0, block.indexOf("\n")).trim(),
+    block.slice(block.indexOf("\n") + 1),
+  ]),
+);
+function sql(name: string) {
+  const statement = statements.get(name);
+  if (!statement) throw new Error(`Missing SQL block: ${name}`);
+  return statement;
 }
-export function createConversation(title: string) {
-  const conversation = { id: randomUUID(), title };
-  db.prepare("INSERT INTO conversations VALUES (?, ?)").run(
-    conversation.id,
-    title,
-  );
-  return conversation;
-}
-export function hasConversation(id: string) {
-  return !!db.prepare("SELECT id FROM conversations WHERE id = ?").get(id);
-}
-const preparing = new Map<string, Promise<Publication>>();
-const publishing = new Map<
-  string,
-  Promise<ReturnType<typeof approvalOutcomeSchema.parse>>
->();
+const connectionString =
+  process.env.DATABASE_URL ?? "postgresql://localhost/course_agent";
+export const db = new pg.Pool({ connectionString });
+await db.query(
+  await readFile(new URL("./schema.sql", import.meta.url), "utf8"),
+);
 const simulated = process.env.PUSH_MODE === "simulated";
+
+/** LISTEN is established before reading a snapshot, so no change can fall into a subscription gap. */
+export async function subscribe(
+  id: string,
+  changed: () => void,
+  failed: () => void,
+) {
+  const client = new pg.Client({ connectionString });
+  client.on("error", failed);
+  client.on("end", failed);
+  client.on("notification", (event) => {
+    if (event.payload === id) changed();
+  });
+  await client.connect();
+  await client.query(sql("listen"));
+  return () => {
+    client.removeAllListeners();
+    void client.end();
+  };
+}
+async function notify(id: string) {
+  await db.query(sql("notify"), [id]);
+}
+export async function listConversations() {
+  return (await db.query(sql("list_conversations"))).rows;
+}
+export async function createConversation(title: string) {
+  const value = { id: randomUUID(), title };
+  await db.query(sql("insert_conversation"), [value.id, title]);
+  return value;
+}
+export async function hasConversation(id: string) {
+  return !!(await db.query(sql("has_conversation"), [id])).rowCount;
+}
+
+/** Reserve admission atomically across tabs and relay instances. A retry with the same payload keeps its revision. */
+export async function reserve(
+  id: string,
+  operation: string,
+  payload: unknown,
+  expected: number,
+) {
+  const client = await db.connect();
+  try {
+    await client.query(sql("begin"));
+    const row = (await client.query(sql("lock_conversation"), [id])).rows[0];
+    if (!row) throw new ChatError(404, "Conversation not found.");
+    const existing = (
+      await client.query(sql("select_operation"), [id, operation])
+    ).rows[0];
+    if (existing) {
+      const same = (
+        await client.query(sql("same_operation"), [
+          id,
+          operation,
+          JSON.stringify(payload),
+        ])
+      ).rows[0].same;
+      if (!same)
+        throw new ChatError(
+          409,
+          "Operation ID was reused with different input.",
+        );
+      await client.query(sql("commit"));
+      return Number(existing.revision);
+    }
+    if (Number(row.revision) !== expected)
+      throw new ChatError(
+        409,
+        "This conversation changed. Refresh history; your draft is preserved.",
+      );
+    const revision = expected + 1;
+    await client.query(sql("advance_revision"), [id, revision]);
+    await client.query(sql("insert_operation"), [
+      id,
+      operation,
+      JSON.stringify(payload),
+      revision,
+    ]);
+    await client.query(sql("notify"), [id]);
+    await client.query(sql("commit"));
+    return revision;
+  } catch (error) {
+    await client.query(sql("rollback"));
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+export async function admit(id: string, input: SendRequest) {
+  return reserve(
+    id,
+    input.id,
+    { kind: "message", text: input.text },
+    input.expectedRevision,
+  );
+}
 function publisher(job: Publication) {
   const token = process.env.GITHUB_TOKEN;
   if (!token)
     throw new Error(
       "Set GITHUB_TOKEN on the PL relay to enable approved pushes.",
     );
-  return new Publisher(resolve(dirname(path), "publish"), job.destination, {
-    token,
-  });
+  return new Publisher(job.destination, { token });
 }
-function readJob(id: string) {
-  const row = db.prepare("SELECT job FROM publications WHERE id = ?").get(id);
-  return row ? (JSON.parse(String(row.job)) as Publication) : undefined;
+async function row(id: string) {
+  return (await db.query(sql("select_publication"), [id])).rows[0];
 }
-function prepare(
-  conversationId: string,
-  approval: Approval,
-): Promise<Publication> {
-  const key = `${conversationId}:${approval.id}`;
-  const previous = preparing.get(key);
-  if (previous)
-    return previous.then((job) => {
-      if (job.approval.digest !== approval.digest)
-        throw new ChatError(409, "Approval payload changed.");
-      return job;
-    });
-  const task = (async () => {
-    const owner = db
-      .prepare("SELECT conversation_id FROM publications WHERE id = ?")
-      .get(approval.id);
-    if (owner && owner.conversation_id !== conversationId)
-      throw new ChatError(409, "Approval belongs to another conversation.");
-    let job = readJob(approval.id);
-    if (!job) {
-      job = {
-        id: approval.id,
-        destination: destination(),
-        approval,
-        createdAt: new Date().toISOString(),
-      };
-      db.prepare(
-        "INSERT INTO publications (id, conversation_id, job) VALUES (?, ?, ?)",
-      ).run(job.id, conversationId, JSON.stringify(job));
-    }
-    if (job.approval.digest !== approval.digest)
-      throw new ChatError(409, "Approval payload changed.");
-    if (!job.candidate) {
-      job.candidate = await publisher(job).prepare(job);
-      db.prepare("UPDATE publications SET job = ? WHERE id = ?").run(
-        JSON.stringify(job),
-        job.id,
-      );
-    }
-    return job;
-  })();
-  preparing.set(key, task);
-  return task;
-}
+
+/** The DO transports a generic immutable payload; PL stores the proposal and owns its user decision. */
 export async function publicationSnapshot(
-  conversationId: string,
+  id: string,
   snapshot: ChatSnapshot,
 ): Promise<ChatSnapshot> {
-  if (simulated || !snapshot.approval || snapshot.approval.status !== "pending")
-    return snapshot;
-  const pending = db
-    .prepare("SELECT decision FROM publications WHERE id = ?")
-    .get(snapshot.approval.id)?.decision;
-  try {
-    const job = await prepare(conversationId, snapshot.approval);
-    return {
-      ...snapshot,
-      publication: {
-        ...job.destination,
-        status: pending ? "publishing" : "ready",
-      },
+  const tool = snapshot.pendingTool;
+  if (tool?.name === "push_sync") {
+    const approval = approvalSchema.parse({
+      ...(tool.args as object),
+      id: tool.id,
+    });
+    const job: Publication = {
+      id: tool.id,
+      destination: destination(),
+      approval,
+      createdAt: new Date().toISOString(),
     };
-  } catch (error) {
-    return {
-      ...snapshot,
-      publication: {
-        ...(readJob(snapshot.approval.id)?.destination ?? destination()),
-        status: "invalid",
-        error:
-          error instanceof Error
-            ? error.message
-            : "Proposal validation failed.",
-      },
+    await db.query(sql("insert_publication"), [
+      job.id,
+      id,
+      JSON.stringify(job),
+    ]);
+  }
+  const jobs = (await db.query(sql("list_publications"), [id])).rows;
+  const approvals: Approval[] = jobs.map((r) => ({
+    ...r.job.approval,
+    status: r.decision
+      ? r.decision.approved
+        ? "approved"
+        : "denied"
+      : "pending",
+    result: r.outcome?.result,
+  }));
+  const current = jobs.find((r) => r.id === tool?.id) ?? jobs.at(-1);
+  let publication: ChatSnapshot["publication"];
+  if (current && !current.delivered) {
+    let error: string | undefined;
+    if (!current.job.candidate && !simulated) {
+      try {
+        current.job.candidate = await publisher(current.job).prepare(
+          current.job,
+        );
+        await db.query(sql("save_candidate"), [
+          current.id,
+          JSON.stringify(current.job),
+        ]);
+        const index = approvals.findIndex((a) => a.id === current.id);
+        approvals[index] = {
+          ...approvals[index]!,
+          diff: current.job.approval.diff,
+        };
+      } catch (failure) {
+        error =
+          failure instanceof Error
+            ? failure.message
+            : "Proposal validation failed.";
+      }
+    }
+    publication = {
+      ...current.job.destination,
+      status: current.decision ? "publishing" : error ? "invalid" : "ready",
+      decision: current.decision?.approved,
+      error,
     };
   }
-}
-function saveOutcome(
-  conversationId: string,
-  input: ApprovalDecision,
-  result: string,
-) {
-  const value = { ...input, result };
-  db.prepare(
-    "INSERT OR IGNORE INTO approval_decisions (id, conversation_id, payload) VALUES (?, ?, ?)",
-  ).run(input.id, conversationId, JSON.stringify(value));
-  return value;
-}
-async function publishDecision(
-  conversationId: string,
-  input: ApprovalDecision,
-) {
-  const previous = publishing.get(input.id);
-  if (previous) return previous;
-  const task = (async () => {
-    const saved = db
-      .prepare("SELECT payload FROM approval_decisions WHERE id = ?")
-      .get(input.id);
-    if (saved)
-      return approvalOutcomeSchema.parse(JSON.parse(String(saved.payload)));
-    const job = readJob(input.id)!;
-    try {
-      const sha = await publisher(job).push(job);
-      console.log(`Approval ${input.id}: pushed ${sha}; sync would go here`);
-      return saveOutcome(
-        conversationId,
-        input,
-        `Push succeeded: ${job.destination.repository} branch ${job.destination.branch}, commit ${sha}. Course Sync: simulated (sync would go here). Run git fetch origin, reconcile your checkout with ${sha} while preserving any newer edits, then git pull --ff-only before continuing. PL applied the approved patch as a new commit, so its SHA can differ from your proposed commit.`,
-      );
-    } catch (error) {
-      if (!(error instanceof PublishRejected)) throw error;
-      return saveOutcome(
-        conversationId,
-        input,
-        `Push failed: ${error.message} Course Sync did not run. Fetch the remote branch and prepare a new proposal.`,
-      );
-    }
-  })().finally(() => publishing.delete(input.id));
-  publishing.set(input.id, task);
-  return task;
-}
-export async function recordDecision(
-  conversationId: string,
-  input: ApprovalDecision,
-  approval: Approval,
-) {
-  const existing = db
-    .prepare(
-      "SELECT payload, conversation_id FROM approval_decisions WHERE id = ?",
-    )
-    .get(input.id);
-  if (existing) {
-    const value = approvalOutcomeSchema.parse(
-      JSON.parse(String(existing.payload)),
-    );
-    if (
-      existing.conversation_id !== conversationId ||
-      value.digest !== input.digest ||
-      value.approved !== input.approved
-    )
-      throw new ChatError(409, "A different decision was already recorded.");
-    return value;
-  }
-  const recorded = db
-    .prepare("SELECT decision FROM publications WHERE id = ?")
-    .get(input.id)?.decision;
-  if (recorded && JSON.parse(String(recorded)).approved !== input.approved)
-    throw new ChatError(409, "A different decision was already recorded.");
-  if (!input.approved)
-    return saveOutcome(
-      conversationId,
-      input,
-      "The user denied this proposal. No changes were published.",
-    );
-  if (simulated)
-    return saveOutcome(
-      conversationId,
-      input,
-      "Approved. sync would go here. SIMULATION ONLY: no commit was published and no sync ran.",
-    );
-  await prepare(conversationId, approval);
-  db.prepare(
-    "UPDATE publications SET decision = ? WHERE id = ? AND decision IS NULL",
-  ).run(JSON.stringify(input), input.id);
-  const chosen = JSON.parse(
-    String(
-      db
-        .prepare("SELECT decision FROM publications WHERE id = ?")
-        .get(input.id)!.decision,
-    ),
-  ) as ApprovalDecision;
-  if (chosen.approved !== input.approved)
-    throw new ChatError(409, "A different decision was already recorded.");
-  return publishDecision(conversationId, chosen);
-}
-export async function retryPublications() {
-  const rows = db
-    .prepare(
-      "SELECT p.conversation_id, p.decision FROM publications p LEFT JOIN approval_decisions d ON p.id = d.id WHERE p.decision IS NOT NULL AND d.id IS NULL",
-    )
-    .all();
-  for (const row of rows) {
-    try {
-      await publishDecision(
-        String(row.conversation_id),
-        JSON.parse(String(row.decision)) as ApprovalDecision,
-      );
-    } catch {
-      /* Preserve uncertain pushes for reconciliation after connection/credential recovery. */
-    }
-  }
-}
-export function pendingDecisions() {
-  return db
-    .prepare(
-      "SELECT conversation_id, payload FROM approval_decisions WHERE delivered = 0",
-    )
-    .all()
-    .map((row) => ({
-      conversationId: String(row.conversation_id),
-      input: approvalOutcomeSchema.parse(JSON.parse(String(row.payload))),
-    }));
-}
-export function deliveredDecision(id: string) {
-  db.prepare("UPDATE approval_decisions SET delivered = 1 WHERE id = ?").run(
-    id,
+  const revision = Number(
+    (await db.query(sql("select_revision"), [id])).rows[0]?.revision ?? 0,
   );
+  return {
+    ...snapshot,
+    revision,
+    approval: approvals.find((a) => a.id === current?.id),
+    approvals,
+    publication,
+  };
+}
+
+/** A session advisory lock serializes Retry across webservers and is released when a crashed connection closes. */
+export async function recordDecision(
+  id: string,
+  input: ApprovalDecision,
+  chat: ChatProvider,
+) {
+  const client = await db.connect();
+  const key = `publication:${input.id}`;
+  let locked = false;
+  try {
+    locked = (await client.query(sql("claim_publication"), [key])).rows[0]
+      .locked;
+    if (!locked)
+      throw new ChatError(
+        409,
+        "This decision is still processing. Retry shortly.",
+      );
+    let saved = await row(input.id);
+    if (
+      !saved ||
+      saved.conversation_id !== id ||
+      saved.job.approval.digest !== input.digest
+    )
+      throw new ChatError(409, "Proposal changed. Refresh before deciding.");
+    await reserve(
+      id,
+      `decision:${input.id}`,
+      { digest: input.digest, approved: input.approved },
+      input.expectedRevision,
+    );
+    if (saved.decision && saved.decision.approved !== input.approved)
+      throw new ChatError(409, "A different decision is already recorded.");
+    await db.query(sql("save_decision"), [input.id, JSON.stringify(input)]);
+    await notify(id);
+    saved = await row(input.id);
+    if (!saved.outcome) {
+      let result: string;
+      if (!input.approved)
+        result = "The user denied this proposal. No changes were published.";
+      else if (simulated)
+        result =
+          "Approved. sync would go here. SIMULATION ONLY: no commit was published and no sync ran.";
+      else {
+        const job: Publication = saved.job;
+        if (!job.candidate)
+          throw new Error(
+            "Proposal has not been validated. Refresh and Retry.",
+          );
+        let sha: string;
+        try {
+          sha = saved.published_sha ?? (await publisher(job).push(job));
+        } catch (error) {
+          if (!(error instanceof PublishRejected)) throw error;
+          await db.query(sql("save_outcome"), [
+            input.id,
+            JSON.stringify({
+              id: input.id,
+              result: `Publication failed: ${error.message} Course Sync did not run. Prepare a new proposal.`,
+            }),
+          ]);
+          saved = await row(input.id);
+          await chat.decide(saved.outcome, AbortSignal.timeout(30_000));
+          await db.query(sql("mark_delivered"), [input.id]);
+          await notify(id);
+          return;
+        }
+        // Save the external effect before sync. An uncertain write is rediscovered by its operation identity.
+        await db.query(sql("save_sha"), [input.id, sha]);
+        console.log(`Approval ${input.id}: sync would go here`);
+        result = `Push succeeded: ${job.destination.repository} branch ${job.destination.branch}, commit ${sha}. Course Sync: simulated (sync would go here). Run git fetch origin, reconcile your checkout with ${sha} while preserving newer edits, then git pull --ff-only before continuing.`;
+      }
+      await db.query(sql("save_outcome"), [
+        input.id,
+        JSON.stringify({ id: input.id, result }),
+      ]);
+      saved = await row(input.id);
+    }
+    if (!saved.delivered) {
+      await chat.decide(saved.outcome, AbortSignal.timeout(30_000));
+      await db.query(sql("mark_delivered"), [input.id]);
+    }
+    await notify(id);
+  } finally {
+    if (locked) await client.query(sql("release_publication"), [key]);
+    client.release();
+  }
 }

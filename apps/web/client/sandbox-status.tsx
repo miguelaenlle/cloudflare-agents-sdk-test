@@ -1,8 +1,5 @@
 import { useEffect, useState } from "react";
-import {
-  sandboxDiagnosticsSchema,
-  type SandboxDiagnostics,
-} from "@playground/chat-contract";
+import { type SandboxDiagnostics } from "@playground/chat-contract";
 
 function Expiration({
   label,
@@ -31,16 +28,12 @@ function Expiration({
 }
 
 export function SandboxStatus({
-  api,
+  diagnostics,
   retryApi,
 }: {
-  api: string;
+  diagnostics?: SandboxDiagnostics;
   retryApi: string;
 }) {
-  const [diagnostics, setDiagnostics] = useState<SandboxDiagnostics | null>(
-    null,
-  );
-  const [unavailable, setUnavailable] = useState(false);
   const [now, setNow] = useState(Date.now);
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState("");
@@ -57,13 +50,6 @@ export function SandboxStatus({
         throw new Error(
           "Could not retry cleanup. Refresh diagnostics and try again.",
         );
-      const next = await fetch(api, {
-        signal: AbortSignal.timeout(5000),
-        cache: "no-store",
-      });
-      if (!next.ok)
-        throw new Error("Cleanup requested, but diagnostics are unavailable.");
-      setDiagnostics(sandboxDiagnosticsSchema.parse(await next.json()));
     } catch (error) {
       setRetryError(
         error instanceof Error ? error.message : "Cleanup retry failed.",
@@ -73,46 +59,16 @@ export function SandboxStatus({
     }
   }
 
-  // Read-only polling also observes lifecycle changes when no chat stream is attached.
+  // This timer only renders the countdown; lifecycle changes arrive through conversation events.
   useEffect(() => {
-    const controller = new AbortController();
-    let poll: ReturnType<typeof setTimeout>;
-    async function refresh() {
-      try {
-        const response = await fetch(api, {
-          signal: AbortSignal.any([
-            controller.signal,
-            AbortSignal.timeout(5000),
-          ]),
-          cache: "no-store",
-        });
-        if (!response.ok) throw new Error("Diagnostics unavailable");
-        const value = sandboxDiagnosticsSchema.parse(await response.json());
-        if (!controller.signal.aborted) {
-          setDiagnostics(value);
-          setUnavailable(false);
-        }
-      } catch {
-        if (!controller.signal.aborted) setUnavailable(true);
-      } finally {
-        if (!controller.signal.aborted) poll = setTimeout(refresh, 2000);
-      }
-    }
-    void refresh();
     const clock = setInterval(() => setNow(Date.now()), 1000);
-    return () => {
-      controller.abort();
-      clearTimeout(poll);
-      clearInterval(clock);
-    };
-  }, [api]);
+    return () => clearInterval(clock);
+  }, []);
 
   return (
     <section aria-label="Sandbox diagnostics" className="hint">
       <strong>Sandbox</strong>
-      {unavailable ? (
-        <p>Diagnostics unavailable; retrying…</p>
-      ) : diagnostics ? (
+      {diagnostics ? (
         <>
           <div>
             State: <code>{diagnostics.state}</code>
@@ -152,6 +108,9 @@ export function SandboxStatus({
             </>
           )}
           {retryError && <p role="alert">{retryError}</p>}
+          {diagnostics.checkpointError && (
+            <p role="alert">{diagnostics.checkpointError}</p>
+          )}
           <Expiration
             label="Interaction expiration"
             at={diagnostics.interactionExpiresAt}

@@ -1,113 +1,152 @@
+import { proposalContent } from "@playground/chat-contract";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { Publisher, EMPTY_BASE, type Publication } from "../server/publish.ts";
-const exec = promisify(execFile);
-async function git(directory: string, ...args: string[]) {
-  return (await exec("git", ["-C", directory, ...args])).stdout.trim();
-}
-function job(baseSha: string, diff: string): Publication {
-  const proposedSha = "a".repeat(40);
+import { Publisher, type Publication } from "../server/publish.ts";
+
+function job(): Publication {
+  const files = [
+    {
+      path: "hello.txt",
+      content: "new\n",
+      previousMode: "100644",
+      mode: "100644",
+    },
+  ];
+  const baseSha = "a".repeat(40),
+    proposedSha = "b".repeat(40);
   return {
     id: randomUUID(),
+    destination: { repository: "example/course", branch: "main" },
     createdAt: new Date().toISOString(),
-    destination: { repository: "owner/test", branch: "main" },
     approval: {
       id: randomUUID(),
       baseSha,
       proposedSha,
-      diff,
-      status: "pending",
+      files,
+      diff: "untrusted visual diff",
       digest: createHash("sha256")
-        .update(`${baseSha}\n${proposedSha}\n${diff}`)
+        .update(proposalContent(baseSha, proposedSha, files))
         .digest("hex"),
+      status: "pending",
     },
   };
 }
-const patch =
-  "diff --git a/hello.txt b/hello.txt\nnew file mode 100644\n--- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+hello\n";
-test("real pushes: empty branch, approved patch, duplicate recovery, stale base, and unsafe files", async () => {
-  const root = await mkdtemp(join(tmpdir(), "publish-test-"));
-  try {
-    await exec("git", ["init", "--bare", join(root, "remote.git")]);
-    const remote = join(root, "remote.git");
-    const publisher = new Publisher(
-      join(root, "jobs"),
-      { repository: "owner/test", branch: "main" },
-      { localRemote: remote },
-    );
-    await assert.rejects(
-      publisher.prepare(job(EMPTY_BASE, patch.trimEnd())),
-      /saved diff is malformed or does not apply/,
-    );
-    const first = job(EMPTY_BASE, patch);
-    first.candidate = await publisher.prepare(first);
-    assert.equal(
-      await git(
-        remote,
-        "for-each-ref",
-        "--format=%(objectname)",
-        "refs/heads/main",
+function github(value: Publication) {
+  let commits = [{ oid: value.approval.baseSha, message: "base" }];
+  let pushes = 0;
+  let loseAck = false;
+  const fetcher: typeof fetch = async (url, init) => {
+    if (String(url).includes("/git/trees/"))
+      return Response.json({
+        truncated: false,
+        tree: [{ path: "hello.txt", mode: "100644", sha: "blob" }],
+      });
+    if (String(url).includes("/git/blobs/"))
+      return Response.json({
+        encoding: "base64",
+        content: Buffer.from("old\n").toString("base64"),
+      });
+    const body = JSON.parse(String(init?.body));
+    if (body.query.startsWith("query"))
+      return Response.json({
+        data: {
+          repository: {
+            ref: {
+              target: {
+                history: { nodes: commits, pageInfo: { hasNextPage: false } },
+              },
+            },
+          },
+        },
+      });
+    const input = body.variables.input;
+    assert.equal(input.expectedHeadOid, value.approval.baseSha);
+    assert.deepEqual(input.fileChanges.additions, [
+      { path: "hello.txt", contents: Buffer.from("new\n").toString("base64") },
+    ]);
+    if (commits[0].oid !== input.expectedHeadOid)
+      return Response.json({ errors: [{ message: "head changed" }] });
+    pushes++;
+    commits.unshift({
+      oid: "c".repeat(40),
+      message: `${input.message.headline}\n\n${input.message.body}`,
+    });
+    if (loseAck) throw new Error("response lost after commit");
+    return Response.json({
+      data: { createCommitOnBranch: { commit: { oid: commits[0].oid } } },
+    });
+  };
+  return {
+    fetcher,
+    pushes: () => pushes,
+    loseAck: () => {
+      loseAck = true;
+    },
+    advance: () =>
+      commits.unshift({
+        oid: "d".repeat(40),
+        message: "unrelated later commit",
+      }),
+  };
+}
+test("publishes saved contents and generates the diff from the same files", async () => {
+  const value = job(),
+    fake = github(value);
+  const publisher = new Publisher(value.destination, {
+    token: "test",
+    fetch: fake.fetcher,
+  });
+  value.candidate = await publisher.prepare(value);
+  assert.match(value.approval.diff, /-old\n\+new/);
+  assert.equal(await publisher.push(value), "c".repeat(40));
+  assert.equal(await publisher.push(value), "c".repeat(40));
+  assert.equal(fake.pushes(), 1);
+});
+test("retry rediscovers a lost commit acknowledgment after main advances", async () => {
+  const value = job(),
+    fake = github(value);
+  const publisher = new Publisher(value.destination, {
+    token: "test",
+    fetch: fake.fetcher,
+  });
+  value.candidate = await publisher.prepare(value);
+  fake.loseAck();
+  await assert.rejects(publisher.push(value), /response lost/);
+  fake.advance();
+  assert.equal(await publisher.push(value), "c".repeat(40));
+  assert.equal(fake.pushes(), 1);
+});
+test("concurrent branch changes never overwrite main", async () => {
+  const value = job(),
+    fake = github(value);
+  const publisher = new Publisher(value.destination, {
+    token: "test",
+    fetch: fake.fetcher,
+  });
+  value.candidate = await publisher.prepare(value);
+  fake.advance();
+  await assert.rejects(publisher.push(value), /Main changed/);
+  assert.equal(fake.pushes(), 0);
+});
+test("proposal tampering and unsupported modes are rejected before publication", async () => {
+  const value = job(),
+    fake = github(value);
+  const publisher = new Publisher(value.destination, {
+    token: "test",
+    fetch: fake.fetcher,
+  });
+  value.approval.files[0].content = "changed";
+  await assert.rejects(publisher.prepare(value), /hash mismatch/);
+  value.approval.files[0].mode = "100755";
+  value.approval.digest = createHash("sha256")
+    .update(
+      proposalContent(
+        value.approval.baseSha,
+        value.approval.proposedSha,
+        value.approval.files,
       ),
-      "",
-    );
-    assert.equal(await publisher.push(first), first.candidate);
-    assert.equal(
-      await git(remote, "show", "refs/heads/main:hello.txt"),
-      "hello",
-    );
-    assert.equal(await publisher.push(first), first.candidate);
-    assert.equal(
-      await git(remote, "rev-list", "--count", "refs/heads/main"),
-      "1",
-    );
-    const change =
-      "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-hello\n+updated\n";
-    const second = job(first.candidate, change);
-    second.candidate = await publisher.prepare(second);
-    const stale = job(first.candidate, change.replace("updated", "stale"));
-    stale.candidate = await publisher.prepare(stale);
-    await publisher.push(second);
-    await assert.rejects(publisher.push(stale), /Remote branch changed/);
-    assert.equal(
-      await git(remote, "show", "refs/heads/main:hello.txt"),
-      "updated",
-    );
-    assert.equal(await publisher.push(first), first.candidate); // Lost ACK, followed by another valid commit.
-    const tampered = job(second.candidate, patch);
-    tampered.approval.digest = "wrong";
-    await assert.rejects(publisher.prepare(tampered), /hash mismatch/);
-    const symlink = job(
-      second.candidate,
-      patch.replaceAll("hello.txt", "link").replace("100644", "120000"),
-    );
-    await assert.rejects(publisher.prepare(symlink), /regular course files/);
-    const workflow = job(
-      second.candidate,
-      patch.replaceAll("hello.txt", ".github/workflows/run.yml"),
-    );
-    await assert.rejects(publisher.prepare(workflow), /regular course files/);
-    const escape = job(
-      second.candidate,
-      patch.replaceAll("hello.txt", "../outside"),
-    );
-    await assert.rejects(publisher.prepare(escape));
-    const binary = job(second.candidate, "GIT binary patch");
-    await assert.rejects(publisher.prepare(binary), /Only text patches/);
-    // The credential is passed in process configuration, never persisted in repository config.
-    const config = await git(
-      join(root, "jobs", first.id),
-      "config",
-      "--local",
-      "--list",
-    );
-    assert.equal(config.includes("extraheader"), false);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+    )
+    .digest("hex");
+  await assert.rejects(publisher.prepare(value), /ordinary text/);
 });

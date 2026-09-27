@@ -1,7 +1,7 @@
 import type { UIMessageChunk } from "ai";
 import type { ServerNotification, ThreadItem } from "./protocol.ts";
 
-// One Codex item can span several UI parts when a steering message arrives.
+/** Translate native Codex items into AI SDK chunks; steering can split one item across several UI parts. */
 export class CodexEvents {
   private parts = new Map<
     string,
@@ -21,6 +21,7 @@ export class CodexEvents {
     this.write = write;
     this.namespace = namespace;
   }
+  /** Consume a native notification after the turn coordinator filters its thread/turn identity. */
   accept(event: ServerNotification) {
     if (event.method === "item/agentMessage/delta")
       this.delta(event.params.itemId, "text", event.params.delta);
@@ -46,6 +47,7 @@ export class CodexEvents {
     part.open = false;
     part.segment++;
   }
+  /** Close open segments so this user correction appears at its actual position in the stream. */
   steering(id: string, text: string) {
     for (const key of this.parts.keys()) this.close(key);
     this.write({ type: "data-steering", id, data: { id, text } });
@@ -78,6 +80,7 @@ export class CodexEvents {
     this.close(key);
     this.parts.get(key)!.ended = true;
   }
+  /** Merge a native item snapshot without repeating text already emitted as deltas. */
   item(item: ThreadItem, completed = true) {
     const id = `${this.namespace}:${item.id}`;
     if (item.type === "agentMessage" && completed)

@@ -16,7 +16,7 @@ After ten minutes waiting for the user, back up before destroying. After six hou
 
 ## Conversations and concurrency
 
-The relay stores a local SQLite conversation catalog. Each ID routes to its own Chat DO. Sends compare a persisted revision; stale tabs retain their draft and must refresh. Test two tabs of one conversation, plus an independent conversation. Production still requires PrairieLearn authorization and shared storage.
+The relay stores its catalog, admission revisions and publication decisions in Postgres (`DATABASE_URL`; default `postgresql://localhost/course_agent`). Each conversation routes to its own Chat DO, which retains chat history and lifecycle state. SSE pushes snapshots and diagnostics; stale tabs retain their draft and must refresh. Publication uses GitHub APIs without a relay checkout; incomplete approvals require explicit Retry. See [testing instructions](docs/testing.md) for setup. Production still requires PrairieLearn authorization.
 
 ## Steering and richer streaming
 

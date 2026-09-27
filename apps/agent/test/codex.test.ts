@@ -232,7 +232,7 @@ test("local backup uses the SDK binding path without changing production default
     [false, true].map((localBucket) => ({
       dir: "/workspace",
       localBucket,
-      ttl: 30 * 24 * 60 * 60,
+      ttl: 7 * 24 * 60 * 60,
       excludes: ["auth.json"],
     })),
   );
@@ -354,12 +354,24 @@ test("approval capture preserves file bytes even when exec stdout is trimmed", a
   let deleted = "";
   const sandbox = {
     exec: async (command: string) => {
-      path = command.split(" > ")[1]!;
+      path = command.match(/(\/tmp\/approval-[\w-]+\.json)/)![1]!;
       return { success: true, stdout: diff.trimEnd() };
     },
     readFile: async (requested: string) => {
       assert.equal(requested, path);
-      return { content: diff };
+      return {
+        content: JSON.stringify({
+          diff,
+          files: [
+            {
+              path: "a",
+              content: "é  ",
+              mode: "100644",
+              previousMode: "100644",
+            },
+          ],
+        }),
+      };
     },
     deleteFile: async (requested: string) => {
       deleted = requested;
@@ -371,7 +383,7 @@ test("approval capture preserves file bytes even when exec stdout is trimmed", a
   });
   assert.equal(result.diff, diff);
   assert.equal(deleted, path);
-  assert.match(path, /^\/tmp\/approval-[\w-]+\.patch$/);
+  assert.match(path, /^\/tmp\/approval-[\w-]+\.json$/);
 });
 
 test("cleanup diagnostics classify failures without retaining credentials or signed URLs", () => {
@@ -399,4 +411,63 @@ test("cleanup diagnostics classify failures without retaining credentials or sig
       cleanupError(stage, new Error("https://r2.test?signature=secret")),
       /secret|signature|https/,
     );
+});
+
+for (const name of ["BackupNotFoundError", "BackupExpiredError"]) {
+  test(`${name} discards the unavailable checkpoint before fresh initialization`, async () => {
+    let warning = "";
+    let initialized = false;
+    const sandbox = {
+      exists: async () => ({ exists: false }),
+      restoreBackup: async () => {
+        throw Object.assign(new Error("unavailable"), { name });
+      },
+      exec: async () => {
+        assert.match(warning, /missing or expired/);
+        initialized = true;
+        throw new Error("Stop before process launch");
+      },
+    } as unknown as CodexSandbox;
+    await assert.rejects(
+      connectCodex(
+        sandbox,
+        {
+          checkpoint: {
+            backup: { id: "gone", dir: "/workspace" },
+            threadId: "old-thread",
+          },
+        },
+        {
+          onCheckpointUnavailable: (value) => {
+            warning = value;
+          },
+        },
+      ),
+      /initializing the Git workspace/,
+    );
+    assert.equal(initialized, true);
+    assert.match(warning, /uncommitted files and Codex session context/);
+  });
+}
+
+test("transient restore failure never discards the checkpoint or initializes fresh files", async () => {
+  const sandbox = {
+    exists: async () => ({ exists: false }),
+    restoreBackup: async () => {
+      throw new Error("503 unavailable");
+    },
+    exec: async () => {
+      assert.fail("Must preserve the existing checkpoint");
+    },
+  } as unknown as CodexSandbox;
+  await assert.rejects(
+    connectCodex(
+      sandbox,
+      {
+        checkpoint: { backup: { id: "recoverable", dir: "/workspace" } },
+      },
+      { onCheckpointUnavailable: () => assert.fail("Must not discard") },
+    ),
+    /restoring the workspace backup/,
+  );
 });
