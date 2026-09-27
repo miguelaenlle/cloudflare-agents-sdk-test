@@ -6,13 +6,14 @@ import {
   type UIMessageChunk,
 } from "ai";
 import {
-  approvalOutcomeSchema,
+  GITHUB_REPOSITORY,
+  toolOutcomeSchema,
   ChatError,
-  type ApprovalDecision,
   sendRequestSchema,
   type SendRequest,
   type SandboxDiagnostics,
 } from "@playground/chat-contract";
+import { cleanupError } from "./cleanup-error.ts";
 import { AppServer, AppServerError, within } from "./app-server.ts";
 import type { Sandbox } from "./sandbox.ts";
 import { openCodexTurn, type CodexTurn } from "./codex-turn.ts";
@@ -32,6 +33,7 @@ import type { DynamicToolCallResponse, Turn } from "./protocol.ts";
 export interface Env {
   Sandbox: DurableObjectNamespace<Sandbox>;
   Chat: DurableObjectNamespace<Chat>;
+  BACKUP_BUCKET: R2Bucket;
   CODEX_MODEL?: string;
   RELAY_TOKEN?: string;
   LOCAL_DEV?: string;
@@ -42,6 +44,7 @@ type Expiration = {
   reason: "idle" | "interaction" | "retry";
   waitingSince?: number;
   attempt?: number;
+  retryOf?: string;
 };
 const MAX_CLEANUP_ATTEMPTS = 3;
 const messageOf = (error: unknown) =>
@@ -51,13 +54,20 @@ const expiredMessage =
 const interruptedMessage =
   "Task interrupted. It was not automatically repeated. You can send another message to continue.";
 
+/**
+ * One durable conversation: SQLite owns history, lifecycle state, and generic pending-tool gates.
+ * Live sockets/promises belong to this instance only; recovery consults Codex native history.
+ */
 export class Chat extends AIChatAgent<Env, CodexState> {
   initialState: CodexState = {};
   private active?: CodexTurn;
+  // Serialize Send/Stop/decisions, not the full model turn: users must retain control while it runs.
   private controlTail: Promise<unknown> = Promise.resolve();
   private chatTask?: Promise<void>;
   private acceptance?: { resolve(): void; reject(error: unknown): void };
   private turnInProgress = false;
+  // Capture has no resumable work; a DO restart must not preserve an in-flight lock.
+  private approvalPreparing = false;
   private recovery?: Promise<void>;
   private approvalResult?: (result: DynamicToolCallResponse) => void;
 
@@ -87,6 +97,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       this.setState({ ...this.state, run });
   }
 
+  /** Renew the durable user-interaction deadline; stale alarms are fenced by sandbox identity. */
   private async interaction() {
     const sandbox = this.state.sandbox!;
     this.ensureUsable(sandbox.id);
@@ -109,29 +120,34 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       await this.cancelSchedule(sandbox.deadlineSchedule);
   }
 
+  /** HTTP controls and snapshots; AIChatAgent separately owns the resumable message stream. */
   override async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
     if (request.method === "GET" && path.endsWith("/snapshot")) {
-      await this.controlTail;
       return Response.json(
         {
           messages: this.messages,
-          revision: this.state.revision ?? 0,
-          blocked:
-            !!this.state.approvalDelivery ||
-            !!this.state.approvalPreparing ||
-            this.state.approval?.status === "pending",
-          approval: this.state.approval,
-          approvals: [
-            ...(this.state.approvalHistory ?? []),
-            ...(this.state.approval ? [this.state.approval] : []),
-          ],
+          revision: 0, // The relay supplies its authoritative admission revision.
+          blocked: !!this.state.pendingTool || this.approvalPreparing,
+          pendingTool: this.state.pendingTool,
         },
         { headers: { "Cache-Control": "no-store" } },
       );
     }
+    if (request.method === "GET" && path.endsWith("/tool-proposal")) {
+      const tool = this.state.pendingTool;
+      if (!tool || tool.id !== new URL(request.url).searchParams.get("id"))
+        return Response.json(
+          { error: "Tool request is no longer current." },
+          { status: 409 },
+        );
+      // The adapter reads immutable Git objects; the relay owns durable storage and approval.
+      const proposal = tool.args as object;
+      return Response.json({ ...proposal, id: tool.id });
+    }
+
     if (request.method === "POST" && path.endsWith("/approval")) {
-      const parsed = approvalOutcomeSchema.safeParse(
+      const parsed = toolOutcomeSchema.safeParse(
         await request.json().catch(() => null),
       );
       if (!parsed.success)
@@ -151,11 +167,32 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         );
       }
     }
+    if (request.method === "POST" && path.endsWith("/cleanup")) {
+      const sandbox = this.state.sandbox;
+      if (
+        !sandbox?.cleanup?.error ||
+        !["waiting_for_user", "cleanup_failed"].includes(sandbox.phase)
+      )
+        return Response.json(
+          { error: "No failed cleanup to retry." },
+          { status: 409 },
+        );
+      this.ctx.waitUntil(
+        this.expireSandbox({
+          id: sandbox.id,
+          reason: sandbox.phase === "cleanup_failed" ? "retry" : "idle",
+          waitingSince: sandbox.waitingSince,
+        }),
+      );
+      return new Response(null, { status: 202 });
+    }
     if (request.method === "GET" && path.endsWith("/diagnostics")) {
       const sandbox = this.state.sandbox;
       return Response.json(
         {
           state: sandbox?.phase ?? "absent",
+          cleanup: sandbox?.cleanup,
+          checkpointError: this.state.lastCheckpointError,
           idleExpiresAt:
             sandbox?.phase === "waiting_for_user" &&
             sandbox.waitingSince !== undefined
@@ -201,26 +238,71 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     }
   }
 
+  /**
+   * Admit a revision-checked prompt, then steer an active turn or start a new one.
+   * Return on native acceptance, not completion. Hidden approval results use the same delivery path.
+   */
   private async send(input: SendRequest, continuation = false) {
-    if (this.messages.some((message) => message.id === input.id)) return;
-    if (!continuation) {
-      if (input.expectedRevision !== (this.state.revision ?? 0))
+    const existing = this.messages.some((message) => message.id === input.id);
+    if (existing && !continuation) return;
+    if (existing && continuation) {
+      if (this.state.run?.messageId === input.id && this.state.run.accepted)
+        return;
+      if (this.turnInProgress)
         throw new ChatError(
           409,
-          "This conversation changed in another tab. Refresh history; your draft is preserved.",
+          "Approval delivery is still starting. Retry shortly.",
         );
-      if (
-        this.state.approval?.status === "pending" ||
-        this.state.approvalDelivery ||
-        this.state.approvalPreparing
-      )
+      if (this.state.run?.messageId === input.id && this.state.run.submitted) {
+        await this.reconcile();
+        if (this.state.run?.accepted) return;
+        if (this.state.run?.submitted)
+          throw new ChatError(
+            503,
+            "Approval delivery is unconfirmed. The outcome remains pending.",
+          );
+      }
+      // A stored UI message is not proof of delivery. Retry only a confirmed pre-submission failure.
+      if (this.state.run?.messageId === input.id)
+        this.setState({ ...this.state, run: undefined });
+    }
+    if (!continuation) {
+      if (!!this.state.pendingTool || this.approvalPreparing)
         throw new ChatError(
           409,
           "Resolve the pending approval before sending another message.",
         );
     }
-    // Reserve the revision before async submission: an uncertain acknowledgment must not accept another stale send.
-    this.setState({ ...this.state, revision: (this.state.revision ?? 0) + 1 });
+    const phase = this.state.sandbox?.phase;
+    if (phase && ["suspending", "destroying", "cleanup_failed"].includes(phase))
+      throw new ChatError(
+        409,
+        "Sandbox cleanup is pending. Your message was not sent.",
+      );
+    if (this.turnInProgress && (!this.active || !this.state.run?.turnId))
+      throw new ChatError(
+        409,
+        "Codex is still starting. Retry when startup completes.",
+      );
+    const lifecycle = this.state.sandbox;
+    if (
+      lifecycle &&
+      this.now() >= lifecycle.lastUserInteractionAt + this.interactionTimeoutMs
+    ) {
+      this.ctx.waitUntil(
+        this.expireSandbox({ id: lifecycle.id, reason: "interaction" }),
+      );
+      throw new ChatError(
+        409,
+        "Sandbox expired. Wait for cleanup before sending.",
+      );
+    }
+    if (
+      !this.active &&
+      !this.turnInProgress &&
+      this.state.run?.status === "running"
+    )
+      await this.reconcile();
     const message = {
       id: input.id,
       role: "user" as const,
@@ -262,7 +344,16 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       }
     }
     // Finish transcript persistence before the next turn can own the stream.
-    await this.chatTask;
+    await within(
+      this.chatTask ?? Promise.resolve(),
+      5_000,
+      "Previous turn is still finishing. Retry shortly.",
+    );
+    if (this.state.sandbox && this.state.sandbox.phase !== "waiting_for_user")
+      throw new ChatError(
+        409,
+        "Sandbox cleanup is pending. Your message was not sent.",
+      );
     let resolve!: () => void;
     let reject!: (error: unknown) => void;
     const accepted = new Promise<void>((res, rej) => {
@@ -270,7 +361,10 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       reject = rej;
     });
     this.acceptance = { resolve, reject };
-    const task = this.saveMessages((messages) => [...messages, message])
+    const task = this.saveMessages((messages) => [
+      ...messages.filter((saved) => saved.id !== input.id),
+      message,
+    ])
       .then((result) => {
         reject(
           new Error(result.error ?? "Turn ended before startup was confirmed."),
@@ -292,44 +386,26 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     }
   }
 
-  private async decide(input: ApprovalDecision & { result: string }) {
-    const receipt = this.state.approvalReceipts?.[input.id];
-    if (receipt) {
-      if (
-        receipt.digest !== input.digest ||
-        receipt.approved !== input.approved
-      )
-        throw new ChatError(409, "A different decision was already recorded.");
-      return;
-    }
-    const approval = this.state.approval;
-    if (
-      !approval ||
-      approval.id !== input.id ||
-      approval.digest !== input.digest
-    )
-      throw new ChatError(409, "This approval is no longer current.");
-    if (approval.status !== "pending") {
-      if ((approval.status === "approved") !== input.approved)
-        throw new ChatError(409, "A different decision was already recorded.");
-      if (!this.state.approvalDelivery) return;
-    } else {
-      if (input.expectedRevision !== (this.state.revision ?? 0))
+  /** Deliver the persisted decision to a waiting tool, or resume Codex after sandbox suspension. */
+  private async decide(input: { id: string; result: string }) {
+    const receipt = this.state.toolReceipts?.[input.id];
+    if (receipt !== undefined) {
+      if (receipt !== input.result)
         throw new ChatError(
           409,
-          "Conversation changed. Refresh before deciding.",
+          "A different tool result was already delivered.",
         );
-      this.setState({
-        ...this.state,
-        revision: (this.state.revision ?? 0) + 1,
-        approvalDelivery: approval.id,
-        approval: {
-          ...approval,
-          status: input.approved ? "approved" : "denied",
-          result: input.result,
-        },
-      });
+      return;
     }
+    const tool = this.state.pendingTool;
+    if (!tool || tool.id !== input.id)
+      throw new ChatError(409, "Tool request is no longer current.");
+    if (tool.result && tool.result !== input.result)
+      throw new ChatError(409, "Tool result changed.");
+    this.setState({
+      ...this.state,
+      pendingTool: { ...tool, result: input.result },
+    });
     if (
       this.state.sandbox &&
       ["suspending", "destroying", "cleanup_failed"].includes(
@@ -340,7 +416,6 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         409,
         "Sandbox cleanup is pending. Retry result delivery after cleanup.",
       );
-    const result = this.state.approval!.result!;
     if (this.approvalResult && this.active && !this.active.terminal) {
       this.setState({
         ...this.state,
@@ -348,74 +423,56 @@ export class Chat extends AIChatAgent<Env, CodexState> {
           ...this.state.sandbox!,
           phase: "waiting_for_agent",
           waitingSince: undefined,
+          cleanup: undefined,
         },
       });
       await this.interaction();
-      this.approvalResult(toolResult(result));
+      this.approvalResult(toolResult(input.result));
       this.approvalResult = undefined;
-      this.setState({
-        ...this.state,
-        approvalDelivery: undefined,
-        approvalReceipts: {
-          ...this.state.approvalReceipts,
-          [input.id]: { digest: input.digest, approved: input.approved },
+    } else {
+      // The old RPC no longer exists. Only a resolved gate may resume with an internal continuation.
+      await this.send(
+        {
+          id: tool.id,
+          text: `${tool.name} result for operation ${tool.id}: ${input.result}`,
+          expectedRevision: 0,
         },
-      });
-      return;
+        true,
+      );
     }
-    // A stopped app-server cannot receive an old RPC response. Resume its thread with the durable outcome instead.
-    await this.send(
-      {
-        id: approval.id,
-        text: `push_sync result for operation ${approval.id}: ${result}`,
-        expectedRevision: this.state.revision ?? 0,
-      },
-      true,
-    );
     this.setState({
       ...this.state,
-      approvalDelivery: undefined,
-      approvalReceipts: {
-        ...this.state.approvalReceipts,
-        [input.id]: { digest: input.digest, approved: input.approved },
-      },
+      pendingTool: undefined,
+      toolReceipts: { ...this.state.toolReceipts, [input.id]: input.result },
     });
   }
 
+  /** Persist the gate before waiting, including across sandbox suspension and DO restart. */
   private async requestApproval(args: unknown, captured: (id: string) => void) {
-    if (
-      this.state.approval?.status === "pending" ||
-      this.state.approvalPreparing
-    )
-      throw new Error("An approval is already pending.");
+    if (this.state.pendingTool)
+      throw new Error("A tool decision is already pending.");
     const run = this.state.run!;
-    this.setState({ ...this.state, approvalPreparing: true });
-    let approval;
+    this.approvalPreparing = true;
+    let payload;
     try {
-      approval = await captureApproval(this.sandbox(run.sandboxId), args);
+      payload = await captureApproval(this.sandbox(run.sandboxId), args);
     } finally {
-      this.setState({ ...this.state, approvalPreparing: false });
+      this.approvalPreparing = false;
     }
     this.ensureUsable(run.sandboxId);
     if (this.state.run?.id !== run.id || !this.active || this.active.terminal)
-      throw new Error("Approval turn is no longer active.");
+      throw new Error("Tool request is no longer active.");
+    const tool = { id: crypto.randomUUID(), name: "push_sync", args: payload };
     const result = new Promise<DynamicToolCallResponse>((resolve) => {
       this.approvalResult = resolve;
     });
-    this.setState({
-      ...this.state,
-      approval,
-      approvalHistory: [
-        ...(this.state.approvalHistory ?? []),
-        ...(this.state.approval ? [this.state.approval] : []),
-      ],
-    });
-    captured(approval.id);
-    // The turn is blocked on a native tool response, so the same idle policy applies as waiting for a user prompt.
+    this.setState({ ...this.state, pendingTool: tool });
+    captured(tool.id);
     await this.finishRun(run, "running");
     return result;
   }
 
+  /** Ask Codex to interrupt; cancellation is distinct from closing a browser stream. */
   private async cancel() {
     const run = this.state.run;
     if (run?.status !== "running") return;
@@ -441,20 +498,72 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     return { persist: false, continue: false };
   }
 
-  private async checkpoint(id: string) {
-    const sandbox = this.sandbox(id);
-    if (!(await sandbox.exists("/tmp/codex-app-server-ready")).exists)
-      throw new ContainerLost();
-    this.ensureUsable(id);
-    const threadId = this.state.threadId;
-    const backup = await checkpointCodex(
-      sandbox,
-      this.env.LOCAL_DEV === "true",
-    );
-    if (this.usable(id))
-      this.setState({ ...this.state, checkpoint: { backup, threadId } });
+  /** Replace the durable checkpoint pointer before making the previous archive eligible for deletion. */
+  private saveCheckpoint(checkpoint: NonNullable<CodexState["checkpoint"]>) {
+    const previous = this.state.checkpoint?.backup.id;
+    this.setState({
+      ...this.state,
+      checkpoint,
+      lastCheckpointError: undefined,
+      obsoleteCheckpoints: [
+        ...new Set([
+          ...(this.state.obsoleteCheckpoints ?? []),
+          ...(previous && previous !== checkpoint.backup.id ? [previous] : []),
+        ]),
+      ],
+    });
   }
 
+  /** Retry deletion of obsolete R2 archives only after the container has been destroyed. */
+  async pruneCheckpoints() {
+    // A warm restored filesystem may still depend on the previous backup's overlay.
+    if (this.state.sandbox) return;
+    for (const id of this.state.obsoleteCheckpoints ?? []) {
+      if (id === this.state.checkpoint?.backup.id) continue;
+      try {
+        // Object layout belongs to the pinned Sandbox SDK 0.12.9.
+        await within(
+          this.env.BACKUP_BUCKET.delete([
+            `backups/${id}/data.sqsh`,
+            `backups/${id}/meta.json`,
+          ]),
+          10_000,
+          "Backup deletion timed out.",
+        );
+      } catch {
+        console.error(
+          "Could not remove superseded checkpoint; retrying in 60 seconds.",
+        );
+        await this.schedule(60, "pruneCheckpoints");
+        return;
+      }
+      this.setState({
+        ...this.state,
+        obsoleteCheckpoints: this.state.obsoleteCheckpoints?.filter(
+          (candidate) => candidate !== id,
+        ),
+      });
+    }
+  }
+
+  /** Save workspace files and the native thread ID together; UI history remains in the Chat DO. */
+  private async checkpoint(id: string) {
+    const sandbox = this.sandbox(id);
+    const threadId = this.state.threadId;
+    const backup = await within(
+      (async () => {
+        if (!(await sandbox.exists("/tmp/codex-app-server-ready")).exists)
+          throw new ContainerLost();
+        this.ensureUsable(id);
+        return checkpointCodex(sandbox, this.env.LOCAL_DEV === "true");
+      })(),
+      60_000,
+      "Backup timed out.",
+    );
+    if (this.usable(id)) this.saveCheckpoint({ backup, threadId });
+  }
+
+  /** Record completion or a pending approval and arm idle cleanup, without creating a backup. */
   private async finishRun(run: Run, status: Run["status"]) {
     if (!this.usable(run.sandboxId)) return;
     if (this.state.sandbox?.phase === "suspending") {
@@ -487,6 +596,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     });
     return this.recovery;
   }
+  /** Inspect surviving native history without replaying an uncertain prompt or restoring a lost container. */
   private async reconcileRun() {
     const run = this.state.run;
     if (run?.status !== "running" || this.active) return;
@@ -545,7 +655,20 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         ).thread;
         if (current.turns.some((turn) => turn.status === "inProgress"))
           throw new Error("Codex is still active.");
-        const completed = current.turns.find((turn) => turn.id === run.turnId);
+        const completed =
+          current.turns.find((turn) => turn.id === run.turnId) ??
+          current.turns.find((turn) =>
+            turn.items.some(
+              (item) =>
+                item.type === "userMessage" && item.clientId === run.messageId,
+            ),
+          );
+        this.setRun({
+          ...this.state.run!,
+          accepted: !!completed,
+          submitted: !!completed,
+          turnId: completed?.id,
+        });
         if (completed?.status === "completed") {
           status = "completed";
           outcome =
@@ -577,6 +700,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     ]);
   }
 
+  /** Destroy this generation, then clear its durable lease; never clear a newer sandbox by accident. */
   private async destroyGeneration(id: string) {
     if (this.state.sandbox?.id !== id) return;
     this.setState({
@@ -591,6 +715,8 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         "Sandbox destruction unconfirmed.",
       );
       if (this.state.sandbox?.id !== id) return;
+      if (this.state.obsoleteCheckpoints?.length)
+        await this.schedule(60, "pruneCheckpoints");
       this.setState({
         ...this.state,
         sandbox: undefined,
@@ -600,6 +726,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             ? { ...this.state.run, status: "interrupted" }
             : this.state.run,
       });
+      await this.pruneCheckpoints();
     } catch (error) {
       if (this.state.sandbox?.id === id)
         this.setState({
@@ -610,12 +737,17 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     }
   }
 
+  /**
+   * Durable alarm: stop, checkpoint, then destroy. Idle backup failure retains the box for retry;
+   * the interaction deadline still destroys it and preserves a visible data-loss warning.
+   */
   async expireSandbox(expiration: Expiration) {
     const { id, reason, attempt = 0 } = expiration;
     // A deployment can leave callbacks from the old absolute-lifetime policy.
     if (!["idle", "interaction", "retry"].includes(reason)) return;
     const state = this.state.sandbox;
     if (!state || state.id !== id) return;
+    if (expiration.retryOf && expiration.retryOf !== state.cleanup?.id) return;
     if (
       reason === "idle" &&
       (state.phase !== "waiting_for_user" ||
@@ -630,49 +762,63 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       return;
     if (reason === "retry" && state.phase !== "cleanup_failed") return;
     let checkpointOnly = reason === "idle";
+    const cleanup = {
+      id: crypto.randomUUID(),
+      attempts: attempt + 1,
+      retryAt: null,
+    };
+    let stage: "stop" | "backup" | "destroy" =
+      reason === "retry" ? "destroy" : "stop";
+    const reportStage = () => {
+      if (this.state.sandbox?.id === id)
+        this.setState({
+          ...this.state,
+          sandbox: {
+            ...this.state.sandbox,
+            cleanup: { ...cleanup, stage },
+          },
+        });
+    };
+    reportStage();
     try {
       if (reason === "idle") {
         this.setState({
           ...this.state,
-          sandbox: { ...state, phase: "suspending" },
+          sandbox: { ...this.state.sandbox!, phase: "suspending" },
         });
         if (
-          this.state.approval?.status === "pending" &&
+          !!this.state.pendingTool &&
           this.state.run?.status === "running" &&
           !this.active
         )
           await this.reconcile();
         if (this.state.sandbox?.id !== id) return;
-        if (
-          this.active &&
-          this.state.run?.turnId &&
-          this.state.approval?.status === "pending"
-        ) {
+        if (this.active && this.state.run?.turnId && !!this.state.pendingTool) {
           const active = this.active;
           const turnId = this.state.run.turnId;
-          this.approvalResult?.(
-            toolResult(
-              "Approval remains pending. Pause now; the decision will be delivered after resumption.",
-            ),
-          );
-          this.approvalResult = undefined;
           await within(
             active.interrupt(turnId).then(() => active.completed),
             5000,
             "Could not stop pending approval turn.",
           );
-          await this.chatTask;
+          await within(
+            this.chatTask ?? Promise.resolve(),
+            5_000,
+            "Chat shutdown timed out.",
+          );
         }
         this.setState({
           ...this.state,
-          sandbox: { ...state, phase: "suspending" },
+          sandbox: { ...this.state.sandbox!, phase: "suspending" },
         });
+        stage = "backup";
+        reportStage();
         await this.checkpoint(id);
         if (!this.usable(id)) return;
       } else if (reason === "interaction") {
         this.setState({
           ...this.state,
-          sandbox: { ...state, phase: "destroying" },
+          sandbox: { ...this.state.sandbox!, phase: "destroying" },
         });
         const active = this.active;
         const run = this.state.run;
@@ -690,22 +836,24 @@ export class Chat extends AIChatAgent<Env, CodexState> {
           }
           const backup = await within(
             checkpointCodex(this.sandbox(id), this.env.LOCAL_DEV === "true"),
-            10_000,
+            60_000,
             "Deadline checkpoint timed out.",
           );
           if (this.state.sandbox?.id === id)
-            this.setState({
-              ...this.state,
-              checkpoint: { backup, threadId: this.state.threadId },
-            });
-        } catch {
-          /* Expiration must not wait indefinitely for a final checkpoint. */
+            this.saveCheckpoint({ backup, threadId: this.state.threadId });
+        } catch (error) {
+          this.setState({
+            ...this.state,
+            lastCheckpointError: `Final checkpoint unavailable; changes since the last checkpoint may be lost. ${cleanupError("backup", error)}`,
+          });
         }
       }
       checkpointOnly = false;
+      stage = "destroy";
+      reportStage();
       await this.destroyGeneration(id);
     } catch (error) {
-      console.error("Sandbox cleanup failed:", messageOf(error));
+      console.error("Sandbox cleanup failed:", cleanupError(stage, error));
       if (this.state.sandbox?.id !== id) return;
       if (checkpointOnly) {
         if (!this.usable(id)) return;
@@ -714,15 +862,34 @@ export class Chat extends AIChatAgent<Env, CodexState> {
           sandbox: { ...this.state.sandbox, phase: "waiting_for_user" },
         });
       }
-      if (attempt + 1 < MAX_CLEANUP_ATTEMPTS)
+      const retryAt =
+        attempt + 1 < MAX_CLEANUP_ATTEMPTS ? this.now() + 30_000 : null;
+      this.setState({
+        ...this.state,
+        sandbox: {
+          ...this.state.sandbox!,
+          cleanup: {
+            ...cleanup,
+            stage,
+            error: cleanupError(stage, error),
+            retryAt,
+          },
+        },
+      });
+      if (retryAt !== null)
         await this.schedule(30, "expireSandbox", {
           ...expiration,
           reason: checkpointOnly ? "idle" : "retry",
           attempt: attempt + 1,
+          retryOf: cleanup.id,
         });
     }
   }
 
+  /**
+   * AIChatAgent invokes this after saving the admitted user message. Run Codex independently of
+   * browser connectivity and return AI SDK chunks for the library to stream and persist.
+   */
   override async onChatMessage() {
     const acceptance = this.acceptance;
     const message = this.messages.findLast(
@@ -753,6 +920,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     if (this.state.run?.status === "running") await this.reconcile();
     if (this.state.sandbox && this.state.sandbox.phase !== "waiting_for_user")
       throw new Error("Sandbox cleanup is pending.");
+    const fresh = !this.state.sandbox && !this.state.checkpoint;
     const sandbox = this.state.sandbox ?? {
       id: crypto.randomUUID(),
       phase: "starting" as const,
@@ -771,6 +939,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         ...sandbox,
         phase: this.state.sandbox ? "waiting_for_agent" : "starting",
         waitingSince: undefined,
+        cleanup: undefined,
       },
     });
     this.turnInProgress = true;
@@ -809,10 +978,32 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               this.sandbox(sandbox.id),
               this.state,
               {
+                repository: GITHUB_REPOSITORY,
+                onCheckpointUnavailable: (warning) => {
+                  const old = this.state.checkpoint?.backup.id;
+                  this.setState({
+                    ...this.state,
+                    checkpoint: undefined,
+                    threadId: undefined,
+                    lastCheckpointError: warning,
+                    obsoleteCheckpoints: [
+                      ...new Set([
+                        ...(this.state.obsoleteCheckpoints ?? []),
+                        ...(old ? [old] : []),
+                      ]),
+                    ],
+                  });
+                },
                 assertCurrent: () => this.ensureUsable(sandbox.id),
               },
             );
             client = connected.client;
+            if (connected.warning) {
+              const id = `${run.id}:restore-warning`;
+              write({ type: "text-start", id });
+              write({ type: "text-delta", id, delta: connected.warning });
+              write({ type: "text-end", id });
+            }
             this.ensureUsable(sandbox.id);
             execution = await openCodexTurn(client, {
               threadId: connected.threadId,
@@ -834,7 +1025,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
                 ]);
               },
               onTurnStarted: (turnId) =>
-                this.setRun({ ...this.state.run!, turnId }),
+                this.setRun({ ...this.state.run!, turnId, accepted: true }),
             });
             this.ensureUsable(sandbox.id);
             this.active = execution;
@@ -845,7 +1036,11 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               sandbox: { ...this.state.sandbox!, phase: "waiting_for_agent" },
             });
             const started = await execution.start(prompt, message.id);
-            this.setRun({ ...this.state.run!, turnId: started.id });
+            this.setRun({
+              ...this.state.run!,
+              turnId: started.id,
+              accepted: true,
+            });
             acceptance?.resolve();
             const turn = await execution.completed;
             terminal = true;
@@ -861,12 +1056,27 @@ export class Chat extends AIChatAgent<Env, CodexState> {
           } catch (error) {
             acceptance?.reject(error);
             failure = error;
-            // Failed submission/transport may still have started work. Leave it running in durable state for reconciliation.
+            if (error instanceof AppServerError && !this.state.run?.accepted)
+              this.setRun({ ...this.state.run!, submitted: false });
+            // Only a fresh, never-submitted workspace is disposable. Preserve restored/warm work.
             if (!this.state.run?.submitted && this.usable(run.sandboxId)) {
               try {
                 await this.finishRun(run, "failed");
+                if (fresh) {
+                  this.setState({
+                    ...this.state,
+                    sandbox: {
+                      ...this.state.sandbox!,
+                      phase: "cleanup_failed",
+                    },
+                  });
+                  await this.expireSandbox({
+                    id: run.sandboxId,
+                    reason: "retry",
+                  });
+                }
               } catch {
-                /* Keep the original startup error. */
+                /* Lifecycle diagnostics retain unconfirmed destruction; keep the startup error. */
               }
             }
           } finally {
@@ -879,7 +1089,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               ),
             );
             this.approvalResult = undefined;
-            if (!this.usable(run.sandboxId))
+            if (!failure && !this.usable(run.sandboxId))
               failure = new Error(expiredMessage);
             if (failure) {
               const id = `${run.id}:error`;

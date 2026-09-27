@@ -190,9 +190,10 @@ test(
       const notifications = [];
       client.subscribe((event) => notifications.push(event));
       const first = completed();
+      const firstMessageId = crypto.randomUUID();
       await client.request("turn/start", {
         threadId: thread.id,
-        clientUserMessageId: crypto.randomUUID(),
+        clientUserMessageId: firstMessageId,
         input: [{ type: "text", text: "Say hello.", text_elements: [] }],
       });
       const result = await first;
@@ -250,6 +251,12 @@ test(
         includeTurns: true,
       });
       assert.equal(current.thread.turns.at(-1).status, "interrupted");
+      assert.ok(
+        current.thread.turns[0].items.some(
+          (item) =>
+            item.type === "userMessage" && item.clientId === firstMessageId,
+        ),
+      );
       toolMode = true;
       const toolThread = (
         await client.request("thread/start", {

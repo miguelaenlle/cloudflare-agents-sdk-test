@@ -2,6 +2,8 @@
 
 This is layer 5 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
 
+Create a dedicated local Postgres database with `createdb course_agent`, and set `DATABASE_URL=postgresql://localhost/course_agent` on the relay.
+
 ## Local inference
 
 Use Node 22.18+ and pnpm 11. Install with `pnpm install --frozen-lockfile`. Run Docker. Create ignored `apps/agent/.dev.vars` with `CODEX_API_KEY=your-key`. The trusted outbound handler injects the key; do not put it in the container. Create ignored root `.env.local` with `AGENT_URL=http://localhost:8790`.
@@ -12,11 +14,11 @@ Run `pnpm typecheck`, `pnpm build`, and `pnpm test` for this layer. The tests us
 
 ## Lifecycle
 
-After ten minutes waiting for the user, back up before destroying. After six hours without accepted user interaction, attempt a bounded final backup and destroy. Restore the workspace/native thread on the next prompt. Diagnostics show state and countdowns. Unexpected loss can lose work since the last backup. Basic Stop is hardened with reconciliation and durable cleanup in this layer. Test idle restoration by creating a file, waiting ten minutes, then reading it in the next turn.
+After the configured idle interval (currently 30 seconds for testing) waiting for the user, back up before destroying. After six hours without accepted user interaction, attempt a bounded final backup and destroy. Restore the workspace/native thread on the next prompt. Diagnostics show state and countdowns. Unexpected loss can lose work since the last backup. Basic Stop is hardened with reconciliation and durable cleanup in this layer. Test idle restoration by creating a file, waiting for idle expiration, then reading it in the next turn.
 
 ## Conversations and concurrency
 
-The relay stores a local SQLite conversation catalog. Each ID routes to its own Chat DO. Sends compare a persisted revision; stale tabs retain their draft and must refresh. Test two tabs of one conversation, plus an independent conversation. Production still requires PrairieLearn authorization and shared storage.
+The relay stores its catalog, admission revisions and publication decisions in Postgres (`DATABASE_URL`; default `postgresql://localhost/course_agent`). Each conversation routes to its own Chat DO, which retains chat history and lifecycle state. SSE pushes snapshots and diagnostics; stale tabs retain their draft and must refresh. Publication uses GitHub APIs without a relay checkout; incomplete approvals require explicit Retry. See [testing instructions](docs/testing.md) for setup. Production still requires PrairieLearn authorization.
 
 ## Steering and richer streaming
 
@@ -24,4 +26,8 @@ Send during execution steers the active native turn. Only confirmed completion p
 
 ## Durable approval
 
-The agent calls `push_sync` with base/proposed commit SHAs. Persist the exact diff outside the sandbox and hold the native tool response pending a decision. Ordinary sends are blocked. After idle cleanup, the saved approval remains actionable and its outcome is delivered to a restored continuation. Warm decisions resolve the live tool result. Relay decision records retry delivery after restart. The layer-5 publisher is explicitly simulated; no GitHub credential is needed and no push occurs.
+The agent calls `push_sync` with base/proposed commit SHAs. Capture immutable final file contents and a raw diff; the relay persists the proposal and hold the native tool response pending a decision. Ordinary sends are blocked. After idle cleanup, the saved approval remains actionable and its outcome is delivered to a restored continuation. Warm decisions resolve the live tool result. After restart or failure, the user explicitly retries completion from the saved decision card. The layer-5 publisher is explicitly simulated; no GitHub credential is needed and no push occurs.
+
+## Publication
+
+This layer simulates both publication and Course Sync. Layer 6 adds real GitHub API writes while keeping the same saved-decision and explicit-Retry workflow. The full-stack documents describe that next layer as well.

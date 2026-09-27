@@ -1,3 +1,4 @@
+import pg from "pg";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -8,6 +9,17 @@ import { setTimeout as delay } from "node:timers/promises";
 import { DefaultChatTransport, readUIMessageStream } from "ai";
 import { Chat } from "@ai-sdk/react";
 
+const schema = `test_${crypto.randomUUID().replaceAll("-", "")}`;
+const admin = new pg.Client({
+  connectionString:
+    process.env.DATABASE_URL ?? "postgresql://localhost/course_agent",
+});
+await admin.connect();
+await admin.query(`CREATE SCHEMA ${schema}`);
+const databaseUrl = new URL(
+  process.env.DATABASE_URL ?? "postgresql://localhost/course_agent",
+);
+databaseUrl.searchParams.set("options", `-c search_path=${schema}`);
 const state = await mkdtemp(join(tmpdir(), "cf-relay-"));
 let logs = "";
 let worker;
@@ -43,7 +55,7 @@ function startServer() {
         AGENT_URL: "http://localhost:8791",
         PUSH_MODE: "simulated",
         PORT: "4318",
-        CHAT_DB_PATH: join(state, "chat.sqlite"),
+        DATABASE_URL: databaseUrl.toString(),
       },
       stdio: "pipe",
     },
@@ -338,15 +350,20 @@ try {
     const minutes = (value) => value * 60_000;
     const lease = (await getState()).sandbox;
     assert.equal(lease.phase, "waiting_for_user");
+    const idleMs = (await diagnostics()).idleExpiresAt - lease.waitingSince;
+    assert.ok(idleMs > 0);
     assert.deepEqual(await diagnostics(), {
       state: lease.phase,
-      idleExpiresAt: lease.waitingSince + minutes(10),
+      idleExpiresAt: lease.waitingSince + idleMs,
       interactionExpiresAt: lease.lastUserInteractionAt + minutes(360),
     });
     assert.deepEqual((await getState()).sandbox, lease);
     const schedules = await (await fetch(`${fixture}/schedules`)).json();
     const lifetime = schedules.filter(
-      (s) => s.payload.id === lease.id && s.payload.reason === "interaction",
+      (s) =>
+        s.callback === "expireSandbox" &&
+        s.payload.id === lease.id &&
+        s.payload.reason === "interaction",
     );
     assert.equal(lifetime.length, 1);
     assert.ok(
@@ -354,9 +371,9 @@ try {
         lifetime[0].time * 1000 - lease.lastUserInteractionAt - minutes(360),
       ) < 1000,
     );
-    await advance(minutes(9));
+    await advance(idleMs / 2);
     assert.equal((await getStatus()).destroys, 0);
-    await advance(minutes(1) + 1000);
+    await advance(idleMs / 2 + 1000);
     assert.equal((await getState()).sandbox, undefined);
     assert.equal((await getStatus()).destroys, 1);
     assert.deepEqual(await diagnostics(), {
@@ -377,10 +394,10 @@ try {
     await post(`${fixture}/expire-old`, { id: lease.id });
     assert.equal((await getState()).sandbox.id, restored.sandbox.id);
     console.log(
-      "Passed: ten minutes waiting destroys the sandbox; next turn restores; old lifetime callbacks are harmless.",
+      "Passed: the configured idle interval destroys the sandbox; next turn restores; old lifetime callbacks are harmless.",
     );
 
-    await advance(minutes(9));
+    await advance(idleMs / 2);
     const activeReader = await firstText(await send());
     await advance(minutes(2));
     assert.equal((await getState()).sandbox.phase, "waiting_for_agent");
@@ -413,7 +430,7 @@ try {
 
     const beforeIdleFailure = await (await fetch(`${fixture}/backups`)).json();
     await fetch(`${fixture}/fail-backup`, { method: "POST" });
-    await advance(minutes(10) + 1000);
+    await advance(idleMs + 1000);
     assert.equal((await getStatus()).destroys, 1);
     assert.equal((await getState()).sandbox.phase, "waiting_for_user");
     await advance(31_000);
@@ -484,14 +501,25 @@ try {
     const remaining = await (await fetch(`${fixture}/schedules`)).json();
     assert.equal(
       remaining.filter(
-        (s) => s.payload.id === failedSandboxId && s.payload.attempt,
+        (s) =>
+          s.callback === "expireSandbox" &&
+          s.payload.id === failedSandboxId &&
+          s.payload.attempt,
       ).length,
       0,
     );
-    await post(`${fixture}/run`);
+    assert.equal(
+      (await fetch(`${api}/cleanup`, { method: "POST" })).status,
+      202,
+    );
+    for (let i = 0; i < 100 && (await getState()).sandbox; i++)
+      await delay(100);
+    assert.equal((await getState()).sandbox, undefined);
+    for await (const _ of await send()) {
+    }
     assert.equal((await getState()).run.status, "completed");
     console.log(
-      "Passed: cleanup stops after three failures, retains the sandbox identity, and an explicit new message can retry and restore.",
+      "Passed: cleanup stops after three failures, retains the sandbox identity, and explicit cleanup retry permits restoration.",
     );
     const idleDeadline = "http://localhost:8791/agents/chat/idle-deadline/test";
     const firstRun = await post(`${idleDeadline}/run`);
@@ -545,7 +573,7 @@ try {
       "destroy",
     ]);
     console.log(
-      "Passed: test-only 30-second interaction deadline expires before the ten-minute idle timer.",
+      "Passed: test-only 30-second interaction deadline expires before the idle timer.",
     );
 
     const chat = new Chat({
@@ -649,7 +677,7 @@ try {
     expectedRevision: old.revision,
   });
   assert.equal(stale.status, 409);
-  assert.match(await stale.text(), /another tab/);
+  assert.match(await stale.text(), /conversation changed/);
   await fetch(`${api}/cancel`, { method: "POST" });
   await delay(300);
   const catalog = "http://127.0.0.1:4318/api/conversations";
@@ -814,6 +842,74 @@ try {
   console.log(
     "Passed: warm denial is a native tool result, relay restart retains catalog, tampered/conflicting decisions are rejected.",
   );
+  const eventConversation = await (
+    await postJson("http://127.0.0.1:4318/api/conversations", {
+      title: "Event stream",
+    })
+  ).json();
+  const eventApi = `http://127.0.0.1:4318/api/conversations/${eventConversation.id}/chat`;
+  async function observe() {
+    const controller = new AbortController();
+    const response = await fetch(`${eventApi}/events`, {
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]),
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body
+      .pipeThrough(new TextDecoderStream())
+      .getReader();
+    let buffer = "";
+    return {
+      close: () => controller.abort(),
+      next: async () => {
+        while (!buffer.includes("\n\n")) {
+          const { value, done } = await reader.read();
+          assert.equal(done, false);
+          buffer += value;
+        }
+        const end = buffer.indexOf("\n\n");
+        const event = JSON.parse(buffer.slice(6, end));
+        buffer = buffer.slice(end + 2);
+        return event;
+      },
+    };
+  }
+  const observer = await observe();
+  assert.equal((await observer.next()).revision, 0);
+  assert.equal(
+    (
+      await postJson(eventApi, {
+        ...newMessage("SSE updates"),
+        expectedRevision: 0,
+      })
+    ).status,
+    204,
+  );
+  let event;
+  do {
+    event = await observer.next();
+  } while (
+    event.revision !== 1 ||
+    event.diagnostics.state !== "waiting_for_agent" ||
+    !event.messages.length
+  );
+  assert.equal(event.messages[0].parts[0].text, "SSE updates");
+  observer.close();
+  const reconnected = await observe();
+  assert.equal((await reconnected.next()).revision, 1);
+  reconnected.close();
+  assert.equal(
+    (
+      await postJson(eventApi, {
+        ...newMessage("stale tab"),
+        expectedRevision: 0,
+      })
+    ).status,
+    409,
+  );
+  await postJson(`${eventApi}/cancel`, {});
+  console.log(
+    "Passed: SSE delivers revision/lifecycle changes without polling and reconnect starts from a fresh snapshot.",
+  );
 } catch (error) {
   console.error(logs.slice(-12_000));
   throw error;
@@ -826,4 +922,6 @@ try {
     await exited;
   }
   await rm(state, { recursive: true, force: true });
+  await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+  await admin.end();
 }

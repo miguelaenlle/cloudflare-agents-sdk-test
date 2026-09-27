@@ -48,6 +48,7 @@ export interface Socket {
   addEventListener(type: "close" | "error", listener: () => void): void;
 }
 
+/** Bound waiting, not execution: callers must reconcile an operation whose acknowledgment times out. */
 export function within<T>(
   promise: Promise<T>,
   milliseconds: number,
@@ -62,7 +63,7 @@ export function within<T>(
   ]).finally(() => clearTimeout(timer));
 }
 
-// Cloudflare supplies the socket. This client owns only Codex's JSON-RPC protocol.
+/** Codex JSON-RPC on a Cloudflare-provided socket: correlate replies, dispatch events, reject on disconnect. */
 export class AppServer {
   private socket: Socket;
   private nextId = 0;
@@ -181,6 +182,7 @@ export class AppServer {
     this.fail(new Error("Codex client closed."));
   }
 
+  /** Resolve the matching RPC reply; an error reply differs from an uncertain transport failure. */
   async request<M extends keyof Results>(
     method: M,
     params: Extract<ClientRequest, { method: M }>["params"],

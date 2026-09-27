@@ -6,6 +6,7 @@ export { Chat } from "./agent.ts";
 export { Sandbox } from "./sandbox.ts";
 export { ContainerProxy };
 
+// Public ingress only: authenticate the relay and route the conversation name to its Chat DO.
 export default {
   async fetch(request, env) {
     // Only the chat is public; the Sandbox binding is an internal execution API.

@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, useRef, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
@@ -73,7 +73,7 @@ function ApprovalCard({
       </details>
       {approval.status === "pending" ? (
         <>
-          <p>Approval is simulated; no Git push or Course Sync will run.</p>
+          <p>Approve publishes these files. Course Sync is simulated.</p>
           {publication?.error && <p role="alert">{publication.error}</p>}
           <div className="actions">
             <button
@@ -115,7 +115,7 @@ function ApprovalCard({
               disabled={sending}
               onClick={() => void decide(approval.status === "approved")}
             >
-              Retry result delivery
+              Retry completion
             </button>
           )}
         </>
@@ -123,6 +123,7 @@ function ApprovalCard({
     </section>
   );
 }
+/** Render user-visible history; internal approval continuations stay available to Codex but are hidden here. */
 function Transcript({
   messages,
   snapshot,
@@ -276,12 +277,14 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
     resume: true,
   });
   const busy = status === "submitted" || status === "streaming";
-  const stale = revision !== snapshot.revision;
+  // Our pending send/approval reserves a revision before its response arrives.
+  const stale = !sending && revision !== snapshot.revision;
   const approval = snapshot.approval;
   function draft(text: string) {
     setInput(text);
     sessionStorage.setItem(`draft:${id}`, text);
   }
+  /** Replace the local snapshot/revision before reconnecting to the current stream. */
   async function refresh() {
     await stop();
     const next = await request<ChatSnapshot>(api.snapshot);
@@ -290,31 +293,27 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
     setMessages(next.messages);
     void resumeStream();
   }
-  // Approvals and other-tab revisions can change while this tab has no active stream.
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  // Subscribe once per conversation. EventSource reconnects and receives a fresh snapshot after transport failure.
   useEffect(() => {
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    async function poll() {
-      try {
-        const next = await request<ChatSnapshot>(api.snapshot);
-        if (disposed) return;
-        setSnapshot(next);
-        if (!busy) {
-          setMessages(next.messages);
-          void resumeStream();
-        }
-      } catch (error) {
-        if (!disposed) setFailure(String(error));
-      } finally {
-        if (!disposed) timer = setTimeout(poll, 2000);
+    const source = new EventSource(api.events);
+    source.onmessage = (event) => {
+      const next = JSON.parse(event.data) as ChatSnapshot;
+      setSnapshot(next);
+      if (!busyRef.current) {
+        setMessages(next.messages);
+        void resumeStream();
       }
-    }
-    timer = setTimeout(poll, 2000);
-    return () => {
-      disposed = true;
-      clearTimeout(timer);
     };
-  }, [id, busy, setMessages, resumeStream]);
+    source.onerror = () =>
+      setFailure(
+        "Live updates disconnected; reconnecting. Your draft is preserved.",
+      );
+    source.onopen = () => setFailure("");
+    return () => source.close();
+  }, [id, setMessages, resumeStream]);
+  /** Submit with the last observed revision; a rejected send keeps the draft for the user. */
   async function send(event: FormEvent) {
     event.preventDefault();
     if (!input.trim() || sending || stale) return;
@@ -352,7 +351,7 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
       await request(api.approval, {
         id: approval.id,
         digest: approval.digest,
-        expectedRevision: snapshot.revision,
+        expectedRevision: revision,
         approved,
       });
       await refresh();
@@ -371,7 +370,10 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
             ? "Working…"
             : "Ready"}
       </p>
-      <SandboxStatus api={api.diagnostics} />
+      <SandboxStatus
+        diagnostics={snapshot.diagnostics}
+        retryApi={api.cleanup}
+      />
       <Transcript
         messages={messages}
         snapshot={snapshot}
