@@ -10,6 +10,7 @@ import {
   type ChatProvider,
   type SendRequest,
 } from "@playground/chat-contract";
+import { Publisher, PublishRejected, type Publication } from "./publish.ts";
 import { prepareTool, historicalApprovals } from "./tools.ts";
 
 const blocks = (
@@ -34,6 +35,7 @@ export const db = new pg.Pool({ connectionString });
 await db.query(
   await readFile(new URL("./schema.sql", import.meta.url), "utf8"),
 );
+const simulated = process.env.PUSH_MODE === "simulated";
 
 /** LISTEN is established before reading a snapshot, so no change can fall into a subscription gap. */
 export async function subscribe(
@@ -142,6 +144,14 @@ export async function admit(id: string, input: SendRequest) {
     input.expectedRevision,
   );
 }
+function publisher(job: Publication) {
+  const token = process.env.GITHUB_TOKEN;
+  if (!token)
+    throw new Error(
+      "Set GITHUB_TOKEN on the PL relay to enable approved pushes.",
+    );
+  return new Publisher(job.destination, { token });
+}
 async function row(id: string) {
   return (await db.query(sql("select_publication"), [id])).rows[0];
 }
@@ -180,7 +190,27 @@ export async function publicationSnapshot(
   let publication: ChatSnapshot["publication"];
   if (current && !current.delivered) {
     let error: string | undefined;
-
+    if (!current.job.candidate && !simulated) {
+      try {
+        current.job.candidate = await publisher(current.job).prepare(
+          current.job,
+        );
+        await db.query(sql("save_candidate"), [
+          current.id,
+          JSON.stringify(current.job),
+        ]);
+        const index = approvals.findIndex((a) => a.id === current.id);
+        approvals[index] = {
+          ...approvals[index]!,
+          diff: current.job.approval.diff,
+        };
+      } catch (failure) {
+        error =
+          failure instanceof Error
+            ? failure.message
+            : "Proposal validation failed.";
+      }
+    }
     publication = {
       ...current.job.destination,
       status: current.decision ? "publishing" : error ? "invalid" : "ready",
@@ -239,9 +269,26 @@ export async function recordDecision(
       let result: string;
       if (!input.approved)
         result = "The user denied this proposal. No changes were published.";
-      else
+      else if (simulated)
         result =
           "Approved. sync would go here. SIMULATION ONLY: no commit was published and no sync ran.";
+      else {
+        const job: Publication = saved.job;
+        if (!job.candidate)
+          throw new Error(
+            "Proposal has not been validated. Refresh and Retry.",
+          );
+        try {
+          const sha = saved.published_sha ?? (await publisher(job).push(job));
+          // Checkpoint publication before sync; Retry reconciles an uncertain GitHub acknowledgment.
+          await db.query(sql("save_sha"), [input.id, sha]);
+          console.log(`Approval ${input.id}: sync would go here`);
+          result = `Push succeeded: ${job.destination.repository} branch ${job.destination.branch}, commit ${sha}. Course Sync: simulated (sync would go here). Run git fetch origin, reconcile your checkout with ${sha} while preserving newer edits, then git pull --ff-only before continuing.`;
+        } catch (error) {
+          if (!(error instanceof PublishRejected)) throw error;
+          result = `Publication failed: ${error.message} Course Sync did not run. Prepare a new proposal.`;
+        }
+      }
       await db.query(sql("save_outcome"), [
         input.id,
         JSON.stringify({ id: input.id, result }),

@@ -1,6 +1,6 @@
-# Durable approvals with simulated publication
+# Real Git publication
 
-This is layer 5 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
+This is layer 6 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
 
 Create a dedicated local Postgres database with `createdb course_agent`, and set `DATABASE_URL=postgresql://localhost/course_agent` on the relay.
 
@@ -30,4 +30,4 @@ The agent calls `push_sync` with base/proposed commit SHAs. Capture immutable fi
 
 ## Publication
 
-This layer simulates both publication and Course Sync. Layer 6 adds real GitHub API writes while keeping the same saved-decision and explicit-Retry workflow. The full-stack documents describe that next layer as well.
+Real publication replaces the simulated operation. A shared repository-scoped PAT permits trusted GitHub API writes and sandbox read-only clone/fetch/pull through outbound injection. The relay generates the visual diff from saved file contents, commits those contents through GitHub APIs with an expected-head guard, and reconciles uncertain outcomes by operation identity. No Git checkout or patch application occurs on the relay. Course Sync remains simulated. See [push-sync-testing.md](docs/push-sync-testing.md) and [testing.md](docs/testing.md).
