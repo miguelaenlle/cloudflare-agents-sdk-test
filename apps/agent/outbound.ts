@@ -1,3 +1,4 @@
+// Credentials are attached here, outside the container and its checkpoints.
 // This executes in Workers, never inside the Linux container.
 export async function forwardOpenAI(
   request: Request,

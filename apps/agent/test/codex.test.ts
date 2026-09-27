@@ -176,7 +176,7 @@ test("local backup uses the SDK binding path without changing production default
     [false, true].map((localBucket) => ({
       dir: "/workspace",
       localBucket,
-      ttl: 30 * 24 * 60 * 60,
+      ttl: 7 * 24 * 60 * 60,
       excludes: ["auth.json"],
     })),
   );

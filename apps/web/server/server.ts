@@ -1,3 +1,4 @@
+import { once } from "node:events";
 import express, { type ErrorRequestHandler, type Response } from "express";
 import { pipeUIMessageStreamToResponse } from "ai";
 import { z } from "zod";
@@ -8,6 +9,9 @@ import {
 } from "@playground/chat-contract";
 import { createCloudflareProvider } from "./providers/cloudflare.ts";
 import {
+  conversationSnapshot,
+  subscribe,
+  admit,
   listConversations,
   createConversation,
   hasConversation,
@@ -40,10 +44,10 @@ function clientSignal(response: Response) {
   response.once("close", () => controller.abort());
   return controller.signal;
 }
-app.get("/api/conversations", (_request, response) =>
-  response.json(listConversations()),
+app.get("/api/conversations", async (_request, response) =>
+  response.json(await listConversations()),
 );
-app.post("/api/conversations", (request, response) => {
+app.post("/api/conversations", async (request, response) => {
   const parsed = z
     .object({ title: z.string().trim().min(1).max(100) })
     .safeParse(request.body);
@@ -51,35 +55,108 @@ app.post("/api/conversations", (request, response) => {
     response.status(400).send("Expected a title.");
     return;
   }
-  response.status(201).json(createConversation(parsed.data.title));
+  response.status(201).json(await createConversation(parsed.data.title));
 });
 function routes(
   base: string,
   conversationId: (params: Record<string, string | string[]>) => string,
 ) {
-  function provider(params: Record<string, string | string[]>) {
+  async function provider(params: Record<string, string | string[]>) {
     const id = conversationId(params);
-    if (!hasConversation(id))
+    if (!(await hasConversation(id)))
       throw new ChatError(404, "Conversation not found.");
     return createCloudflareProvider(new URL(config.AGENT_URL), id);
   }
+  app.get(`${base}/events`, async (request, response) => {
+    const id = conversationId(request.params);
+    const chat = await provider(request.params);
+    const signal = clientSignal(response);
+    let ready = false,
+      dirty = false,
+      running = false;
+    const failed = () => response.destroy();
+    const refresh = async () => {
+      dirty = true;
+      if (!ready || running || signal.aborted) return;
+      running = true;
+      try {
+        while (dirty && !signal.aborted) {
+          dirty = false;
+          const snapshot = await conversationSnapshot(
+            id,
+            await chat.getSnapshot(signal),
+          );
+          snapshot.diagnostics = await chat.getDiagnostics(signal);
+          if (
+            !signal.aborted &&
+            !response.write(`data: ${JSON.stringify(snapshot)}\n\n`)
+          ) {
+            // Bound queued output while allowing large snapshots to drain normally.
+            await once(response, "drain", {
+              signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
+            });
+          }
+        }
+      } catch {
+        failed();
+      } finally {
+        running = false;
+      }
+    };
+    const unlisten = await subscribe(id, () => void refresh(), failed);
+    let unwatch: (() => void) | undefined;
+    response.once("close", () => {
+      unlisten();
+      unwatch?.();
+    });
+    try {
+      unwatch = await chat.watch(signal, () => void refresh(), failed);
+      if (signal.aborted) {
+        unwatch();
+        return;
+      }
+      response.set({
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+      });
+      response.flushHeaders();
+      ready = true;
+      await refresh();
+    } catch (error) {
+      unlisten();
+      unwatch?.();
+      throw error;
+    }
+  });
   app.get(`${base}/snapshot`, async (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.json(
-      await provider(request.params).getSnapshot(clientSignal(response)),
+      await conversationSnapshot(
+        conversationId(request.params),
+        await (
+          await provider(request.params)
+        ).getSnapshot(clientSignal(response)),
+      ),
     );
   });
   app.get(`${base}/history`, async (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.json(
-      await provider(request.params).getHistory(clientSignal(response)),
+      await (await provider(request.params)).getHistory(clientSignal(response)),
     );
   });
   app.get(`${base}/diagnostics`, async (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.json(
-      await provider(request.params).getDiagnostics(clientSignal(response)),
+      await (
+        await provider(request.params)
+      ).getDiagnostics(clientSignal(response)),
     );
+  });
+  app.post(`${base}/cleanup`, async (request, response) => {
+    await (await provider(request.params)).retryCleanup(clientSignal(response));
+    response.sendStatus(202);
   });
   app.post(base, async (request, response) => {
     const parsed = sendRequestSchema.safeParse(request.body);
@@ -89,23 +166,26 @@ function routes(
         .send("Expected a message ID, revision and nonempty text.");
       return;
     }
-    await provider(request.params).send(parsed.data, clientSignal(response));
+    const chat = await provider(request.params);
+    await admit(conversationId(request.params), parsed.data);
+    await chat.send(parsed.data, clientSignal(response));
     response.status(204).end();
   });
   app.post(`${base}/cancel`, async (request, response) => {
-    await provider(request.params).cancel(clientSignal(response));
+    await (await provider(request.params)).cancel(clientSignal(response));
     response.status(204).end();
   });
   app.get(`${base}/:chatId/stream`, async (request, response) => {
     if (request.params.chatId !== conversationId(request.params))
       throw new ChatError(404, "Conversation not found.");
-    await streamChat(provider(request.params), response);
+    await streamChat(await provider(request.params), response);
   });
 }
 routes("/api/conversations/:conversationId/chat", (params) =>
   z.string().parse(params.conversationId),
 );
 routes("/api/chat", () => "playground");
+/** Relay AI SDK SSE to this browser; disconnect aborts observation, not the durable Codex turn. */
 async function streamChat(provider: ChatProvider, response: Response) {
   const connection = await provider.connect(clientSignal(response));
   try {

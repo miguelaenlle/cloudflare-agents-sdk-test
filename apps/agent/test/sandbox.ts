@@ -3,6 +3,8 @@ import type { ThreadItem, Turn } from "../protocol.ts";
 
 type State = {
   files: Record<string, string>;
+  waitingTool?: boolean;
+  toolResults?: unknown[];
   backup?: Record<string, string>;
   backupEvents: string[];
   running: boolean;
@@ -15,6 +17,8 @@ type State = {
   destroyFailures?: number;
   ignoreCancellation?: boolean;
   dropStartAck?: boolean;
+  failLaunch?: boolean;
+  launchDelay?: number;
   steerBehavior?: "finish" | "lose-ack" | "reject";
 };
 const textItem = (id: string, text: string): ThreadItem => ({
@@ -71,6 +75,7 @@ export class TestSandbox extends DurableObject {
     const state = await this.state();
     if (
       !state.running ||
+      state.waitingTool ||
       request.headers.get("Authorization") !==
         `Bearer ${state.files["/tmp/codex-app-server-token"]}`
     )
@@ -81,6 +86,10 @@ export class TestSandbox extends DurableObject {
     server.addEventListener("close", () => this.sockets.delete(server));
     server.addEventListener("message", (event) => {
       const frame = JSON.parse(String(event.data));
+      if (!frame.method && frame.id === "approval-call") {
+        void this.acceptToolResult(frame.result);
+        return;
+      }
       void this.rpc(frame.method, frame.params ?? {})
         .then(async (result) => {
           const state = await this.state();
@@ -116,7 +125,12 @@ export class TestSandbox extends DurableObject {
   }
   private async rpc(
     method: string,
-    params: { threadId?: string; turnId?: string; expectedTurnId?: string },
+    params: {
+      threadId?: string;
+      turnId?: string;
+      expectedTurnId?: string;
+      clientUserMessageId?: string;
+    },
   ) {
     await this.completeIfDue();
     const state = await this.state();
@@ -141,7 +155,16 @@ export class TestSandbox extends DurableObject {
         const turn: Turn = {
           id: crypto.randomUUID(),
           status: "inProgress",
-          items: [textItem("start", "Started. "), command("inProgress")],
+          items: [
+            textItem("start", "Started. "),
+            command("inProgress"),
+            {
+              type: "userMessage",
+              id: crypto.randomUUID(),
+              clientId: params.clientUserMessageId ?? null,
+              content: [],
+            },
+          ],
           itemsView: "full",
           error: null,
           startedAt: Date.now() / 1000,
@@ -151,7 +174,8 @@ export class TestSandbox extends DurableObject {
         state.turns.push(turn);
         await this.save(state);
         await this.ctx.storage.setAlarm(Date.now() + 8_000);
-        this.emit("turn/started", { threadId: "native-thread", turn });
+        if (!state.dropStartAck)
+          this.emit("turn/started", { threadId: "native-thread", turn });
         this.emit("item/completed", {
           threadId: "native-thread",
           turnId: turn.id,
@@ -214,6 +238,7 @@ export class TestSandbox extends DurableObject {
     const turn = state.turns.at(-1);
     if (
       !state.running ||
+      state.waitingTool ||
       state.ignoreCancellation ||
       turn?.status !== "inProgress" ||
       Date.now() < turn.startedAt! * 1000 + 8000
@@ -224,6 +249,7 @@ export class TestSandbox extends DurableObject {
       textItem("start", "Started. "),
       command("completed"),
       textItem("finish", "Finished."),
+      ...turn.items.filter((item) => item.type === "userMessage"),
     ];
     await this.save(state);
     for (const item of turn.items.slice(1))
@@ -250,11 +276,74 @@ export class TestSandbox extends DurableObject {
     if (content === undefined) throw new Error(`Missing fixture file: ${path}`);
     return { content };
   }
-  async exec() {
-    return { success: true };
+  async deleteFile(path: string) {
+    const state = await this.state();
+    delete state.files[path];
+    await this.save(state);
+  }
+  async exec(command: string) {
+    const path = command.match(/(\/tmp\/approval-[\w-]+\.json)/)?.[1];
+    if (path)
+      await this.writeFile(
+        path,
+        JSON.stringify({
+          diff: "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n",
+          files: [
+            {
+              path: "hello.txt",
+              content: "new\n",
+              previousMode: "100644",
+              mode: "100644",
+            },
+          ],
+        }),
+      );
+    return {
+      success: true,
+      stdout:
+        "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n",
+    };
+  }
+  async requestApproval() {
+    const state = await this.state();
+    state.waitingTool = true;
+    await this.save(state);
+    for (const socket of this.sockets)
+      socket.send(
+        JSON.stringify({
+          id: "approval-call",
+          method: "item/tool/call",
+          params: {
+            threadId: "native-thread",
+            turnId: state.turns.at(-1)!.id,
+            callId: "approval-call",
+            namespace: null,
+            tool: "push_sync",
+            arguments: { baseSha: "a".repeat(40), proposedSha: "b".repeat(40) },
+          },
+        }),
+      );
+  }
+  private async acceptToolResult(result: unknown) {
+    const state = await this.state();
+    state.toolResults = [...(state.toolResults ?? []), result];
+    state.waitingTool = false;
+    await this.save(state);
+    await this.ctx.storage.setAlarm(Date.now() + 100);
   }
   async startProcess(_command: string, _options: { processId: string }) {
     const state = await this.state();
+    if (state.failLaunch) {
+      state.failLaunch = false;
+      await this.save(state);
+      throw new Error("Fixture launch failed");
+    }
+    if (state.launchDelay) {
+      const delay = state.launchDelay;
+      state.launchDelay = undefined;
+      await this.save(state);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
     if (state.running) throw new Error("Duplicate launch");
     state.running = true;
     state.launches++;
@@ -268,6 +357,12 @@ export class TestSandbox extends DurableObject {
     const state = await this.state();
     state.steerBehavior = behavior;
     await this.save(state);
+  }
+  async configureLaunch(options: {
+    failLaunch?: boolean;
+    launchDelay?: number;
+  }) {
+    await this.save({ ...(await this.state()), ...options });
   }
   async dropNextStartAck() {
     const state = await this.state();
@@ -300,13 +395,22 @@ export class TestSandbox extends DurableObject {
         path.startsWith("/workspace/"),
       ),
     );
+    const id = crypto.randomUUID();
+    const bucket = (this.env as { BACKUP_BUCKET: R2Bucket }).BACKUP_BUCKET;
+    await bucket.put(`backups/${id}/data.sqsh`, JSON.stringify(state.backup));
+    await bucket.put(`backups/${id}/meta.json`, JSON.stringify({ id }));
     await this.save(state);
-    return { id: "test-backup", dir: "/workspace" };
+    return { id, dir: "/workspace" };
   }
-  async restoreBackup() {
+  async restoreBackup(backup: { id: string }) {
     const state = await this.state();
-    if (!state.backup) throw new Error("No backup");
-    state.files = { ...state.backup };
+    const bucket = (this.env as { BACKUP_BUCKET: R2Bucket }).BACKUP_BUCKET;
+    const archive = await bucket.get(`backups/${backup.id}/data.sqsh`);
+    if (!archive)
+      throw Object.assign(new Error("No backup"), {
+        name: "BackupNotFoundError",
+      });
+    state.files = await archive.json<Record<string, string>>();
     state.restores++;
     // The saved native session is idle. Work lost since that checkpoint is not replayed.
     state.turns = state.turns.filter((turn) => turn.status !== "inProgress");
@@ -340,6 +444,7 @@ export class TestSandbox extends DurableObject {
       throw new Error("Fixture destroy unavailable");
     }
     state.files = {};
+    state.waitingTool = false;
     state.running = false;
     state.ignoreCancellation = false;
     await this.save(state);
@@ -350,8 +455,15 @@ export class TestSandbox extends DurableObject {
     return (await this.state()).backupEvents;
   }
   async inspect() {
-    const { launches, restores, destroys, running, steers, turns } =
-      await this.state();
+    const {
+      launches,
+      restores,
+      destroys,
+      running,
+      steers,
+      turns,
+      toolResults,
+    } = await this.state();
     return {
       launches,
       restores,
@@ -359,6 +471,7 @@ export class TestSandbox extends DurableObject {
       running,
       steers,
       turns: turns.length,
+      toolResults,
     };
   }
 }
