@@ -38,7 +38,7 @@ export interface Env {
 }
 type Expiration = {
   id: string;
-  reason: "idle" | "interaction" | "retry";
+  reason: "idle" | "interaction" | "retry" | "startup-cancel";
   waitingSince?: number;
   attempt?: number;
   retryOf?: string;
@@ -65,6 +65,8 @@ export class Chat extends AIChatAgent<Env, CodexState> {
   private turnInProgress = false;
   // Capture has no resumable work; a DO restart must not preserve an in-flight lock.
   private recovery?: Promise<void>;
+  // Cleanup joins setup instead of cancelling individual SDK operations.
+  private startup?: Promise<unknown>;
 
   protected get interactionTimeoutMs() {
     return USER_IDLE_MS;
@@ -293,6 +295,10 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     const run = this.state.run;
     if (run?.status !== "running") return;
     this.ensureUsable(run.sandboxId);
+    if (this.turnInProgress && !run.submitted) {
+      this.setRun({ ...run, cancelRequested: true });
+      return;
+    }
     const active = this.active;
     if (active && run.threadId && run.turnId) {
       await active.interrupt(run.turnId);
@@ -303,7 +309,9 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         "Stop is unconfirmed. Another turn remains blocked.",
       );
     } else if (this.turnInProgress) {
-      throw new Error("Codex is still starting. Try Stop again shortly.");
+      throw new Error(
+        "Native turn acceptance is pending. Try Stop again shortly.",
+      );
     } else {
       await this.reconcile();
     }
@@ -426,10 +434,10 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         this.state,
         {
           recovery: true,
-          assertCurrent: () => this.ensureUsable(run.sandboxId),
         },
       );
       client = connection.client;
+      this.ensureUsable(run.sandboxId);
       if (run.threadId) {
         const { thread } = await client.request("thread/resume", {
           threadId: run.threadId,
@@ -560,7 +568,8 @@ export class Chat extends AIChatAgent<Env, CodexState> {
   async expireSandbox(expiration: Expiration) {
     const { id, reason, attempt = 0 } = expiration;
     // A deployment can leave callbacks from the old absolute-lifetime policy.
-    if (!["idle", "interaction", "retry"].includes(reason)) return;
+    if (!["idle", "interaction", "retry", "startup-cancel"].includes(reason))
+      return;
     const state = this.state.sandbox;
     if (!state || state.id !== id) return;
     if (expiration.retryOf && expiration.retryOf !== state.cleanup?.id) return;
@@ -577,7 +586,17 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     )
       return;
     if (reason === "retry" && state.phase !== "cleanup_failed") return;
-    let checkpointOnly = reason === "idle";
+    // Setup may still be restoring files or opening a native thread. Fence sends,
+    // then join it before any checkpoint/destruction can touch the same container.
+    if (this.startup) {
+      this.setState({
+        ...this.state,
+        sandbox: { ...state, phase: "destroying" },
+      });
+      await this.startup.catch(() => {});
+      if (this.state.sandbox?.id !== id) return;
+    }
+    let checkpointOnly = reason === "idle" || reason === "startup-cancel";
     const cleanup = {
       id: crypto.randomUUID(),
       attempts: attempt + 1,
@@ -597,7 +616,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     };
     reportStage();
     try {
-      if (reason === "idle") {
+      if (reason === "idle" || reason === "startup-cancel") {
         this.setState({
           ...this.state,
           sandbox: { ...this.state.sandbox!, phase: "suspending" },
@@ -618,7 +637,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
         const active = this.active;
         const run = this.state.run;
         try {
-          if (run?.status === "running") {
+          if (run?.status === "running" && run.submitted) {
             if (!active || !run.threadId || !run.turnId)
               throw new Error(
                 "Native execution is unconfirmed; skip final backup.",
@@ -769,7 +788,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             messageMetadata: { runId: run.id },
           });
           try {
-            const connected = await connectCodex(
+            const connecting = connectCodex(
               this.sandbox(sandbox.id),
               this.state,
               {
@@ -788,10 +807,14 @@ export class Chat extends AIChatAgent<Env, CodexState> {
                     ],
                   });
                 },
-                assertCurrent: () => this.ensureUsable(sandbox.id),
               },
             );
+            this.startup = connecting;
+            const connected = await connecting;
             client = connected.client;
+            this.ensureUsable(sandbox.id);
+            if (this.state.run?.cancelRequested)
+              throw new Error("Startup cancelled.");
             if (connected.warning) {
               const id = `${run.id}:restore-warning`;
               write({ type: "text-start", id });
@@ -799,7 +822,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               write({ type: "text-end", id });
             }
             this.ensureUsable(sandbox.id);
-            execution = await openCodexTurn(client, {
+            const opening = openCodexTurn(client, {
               threadId: connected.threadId,
               model: this.env.CODEX_MODEL,
               runId: run.id,
@@ -807,7 +830,12 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               onTurnStarted: (turnId) =>
                 this.setRun({ ...this.state.run!, turnId, accepted: true }),
             });
+            this.startup = opening;
+            execution = await opening;
+            this.startup = undefined;
             this.ensureUsable(sandbox.id);
+            if (this.state.run?.cancelRequested)
+              throw new Error("Startup cancelled.");
             this.active = execution;
             this.setState({
               ...this.state,
@@ -834,6 +862,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               failure = new Error(turn.error?.message ?? "Codex turn failed.");
             if (this.usable(run.sandboxId)) await this.finishRun(run, status);
           } catch (error) {
+            this.startup = undefined;
             acceptance?.reject(error);
             failure = error;
             if (error instanceof AppServerError && !this.state.run?.accepted)
@@ -841,8 +870,17 @@ export class Chat extends AIChatAgent<Env, CodexState> {
             // Only a fresh, never-submitted workspace is disposable. Preserve restored/warm work.
             if (!this.state.run?.submitted && this.usable(run.sandboxId)) {
               try {
-                await this.finishRun(run, "failed");
-                if (fresh) {
+                const cancelled = !!this.state.run?.cancelRequested;
+                await execution?.close();
+                execution = undefined;
+                client?.close();
+                await this.finishRun(run, cancelled ? "cancelled" : "failed");
+                if (cancelled && !fresh) {
+                  await this.expireSandbox({
+                    id: run.sandboxId,
+                    reason: "startup-cancel",
+                  });
+                } else if (fresh) {
                   this.setState({
                     ...this.state,
                     sandbox: {
