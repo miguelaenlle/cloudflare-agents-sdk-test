@@ -1,3 +1,4 @@
+// Public entry point: authenticate and route to the named conversation DO.
 import { ContainerProxy } from "@cloudflare/sandbox";
 import { routeAgentRequest } from "agents";
 import type { Env } from "./agent.ts";
