@@ -1,3 +1,5 @@
+> This review round requires a fresh relay database and new conversations. See [tool flow and setup](tool-flow.md).
+
 # Test the complete stack, then deploy manually
 
 Use **`codex/review-v2-06-publication`**, the top of the behavior-oriented stack. The original PRs and `codex/prototype` remain unchanged. Commands run from the repository root. Preserve local credentials and Wrangler configuration.

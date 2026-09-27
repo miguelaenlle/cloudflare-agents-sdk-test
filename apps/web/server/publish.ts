@@ -9,6 +9,7 @@ export function destination(): Destination {
 }
 export type Publication = {
   id: string;
+  sequence: number;
   destination: Destination;
   approval: Approval;
   createdAt: string;

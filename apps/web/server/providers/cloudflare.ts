@@ -6,7 +6,6 @@ import { z } from "zod";
 import {
   CONVERSATION_ID,
   ChatError,
-  approvalSchema,
   type ChatSnapshot,
   sandboxDiagnosticsSchema,
   type ChatConnection,
@@ -62,17 +61,6 @@ export function createCloudflareProvider(
   }
 
   return {
-    async captureTool(id, signal) {
-      return approvalSchema.parse(
-        await (
-          await request(
-            `tool-proposal?id=${encodeURIComponent(id)}`,
-            "GET",
-            signal,
-          )
-        ).json(),
-      );
-    },
     async watch(signal, changed, failed) {
       const url = new URL(agentUrl);
       url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -129,8 +117,8 @@ export function createCloudflareProvider(
         pendingTool: value.pendingTool,
       };
     },
-    async decide(input, signal) {
-      await request("approval", "POST", signal, input);
+    async deliverToolResult(input, signal) {
+      await request("tool-result", "POST", signal, input);
     },
     async getDiagnostics(signal) {
       const response = await request("diagnostics", "GET", signal);

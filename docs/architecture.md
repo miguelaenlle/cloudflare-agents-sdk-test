@@ -75,7 +75,7 @@ Cleanup diagnostics report stage, attempts, sanitized errors and retry time. Des
 
 The DO persists a generic request ID, tool name and immutable payload before the native tool waits. The payload is transport data; the relay owns the approval record and verdict. `push_sync` captures committed text blobs, deletions, file modes and a raw diff from immutable Git objects, not from the changing worktree.
 
-The relay persists the proposal in Postgres. In real publication mode it retrieves base blobs from GitHub, validates paths/modes and reconstructs the displayed raw diff from the same saved final contents that will be published. It never applies the sandbox's diff as executable publication instructions. The content digest is stable across JSONB key ordering.
+The relay dispatches pending calls through its tool registry and persists the latest proposal per conversation in Postgres. A later call replaces it only after result delivery; completed card display data lives in DO history. In real publication mode it retrieves base blobs from GitHub, validates paths/modes and reconstructs the displayed raw diff from the same saved final contents that will be published. It never applies the sandbox's diff as executable publication instructions. The content digest is stable across JSONB key ordering.
 
 An unresolved gate blocks ordinary Send/steer in both warm and recovery paths. An approval can outlive sandbox destruction. Once a result exists, the DO either responds to the live native tool or resumes the saved thread with a hidden result message. The browser keeps the decision card at its original transcript location.
 
@@ -115,3 +115,5 @@ Local development runs the same Worker/DO code, a local container and a separate
 - Transport reconnects/timeouts and the browser's local countdown.
 
 No recurring publication scan, browser history polling, diagnostics polling, or sandbox health probe is added.
+
+Implementation details and setup changes: [generic tool flow](tool-flow.md).

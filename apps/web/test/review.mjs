@@ -440,12 +440,12 @@ try {
     expectedRevision: pending.revision,
     result: "Simulated publication result",
   };
-  assert.equal((await postJson(`${native}/approval`, decision)).ok, false);
+  assert.equal((await postJson(`${native}/tool-result`, decision)).ok, false);
   let failed = await (await fetch(`${native}/test/state`)).json();
   assert.equal(failed.pendingTool.id, decision.id);
   assert.equal(failed.run.accepted, undefined);
   await delay(100);
-  const redelivery = await postJson(`${native}/approval`, decision);
+  const redelivery = await postJson(`${native}/tool-result`, decision);
   assert.equal(redelivery.status, 204, await redelivery.text());
   const delivered = await (await fetch(`${native}/test/state`)).json();
   assert.equal(delivered.pendingTool, undefined);
@@ -477,6 +477,13 @@ try {
     "Passed: a missing R2 archive is identified across DO RPC and starts fresh with a retained warning.",
   );
 
+  const rpcFailure = await (
+    await fetch("http://localhost:8791/agents/chat/playground/test/error-shape")
+  ).json();
+  assert.equal(rpcFailure.name, "InvalidBackupConfigError");
+  assert.match(rpcFailure.diagnosis, /configuration is invalid/);
+  assert.doesNotMatch(JSON.stringify(rpcFailure), /signed-url-secret/);
+
   const slow = "http://localhost:8791/agents/chat/slow-start-review";
   await postJson(`${slow}/test/launch`, { launchDelay: 28000 });
   assert.equal(
@@ -504,8 +511,14 @@ try {
     await (await fetch(`${slow}/snapshot`)).json(),
     beforeSecond,
   );
-  await delay(3500);
-  await postJson(`${slow}/cancel`);
+  await delay(4000);
+  const stoppedStartup = await (await fetch(`${slow}/test/status`)).json();
+  assert.equal(stoppedStartup.turns, 0);
+  assert.equal(stoppedStartup.destroys, 1);
+  assert.equal(
+    (await (await fetch(`${slow}/diagnostics`)).json()).state,
+    "absent",
+  );
   console.log(
     "Passed: Send during startup rejects promptly without persisting input or blocking Stop behind the model turn.",
   );

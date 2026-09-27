@@ -57,12 +57,8 @@ export interface ChatProvider {
     changed: () => void,
     failed: () => void,
   ): Promise<() => void>;
-  captureTool(id: string, signal: AbortSignal): Promise<Approval>;
   getSnapshot(signal: AbortSignal): Promise<ChatSnapshot>;
-  decide(
-    input: { id: string; result: string },
-    signal: AbortSignal,
-  ): Promise<void>;
+  deliverToolResult(input: ToolOutcome, signal: AbortSignal): Promise<void>;
   getDiagnostics(signal: AbortSignal): Promise<SandboxDiagnostics>;
   retryCleanup(signal: AbortSignal): Promise<void>;
   getHistory(signal: AbortSignal): Promise<UIMessage[]>;
@@ -104,6 +100,9 @@ export const approvalSchema = z.object({
   result: z.string().optional(),
 });
 export type Approval = z.infer<typeof approvalSchema>;
+/** History keeps the reviewed diff and verdict, not another copy of publication file blobs. */
+export const approvalDisplaySchema = approvalSchema.omit({ files: true });
+export type ApprovalDisplay = z.infer<typeof approvalDisplaySchema>;
 /** Stable across JSONB object-key normalization; every published byte participates in approval identity. */
 export function proposalContent(
   base: string,
@@ -125,8 +124,8 @@ export type ChatSnapshot = {
   blocked?: boolean;
   pendingTool?: PendingTool;
   diagnostics?: SandboxDiagnostics;
-  approval?: Approval;
-  approvals?: Approval[];
+  approval?: ApprovalDisplay;
+  approvals?: ApprovalDisplay[];
   publication?: {
     repository: string;
     branch: string;
@@ -138,6 +137,7 @@ export type ChatSnapshot = {
 /** Generic durable gate. Product-specific proposals and decisions belong to the relay. */
 export type PendingTool = {
   id: string;
+  sequence: number;
   name: string;
   args: unknown;
   result?: string;
@@ -145,7 +145,9 @@ export type PendingTool = {
 export const toolOutcomeSchema = z.object({
   id: z.uuid(),
   result: z.string().min(1).max(2000),
+  display: z.object({ name: z.string(), value: z.json() }).optional(),
 });
+export type ToolOutcome = z.infer<typeof toolOutcomeSchema>;
 
 export class ChatError extends Error {
   readonly status: number;

@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS operations (
 );
 CREATE TABLE IF NOT EXISTS publications (
   id text PRIMARY KEY,
-  conversation_id text NOT NULL REFERENCES conversations(id),
+  conversation_id text NOT NULL UNIQUE REFERENCES conversations(id),
   job jsonb NOT NULL,
   decision jsonb,
   published_sha text,

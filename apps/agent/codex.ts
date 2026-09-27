@@ -30,6 +30,7 @@ export type Run = {
 /** Persisted in the Chat DO; filesystem contents live in the sandbox or its latest R2 checkpoint. */
 export type CodexState = {
   pendingTool?: PendingTool;
+  toolSequence?: number;
   toolReceipts?: Record<string, string>;
   sandbox?: {
     id: string;

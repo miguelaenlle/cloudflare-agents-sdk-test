@@ -1,7 +1,7 @@
 import type { UIMessageChunk } from "ai";
 import type { AppServer } from "./app-server.ts";
 import { CodexEvents } from "./codex-events.ts";
-import { pushSyncTool } from "./approval.ts";
+import { toolDefinitions } from "./tools.ts";
 import type {
   DynamicToolCallParams,
   DynamicToolCallResponse,
@@ -20,14 +20,14 @@ export async function openCodexTurn(
     runId,
     write,
     onTurnStarted,
-    onPushSync,
+    onToolCall,
   }: {
     threadId?: string;
     model?: string;
     runId: string;
     write: (chunk: UIMessageChunk) => void;
     onTurnStarted: (turnId: string) => void;
-    onPushSync?: (
+    onToolCall?: (
       params: DynamicToolCallParams,
     ) => Promise<DynamicToolCallResponse>;
   },
@@ -41,12 +41,12 @@ export async function openCodexTurn(
     ? await client.request("thread/resume", { ...options, threadId })
     : await client.request("thread/start", {
         ...options,
-        dynamicTools: [pushSyncTool],
+        dynamicTools: toolDefinitions,
       });
   if (thread.turns.some((turn) => turn.status === "inProgress"))
     throw new Error("Native thread still has an active turn.");
 
-  client.toolHandler = onPushSync;
+  client.toolHandler = onToolCall;
   const events = new CodexEvents(write, runId);
   const controls = new Set<Promise<unknown>>();
   async function control<T>(request: Promise<T>): Promise<T> {

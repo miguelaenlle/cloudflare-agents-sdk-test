@@ -5,7 +5,7 @@ import {
   type Approval,
 } from "@playground/chat-contract";
 import type { CodexSandbox } from "./codex.ts";
-import type { DynamicToolSpec, DynamicToolCallResponse } from "./protocol.ts";
+import type { DynamicToolSpec } from "./protocol.ts";
 
 export const pushSyncTool: DynamicToolSpec = {
   type: "function",
@@ -87,7 +87,4 @@ with open("${path}", "w") as f:
     digest,
     status: "pending",
   });
-}
-export function toolResult(text: string): DynamicToolCallResponse {
-  return { success: true, contentItems: [{ type: "inputText", text }] };
 }
