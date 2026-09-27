@@ -5,16 +5,21 @@ import { z } from "zod";
 import {
   ChatError,
   sendRequestSchema,
+  approvalDecisionSchema,
   type ChatProvider,
 } from "@playground/chat-contract";
+import { dispatchHostTool } from "./host-tools.ts";
 import { createCloudflareProvider } from "./providers/cloudflare.ts";
 import {
-  conversationSnapshot,
+  publicationSnapshot,
+  preparePublication,
+  retryPreparation,
   subscribe,
   admit,
   listConversations,
   createConversation,
   hasConversation,
+  recordDecision,
 } from "./conversations.ts";
 
 const config = z
@@ -82,7 +87,7 @@ function routes(
       try {
         while (dirty && !signal.aborted) {
           dirty = false;
-          const snapshot = await conversationSnapshot(
+          const snapshot = await publicationSnapshot(
             id,
             await chat.getSnapshot(signal),
           );
@@ -110,7 +115,20 @@ function routes(
       unwatch?.();
     });
     try {
-      unwatch = await chat.watch(signal, () => void refresh(), failed);
+      unwatch = await chat.watch(
+        signal,
+        () => void refresh(),
+        failed,
+        (call) =>
+          dispatchHostTool(call, (incoming) =>
+            preparePublication(id, {
+              id: incoming.id,
+              sequence: incoming.sequence!,
+              name: incoming.name,
+              args: incoming.input,
+            }),
+          ),
+      );
       if (signal.aborted) {
         unwatch();
         return;
@@ -132,7 +150,7 @@ function routes(
   app.get(`${base}/snapshot`, async (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.json(
-      await conversationSnapshot(
+      await publicationSnapshot(
         conversationId(request.params),
         await (
           await provider(request.params)
@@ -173,6 +191,22 @@ function routes(
   });
   app.post(`${base}/cancel`, async (request, response) => {
     await (await provider(request.params)).cancel(clientSignal(response));
+    response.status(204).end();
+  });
+  app.post(`${base}/approval/prepare`, async (request, response) => {
+    await provider(request.params);
+    const id = z.uuid().parse(request.body.id);
+    await retryPreparation(conversationId(request.params), id);
+    response.sendStatus(204);
+  });
+  app.post(`${base}/approval`, async (request, response) => {
+    const parsed = approvalDecisionSchema.safeParse(request.body);
+    if (!parsed.success) {
+      response.status(400).send("Invalid approval decision.");
+      return;
+    }
+    const chat = await provider(request.params);
+    await recordDecision(conversationId(request.params), parsed.data, chat);
     response.status(204).end();
   });
   app.get(`${base}/:chatId/stream`, async (request, response) => {

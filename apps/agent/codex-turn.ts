@@ -1,4 +1,4 @@
-import { hostToolDefinitions } from "@playground/chat-contract";
+import { toolDefinitions } from "./tools.ts";
 import type { UIMessageChunk } from "ai";
 import type { AppServer } from "./app-server.ts";
 import { CodexEvents } from "./codex-events.ts";
@@ -41,7 +41,7 @@ export async function openCodexTurn(
     ? await client.request("thread/resume", { ...options, threadId })
     : await client.request("thread/start", {
         ...options,
-        dynamicTools: hostToolDefinitions,
+        dynamicTools: toolDefinitions,
       });
   if (thread.turns.some((turn) => turn.status === "inProgress"))
     throw new Error("Native thread still has an active turn.");

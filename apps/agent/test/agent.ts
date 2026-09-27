@@ -1,3 +1,4 @@
+import { cleanupError } from "../cleanup-error.ts";
 import { Chat as ProductionChat } from "../agent.ts";
 import worker from "../worker.ts";
 import { SANDBOX_IDLE_MS, type CodexSandbox } from "../codex.ts";
@@ -36,6 +37,16 @@ export class Chat extends ProductionChat {
   }
   override async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
+    if (path.endsWith("/test/error-shape")) {
+      try {
+        await this.fixture().structuredFailure();
+      } catch (error) {
+        return Response.json({
+          name: error instanceof Error ? error.name : null,
+          diagnosis: cleanupError("backup", error),
+        });
+      }
+    }
     if (path.endsWith("/test/launch")) {
       await this.fixture().configureLaunch(await request.json());
       return new Response(null, { status: 204 });
@@ -75,6 +86,13 @@ export class Chat extends ProductionChat {
       for (const schedule of this.getSchedules<
         Parameters<Chat["expireSandbox"]>[0]
       >()) {
+        if (
+          schedule.callback === "expireToolPreparation" &&
+          schedule.time * 1000 <= this.now()
+        ) {
+          await this.cancelSchedule(schedule.id);
+          await this.expireToolPreparation({ id: schedule.payload.id });
+        }
         if (
           schedule.callback === "expireSandbox" &&
           schedule.time * 1000 <= this.now()

@@ -56,8 +56,10 @@ export interface ChatProvider {
     signal: AbortSignal,
     changed: () => void,
     failed: () => void,
+    execute?: (call: HostToolCall) => Promise<unknown>,
   ): Promise<() => void>;
   getSnapshot(signal: AbortSignal): Promise<ChatSnapshot>;
+  deliverToolResult(input: ToolOutcome, signal: AbortSignal): Promise<void>;
   getDiagnostics(signal: AbortSignal): Promise<SandboxDiagnostics>;
   retryCleanup(signal: AbortSignal): Promise<void>;
   getHistory(signal: AbortSignal): Promise<UIMessage[]>;
@@ -79,12 +81,77 @@ export function conversationApi(id: string) {
     approval: `${chat}/approval`,
   };
 }
+export const approvalSchema = z.object({
+  id: z.uuid(),
+  baseSha: z.string().regex(/^[a-f0-9]{40}$/),
+  proposedSha: z.string().regex(/^[a-f0-9]{40}$/),
+  diff: z.string().max(262144),
+  files: z
+    .array(
+      z.object({
+        path: z.string().min(1).max(1024),
+        content: z.string().max(262144).nullable(),
+        mode: z.string(),
+        previousMode: z.string(),
+      }),
+    )
+    .max(100),
+  digest: z.string(),
+  status: z.enum(["pending", "approved", "denied"]),
+  result: z.string().optional(),
+});
+export type Approval = z.infer<typeof approvalSchema>;
+/** History keeps the reviewed diff and verdict, not another copy of publication file blobs. */
+export const approvalDisplaySchema = approvalSchema.omit({ files: true });
+export type ApprovalDisplay = z.infer<typeof approvalDisplaySchema>;
+/** Stable across JSONB object-key normalization; every published byte participates in approval identity. */
+export function proposalContent(
+  base: string,
+  proposed: string,
+  files: Approval["files"],
+) {
+  return `${base}\n${proposed}\n${JSON.stringify(files.map((f) => [f.path, f.content, f.mode, f.previousMode]))}`;
+}
+export const approvalDecisionSchema = z.object({
+  id: z.uuid(),
+  expectedRevision: z.number().int().nonnegative(),
+  digest: z.string(),
+  approved: z.boolean(),
+});
+export type ApprovalDecision = z.infer<typeof approvalDecisionSchema>;
 export type ChatSnapshot = {
   messages: UIMessage[];
   revision: number;
   blocked?: boolean;
+  pendingTool?: PendingTool;
   diagnostics?: SandboxDiagnostics;
+  approval?: ApprovalDisplay;
+  approvals?: ApprovalDisplay[];
+  publication?: {
+    repository: string;
+    branch: string;
+    status: "ready" | "publishing" | "invalid";
+    decision?: boolean;
+    error?: string;
+  };
 };
+/** Generic durable gate. Product-specific proposals and decisions belong to the relay. */
+export type PendingTool = {
+  id: string;
+  sequence: number;
+  name: string;
+  args: unknown;
+  result?: string;
+  prepared?: boolean;
+  error?: string;
+};
+export const toolOutcomeSchema = z.object({
+  id: z.uuid(),
+  result: z.string().min(1).max(2000),
+  display: z.object({ name: z.string(), value: z.json() }).optional(),
+});
+export type ToolOutcome = z.infer<typeof toolOutcomeSchema>;
+
 export class ChatError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
@@ -93,13 +160,19 @@ export class ChatError extends Error {
   }
 }
 
-/** Custom relay frames share the Agents socket, but are separate from its chat protocol. */
+export const approvalOutcomeSchema = approvalDecisionSchema.extend({
+  result: z.string().min(1).max(2000),
+});
+
 export const hostToolCallSchema = z.object({
   type: z.literal("host-tool-call"),
   id: z.string().uuid(),
   name: z.string().max(100),
   input: z.unknown(),
+  sequence: z.number().int().positive().optional(),
 });
+export type HostToolCall = z.infer<typeof hostToolCallSchema>;
+
 export const hostToolResultSchema = z.object({
   type: z.literal("host-tool-result"),
   id: z.string().uuid(),

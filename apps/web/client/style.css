@@ -55,3 +55,31 @@ button:disabled {
 [role="alert"] {
   color: #a00;
 }
+
+code {
+  overflow-wrap: anywhere;
+}
+select {
+  max-width: 100%;
+  font: inherit;
+}
+
+.approval-card {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fafafa;
+  font-size: 14px;
+}
+.approval-card p {
+  margin: 6px 0;
+}
+.approval-card pre {
+  max-height: 280px;
+  overflow: auto;
+}
+.approval-card button {
+  padding: 4px 10px;
+  font-size: 14px;
+}

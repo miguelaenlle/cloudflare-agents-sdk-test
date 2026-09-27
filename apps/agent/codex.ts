@@ -1,5 +1,8 @@
 import type { DirectoryBackup, getSandbox } from "@cloudflare/sandbox";
-import type { CleanupDiagnostics } from "@playground/chat-contract";
+import type {
+  PendingTool,
+  CleanupDiagnostics,
+} from "@playground/chat-contract";
 import { safeFailure } from "./cleanup-error.ts";
 import { AppServer } from "./app-server.ts";
 
@@ -26,6 +29,9 @@ export type Run = {
 };
 /** Persisted in the Chat DO; filesystem contents live in the sandbox or its latest R2 checkpoint. */
 export type CodexState = {
+  pendingTool?: PendingTool;
+  toolSequence?: number;
+  toolReceipts?: Record<string, string>;
   sandbox?: {
     id: string;
     phase:

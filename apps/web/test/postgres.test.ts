@@ -60,6 +60,106 @@ test("Postgres admissions, notification delivery, and durable manual Retry", asy
         close();
       }
     });
+    await t.test(
+      "decision survives failed delivery; explicit Retry preserves the verdict and revision",
+      async () => {
+        const convo = await store.createConversation("Retry");
+        const id = randomUUID();
+        const files = [
+          {
+            path: "a",
+            content: "hello",
+            mode: "100644",
+            previousMode: "000000",
+          },
+        ];
+        const baseSha = "a".repeat(40),
+          proposedSha = "b".repeat(40);
+        const approval = {
+          id,
+          baseSha,
+          proposedSha,
+          files,
+          diff: "raw diff",
+          digest: createHash("sha256")
+            .update(`${baseSha}\n${proposedSha}\n${JSON.stringify(files)}`)
+            .digest("hex"),
+          status: "pending" as const,
+        };
+        const initial = {
+          messages: [],
+          revision: 0,
+          blocked: true,
+          pendingTool: { id, sequence: 1, name: "push_sync", args: approval },
+        };
+        await store.preparePublication(convo.id, initial.pendingTool);
+        let deliveries = 0;
+        const chat = {
+          deliverToolResult: async () => {
+            deliveries++;
+            if (deliveries === 1) throw new Error("delivery failed");
+          },
+        } as unknown as ChatProvider;
+        const decision = {
+          id,
+          digest: approval.digest,
+          approved: true,
+          expectedRevision: 0,
+        };
+        await assert.rejects(
+          store.recordDecision(convo.id, decision, chat),
+          /delivery failed/,
+        );
+        await assert.rejects(
+          store.admit(convo.id, {
+            id: randomUUID(),
+            text: "bypass",
+            expectedRevision: 1,
+          }),
+          /pending publication/,
+        );
+        const newer = {
+          ...initial,
+          pendingTool: {
+            ...initial.pendingTool,
+            id: randomUUID(),
+            sequence: 2,
+          },
+        };
+        assert.equal(
+          (await store.publicationSnapshot(convo.id, newer)).approval?.id,
+          id,
+        );
+        const failed = await store.publicationSnapshot(convo.id, initial);
+        assert.equal(failed.approval?.status, "approved");
+        assert.equal(failed.revision, 1);
+        await store.recordDecision(convo.id, decision, chat);
+        await store.recordDecision(convo.id, decision, chat);
+        assert.equal(deliveries, 2);
+        await assert.rejects(
+          store.recordDecision(
+            convo.id,
+            { ...decision, approved: false },
+            chat,
+          ),
+          /different input/,
+        );
+        await store.preparePublication(convo.id, newer.pendingTool);
+        await store.publicationSnapshot(convo.id, initial); // A delayed old snapshot must not replace the new record.
+        const rows = await store.db.query(
+          "SELECT id FROM publications WHERE conversation_id=$1",
+          [convo.id],
+        );
+        assert.deepEqual(
+          rows.rows.map((r) => r.id),
+          [newer.pendingTool.id],
+        );
+        await assert.rejects(
+          store.recordDecision(convo.id, decision, chat),
+          /Proposal changed/,
+        );
+      },
+    );
   } finally {
     await store.db.end();
     await admin.query(`DROP SCHEMA ${schema} CASCADE`);
