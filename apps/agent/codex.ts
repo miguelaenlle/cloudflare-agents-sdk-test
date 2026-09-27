@@ -112,7 +112,7 @@ export async function connectCodex(
       }
       threadId = restored ? state.checkpoint?.threadId : undefined;
       const configured = await sandbox.exec(
-        "cp /opt/codex-config.toml /workspace/codex/config.toml",
+        "git -C /workspace/repo config user.name Codex && git -C /workspace/repo config user.email codex@users.noreply.github.com && cp /opt/codex-config.toml /workspace/codex/config.toml",
         {
           timeout: 60_000,
         },
