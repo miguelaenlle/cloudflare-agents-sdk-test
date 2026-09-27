@@ -1,0 +1,13 @@
+{
+  "name": "@playground/chat-contract",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ai": "^7.0.102",
+    "zod": "^4.6.5"
+  }
+}

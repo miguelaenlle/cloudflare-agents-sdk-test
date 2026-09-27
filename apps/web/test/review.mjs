@@ -1,0 +1,151 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { DefaultChatTransport, readUIMessageStream } from "ai";
+import { Chat } from "@ai-sdk/react";
+
+const state = await mkdtemp(join(tmpdir(), "cf-relay-"));
+let logs = "";
+let worker;
+function startWorker() {
+  worker = spawn(
+    "../agent/node_modules/.bin/wrangler",
+    [
+      "dev",
+      "--config",
+      "../agent/test/wrangler.jsonc",
+      "--port",
+      "8791",
+      "--inspector-port",
+      "0",
+      "--persist-to",
+      state,
+    ],
+    { stdio: "pipe" },
+  );
+  worker.stdout.on("data", (chunk) => (logs += chunk));
+  worker.stderr.on("data", (chunk) => (logs += chunk));
+}
+startWorker();
+const api = "http://127.0.0.1:4318/api/chat";
+let server;
+function startServer() {
+  server = spawn(
+    process.execPath,
+    ["--experimental-strip-types", "server/server.ts"],
+    {
+      env: {
+        ...process.env,
+        AGENT_URL: "http://localhost:8791",
+        PUSH_MODE: "simulated",
+        PORT: "4318",
+        CHAT_DB_PATH: join(state, "chat.sqlite"),
+      },
+      stdio: "pipe",
+    },
+  );
+  server.stderr.on("data", (chunk) => (logs += chunk));
+}
+async function ready(url) {
+  for (let i = 0; i < 100; i++) {
+    try {
+      if ((await fetch(url, { signal: AbortSignal.timeout(500) })).ok) return;
+    } catch {}
+    await delay(100);
+  }
+  throw new Error(`Not ready: ${url}\n${logs}`);
+}
+async function stopServer() {
+  const exited = once(server, "exit");
+  server.kill("SIGKILL");
+  await exited;
+}
+const diagnostics = async () => {
+  const response = await fetch(`${api}/diagnostics`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  return response.json();
+};
+const history = async () => (await fetch(`${api}/history`)).json();
+const transport = new DefaultChatTransport({ api });
+const newMessage = (text = "Run fixture.") => ({
+  id: crypto.randomUUID(),
+  text,
+});
+const submit = async (input = newMessage()) =>
+  fetch(api, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...input,
+    }),
+  });
+async function send(input = newMessage()) {
+  const response = await submit(input);
+  assert.equal(response.status, 204, await response.text());
+  const stream = await transport.reconnectToStream({ chatId: "playground" });
+  assert.ok(stream);
+  return stream;
+}
+async function firstText(stream) {
+  const reader = stream.getReader();
+  while (true) {
+    const { value, done } = await reader.read();
+    assert.equal(done, false);
+    if (value.type === "text-delta") return reader;
+  }
+}
+try {
+  await ready("http://localhost:8791/agents/chat/playground/get-messages");
+  startServer();
+  await ready(`${api}/history`);
+  assert.deepEqual(await history(), []);
+  const first = await firstText(await send());
+  assert.equal(
+    (await submit(newMessage("Do not start a second turn."))).status,
+    409,
+  );
+  await stopServer();
+  await assert.rejects(async () => {
+    while (!(await first.read()).done) {}
+  });
+  await delay(8500);
+  startServer();
+  await ready(`${api}/history`);
+  const saved = await history();
+  assert.ok(
+    saved.some(
+      (message) =>
+        message.role === "assistant" &&
+        message.parts.some(
+          (part) => part.type === "text" && part.text.length > 0,
+        ),
+    ),
+  );
+  const stream = await send(newMessage("Continue the same conversation."));
+  for await (const _ of stream) {
+  }
+  assert.equal(
+    (await history()).filter((message) => message.role === "user").length,
+    2,
+  );
+  console.log(
+    "Passed: native-shaped streaming, durable history and detached completion across relay restart.",
+  );
+} catch (error) {
+  console.error(logs.slice(-12_000));
+  throw error;
+} finally {
+  if (server && server.exitCode === null && server.signalCode === null)
+    await stopServer();
+  if (worker.exitCode === null && worker.signalCode === null) {
+    const exited = once(worker, "exit");
+    worker.kill("SIGTERM");
+    await exited;
+  }
+  await rm(state, { recursive: true, force: true });
+}
