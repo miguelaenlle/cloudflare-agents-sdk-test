@@ -3,6 +3,7 @@ import type {
   PendingTool,
   CleanupDiagnostics,
 } from "@playground/chat-contract";
+import { safeFailure } from "./cleanup-error.ts";
 import { AppServer } from "./app-server.ts";
 
 export type CodexSandbox = ReturnType<typeof getSandbox>;
@@ -22,6 +23,8 @@ export type Run = {
   submitted?: boolean;
   /** Native acknowledgment or correlated native history proves the prompt arrived. */
   accepted?: boolean;
+  /** Stop during startup is applied before submitting native work. */
+  cancelRequested?: boolean;
   status: "running" | "completed" | "cancelled" | "failed" | "interrupted";
 };
 /** Persisted in the Chat DO; filesystem contents live in the sandbox or its latest R2 checkpoint. */
@@ -64,21 +67,9 @@ async function startupStep<T>(
   try {
     return await operation();
   } catch (error) {
-    const message = error instanceof Error ? error.message : "";
-    let detail = "Check the Worker and container logs for this stage.";
-    if (
-      /maximum number of running container instances exceeded/i.test(message)
-    ) {
-      detail =
-        "Cloudflare's running-container limit is reached. Wait for an idle sandbox to shut down, or increase containers[].max_instances in wrangler.jsonc and redeploy.";
-    } else if (/no container instance.*(provided|available)/i.test(message)) {
-      detail =
-        "Cloudflare could not allocate a container. Check container provisioning and available capacity, then retry.";
-    } else if (/timeout|timed out/i.test(message)) {
-      detail =
-        "The operation timed out. Check container startup and connectivity, then retry.";
-    }
-    throw new Error(`Sandbox startup failed while ${stage}. ${detail}`);
+    throw new Error(
+      `Sandbox startup failed while ${stage}. ${safeFailure(error)}`,
+    );
   }
 }
 
@@ -92,33 +83,17 @@ export async function connectCodex(
   {
     repository,
     recovery = false,
-    assertCurrent = () => {},
     onCheckpointUnavailable = (_warning: string) => {},
   }: {
     repository?: string;
     recovery?: boolean;
-    assertCurrent?: () => void;
     onCheckpointUnavailable?: (warning: string) => void;
   } = {},
 ) {
-  // One guard per asynchronous SDK operation; this does not cancel an operation already in flight.
-  async function step<T>(
-    stage: string,
-    operation: () => Promise<T>,
-    dispose?: (value: T) => void,
-  ): Promise<T> {
-    assertCurrent();
-    const value = await startupStep(stage, operation);
-    try {
-      assertCurrent();
-    } catch (error) {
-      dispose?.(value);
-      throw error;
-    }
-    return value;
-  }
   const warm = (
-    await step("allocating the container", () => sandbox.exists(readyFile))
+    await startupStep("allocating the container", () =>
+      sandbox.exists(readyFile),
+    )
   ).exists;
   if (!warm && recovery) throw new ContainerLost();
   let threadId = state.threadId;
@@ -127,7 +102,7 @@ export async function connectCodex(
     let restored = false;
     if (state.checkpoint) {
       const { backup } = state.checkpoint;
-      await step("restoring the workspace backup", async () => {
+      await startupStep("restoring the workspace backup", async () => {
         try {
           await sandbox.restoreBackup(backup);
           restored = true;
@@ -138,7 +113,6 @@ export async function connectCodex(
             !["BackupNotFoundError", "BackupExpiredError"].includes(error.name)
           )
             throw error;
-          assertCurrent();
           warning =
             "The checkpoint is missing or expired. Starting a fresh workspace from the configured repository; prior uncommitted files and Codex session context are unavailable.";
           onCheckpointUnavailable(warning);
@@ -149,13 +123,15 @@ export async function connectCodex(
       if (repository && !/^[\w.-]+\/[\w.-]+$/.test(repository))
         throw new Error("Invalid configured GitHub repository.");
       // The outbound handler injects credentials and uses HTTPS upstream; local sandbox TLS interception is unavailable.
-      const initialized = await step("initializing the Git workspace", () =>
-        sandbox.exec(
-          repository
-            ? `mkdir -p /workspace/codex && git clone http://github.com/${repository}.git /workspace/repo`
-            : "mkdir -p /workspace/repo /workspace/codex && git init /workspace/repo",
-          { timeout: 60_000 },
-        ),
+      const initialized = await startupStep(
+        "initializing the Git workspace",
+        () =>
+          sandbox.exec(
+            repository
+              ? `mkdir -p /workspace/codex && git clone http://github.com/${repository}.git /workspace/repo`
+              : "mkdir -p /workspace/repo /workspace/codex && git init /workspace/repo",
+            { timeout: 60_000 },
+          ),
       );
       if (!initialized.success)
         throw new Error(
@@ -163,29 +139,29 @@ export async function connectCodex(
         );
     }
     threadId = restored ? state.checkpoint?.threadId : undefined;
-    const configured = await step("configuring Codex", () =>
+    const configured = await startupStep("configuring Codex", () =>
       sandbox.exec("cp /opt/codex-config.toml /workspace/codex/config.toml", {
         timeout: 60_000,
       }),
     );
     if (!configured.success) throw new Error("Could not configure Codex.");
-    await step("writing the connection token", () =>
+    await startupStep("writing the connection token", () =>
       sandbox.writeFile(tokenFile, crypto.randomUUID()),
     );
-    await step("marking workspace ready", () =>
+    await startupStep("marking workspace ready", () =>
       sandbox.writeFile(readyFile, "ready"),
     );
   }
-  const process = await step("reading process status", () =>
+  const process = await startupStep("reading process status", () =>
     sandbox.getProcess(SERVER_ID),
   );
   if (!process || !["running", "starting"].includes(process.status)) {
     if (recovery) throw new ContainerLost();
     if (process)
-      await step("cleaning old processes", () =>
+      await startupStep("cleaning old processes", () =>
         sandbox.cleanupCompletedProcesses(),
       );
-    const server = await step("launching Codex app-server", () =>
+    const server = await startupStep("launching Codex app-server", () =>
       sandbox.startProcess(
         `codex app-server --listen ws://0.0.0.0:${SERVER_PORT} --ws-auth capability-token --ws-token-file ${tokenFile}`,
         {
@@ -195,34 +171,33 @@ export async function connectCodex(
         },
       ),
     );
-    await step("waiting for Codex app-server readiness (60-second limit)", () =>
-      server.waitForPort(SERVER_PORT, { path: "/readyz", timeout: 60_000 }),
+    await startupStep(
+      "waiting for Codex app-server readiness (60-second limit)",
+      () =>
+        server.waitForPort(SERVER_PORT, { path: "/readyz", timeout: 60_000 }),
     );
   } else if (process.status === "starting") {
-    await step("waiting for Codex app-server readiness (60-second limit)", () =>
-      process.waitForPort(SERVER_PORT, { path: "/readyz", timeout: 60_000 }),
+    await startupStep(
+      "waiting for Codex app-server readiness (60-second limit)",
+      () =>
+        process.waitForPort(SERVER_PORT, { path: "/readyz", timeout: 60_000 }),
     );
   }
-  const { content: token } = await step("reading the connection token", () =>
-    sandbox.readFile(tokenFile),
+  const { content: token } = await startupStep(
+    "reading the connection token",
+    () => sandbox.readFile(tokenFile),
   );
-  const response = await step(
-    "connecting to Codex",
-    () =>
-      sandbox.wsConnect(
-        new Request("http://sandbox/", {
-          headers: {
-            Upgrade: "websocket",
-            Connection: "Upgrade",
-            Authorization: `Bearer ${token}`,
-          },
-        }),
-        SERVER_PORT,
-      ),
-    (response) => {
-      response.webSocket?.accept();
-      response.webSocket?.close();
-    },
+  const response = await startupStep("connecting to Codex", () =>
+    sandbox.wsConnect(
+      new Request("http://sandbox/", {
+        headers: {
+          Upgrade: "websocket",
+          Connection: "Upgrade",
+          Authorization: `Bearer ${token}`,
+        },
+      }),
+      SERVER_PORT,
+    ),
   );
   if (!response.webSocket)
     throw new Error(
@@ -231,7 +206,9 @@ export async function connectCodex(
   response.webSocket.accept();
   const client = new AppServer(response.webSocket);
   try {
-    await step("initializing the Codex connection", () => client.initialize());
+    await startupStep("initializing the Codex connection", () =>
+      client.initialize(),
+    );
   } catch (error) {
     client.close();
     throw error;

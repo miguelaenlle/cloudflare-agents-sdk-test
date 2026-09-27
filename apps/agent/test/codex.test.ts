@@ -196,25 +196,23 @@ test("missing credentials and upstream exceptions reveal no secret", async () =>
   assert.doesNotMatch(await response.text(), /private-test-key/);
 });
 
-test("expiry during restore prevents subsequent configuration and process launch", async () => {
-  let active = true;
-  const sandbox = {
-    exists: async () => ({ exists: false }),
-    restoreBackup: async () => {
-      active = false;
-    },
-  } as unknown as CodexSandbox;
-  await assert.rejects(
-    connectCodex(
-      sandbox,
-      { checkpoint: { backup: { id: "backup", dir: "/workspace" } } },
-      {
-        assertCurrent: () => {
-          if (!active) throw new Error("Expired");
-        },
-      },
-    ),
-    /Expired/,
+test("cleanup diagnoses ignore arbitrary error text", async () => {
+  const { cleanupError, OperationTimeout } =
+    await import("../cleanup-error.ts");
+  assert.doesNotMatch(
+    cleanupError("backup", new Error("403 AccessDenied secret")),
+    /secret|credentials|rejected/,
+  );
+  assert.match(
+    cleanupError("backup", new OperationTimeout("secret")),
+    /timed out/,
+  );
+  const rpcError = new Error("secret signed URL");
+  rpcError.name = "InvalidBackupConfigError";
+  assert.match(cleanupError("backup", rpcError), /configuration is invalid/);
+  assert.match(
+    cleanupError("stop", { code: "CONTAINER_UNAVAILABLE" }),
+    /container is unavailable/,
   );
 });
 
