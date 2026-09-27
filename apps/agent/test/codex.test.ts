@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { cleanupError } from "../cleanup-error.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -460,4 +464,86 @@ test("transient restore failure never discards the checkpoint or initializes fre
     ),
     /Sandbox startup failed/,
   );
+});
+
+// Execute the actual capture script: a mocked exec cannot detect a missing runtime dependency.
+test("Node capture reads committed additions, edits and deletions from real Git", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "node-capture-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", directory, ...args], {
+      encoding: "utf8",
+    }).trim();
+  try {
+    git("init", "--quiet");
+    git("config", "user.name", "Capture test");
+    git("config", "user.email", "capture@example.com");
+    await writeFile(join(directory, "edit.txt"), "old\n");
+    await writeFile(join(directory, "delete.txt"), "delete me\n");
+    git("add", ".");
+    git("commit", "--quiet", "-m", "Base");
+    const baseSha = git("rev-parse", "HEAD");
+    await writeFile(join(directory, "edit.txt"), "é  ");
+    await writeFile(join(directory, "space name.txt"), "new\n");
+    await rm(join(directory, "delete.txt"));
+    git("add", "-A");
+    git("commit", "--quiet", "-m", "Proposed");
+    const proposedSha = git("rev-parse", "HEAD");
+    await writeFile(join(directory, "edit.txt"), "uncommitted newer edit");
+    const sandbox = {
+      exec: async (command: string) => {
+        assert.ok(command.startsWith("node - <<'CAPTURE'"));
+        execFileSync("/bin/sh", [
+          "-c",
+          command.replace("/workspace/repo", directory),
+        ]);
+        return { success: true };
+      },
+      readFile: async (path: string) => ({
+        content: await readFile(path, "utf8"),
+      }),
+      deleteFile: async (path: string) => {
+        await rm(path);
+      },
+    } as unknown as CodexSandbox;
+    const result = await captureApproval(sandbox, { baseSha, proposedSha });
+    assert.deepEqual(result.files, [
+      {
+        path: "delete.txt",
+        content: null,
+        mode: "000000",
+        previousMode: "100644",
+      },
+      {
+        path: "edit.txt",
+        content: "é  ",
+        mode: "100644",
+        previousMode: "100644",
+      },
+      {
+        path: "space name.txt",
+        content: "new\n",
+        mode: "100644",
+        previousMode: "000000",
+      },
+    ]);
+    assert.equal(
+      result.diff,
+      execFileSync(
+        "git",
+        [
+          "-C",
+          directory,
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--no-renames",
+          baseSha,
+          proposedSha,
+        ],
+        { encoding: "utf8" },
+      ),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
