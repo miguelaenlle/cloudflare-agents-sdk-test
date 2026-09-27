@@ -1,3 +1,4 @@
+import pg from "pg";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -8,6 +9,17 @@ import { setTimeout as delay } from "node:timers/promises";
 import { DefaultChatTransport, readUIMessageStream } from "ai";
 import { Chat } from "@ai-sdk/react";
 
+const schema = `test_${crypto.randomUUID().replaceAll("-", "")}`;
+const admin = new pg.Client({
+  connectionString:
+    process.env.DATABASE_URL ?? "postgresql://localhost/course_agent",
+});
+await admin.connect();
+await admin.query(`CREATE SCHEMA ${schema}`);
+const databaseUrl = new URL(
+  process.env.DATABASE_URL ?? "postgresql://localhost/course_agent",
+);
+databaseUrl.searchParams.set("options", `-c search_path=${schema}`);
 const state = await mkdtemp(join(tmpdir(), "cf-relay-"));
 let logs = "";
 let worker;
@@ -43,7 +55,7 @@ function startServer() {
         AGENT_URL: "http://localhost:8791",
         PUSH_MODE: "simulated",
         PORT: "4318",
-        CHAT_DB_PATH: join(state, "chat.sqlite"),
+        DATABASE_URL: databaseUrl.toString(),
       },
       stdio: "pipe",
     },
@@ -263,4 +275,6 @@ try {
     await exited;
   }
   await rm(state, { recursive: true, force: true });
+  await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+  await admin.end();
 }

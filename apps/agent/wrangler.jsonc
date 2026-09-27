@@ -7,13 +7,13 @@
   "vars": {
     "UI_ORIGIN": "http://localhost:4315",
     "BACKUP_BUCKET_NAME": "codex-playground-backups",
-    "CLOUDFLARE_ACCOUNT_ID": "REPLACE_WITH_YOUR_ACCOUNT_ID",
+    "CLOUDFLARE_ACCOUNT_ID": "b47f20d37a5819c82ba5748e6f4ed62d",
   },
   "containers": [
     {
       "class_name": "Sandbox",
       "image": "./Dockerfile",
-      "max_instances": 1,
+      "max_instances": 5,
       "instance_type": "basic",
     },
   ],

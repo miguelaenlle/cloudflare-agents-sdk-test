@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, useRef, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
@@ -23,26 +23,31 @@ async function request<T>(url: string, body?: unknown): Promise<T> {
 function Transcript({ messages }: { messages: UIMessage[] }) {
   return (
     <section aria-label="Conversation">
-      {messages.length === 0 && <p>No messages yet.</p>}
+      {!messages.length && <p>No messages yet.</p>}
       {messages.map((message) => (
         <article key={message.id}>
           <strong>{message.role}</strong>
           {message.parts.map((part, index) => {
-            if (part.type === "text") {
+            if (part.type === "text")
               return (
                 <p className="message" key={index}>
                   {part.text}
                 </p>
               );
-            }
-            if (part.type.startsWith("tool-") || part.type === "dynamic-tool") {
+            if (part.type === "reasoning")
               return (
-                <details key={index} open>
+                <details key={index}>
+                  <summary>Reasoning summary</summary>
+                  <p className="message">{part.text}</p>
+                </details>
+              );
+            if (part.type.startsWith("tool-") || part.type === "dynamic-tool")
+              return (
+                <details key={index}>
                   <summary>Tool activity</summary>
                   <pre>{JSON.stringify(part, null, 2)}</pre>
                 </details>
               );
-            }
             return null;
           })}
         </article>
@@ -50,7 +55,6 @@ function Transcript({ messages }: { messages: UIMessage[] }) {
     </section>
   );
 }
-
 function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
   const api = conversationApi(id);
   const [transport] = useState(
@@ -70,11 +74,13 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
     resume: true,
   });
   const busy = status === "submitted" || status === "streaming";
-  const stale = revision !== snapshot.revision;
+  // Our pending send/approval reserves a revision before its response arrives.
+  const stale = !sending && revision !== snapshot.revision;
   function draft(text: string) {
     setInput(text);
     sessionStorage.setItem(`draft:${id}`, text);
   }
+  /** Replace the local snapshot/revision before reconnecting to the current stream. */
   async function refresh() {
     await stop();
     const next = await request<ChatSnapshot>(api.snapshot);
@@ -83,31 +89,27 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
     setMessages(next.messages);
     void resumeStream();
   }
-  // Other-tab revisions can change while this tab has no active stream.
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  // Subscribe once per conversation. EventSource reconnects and receives a fresh snapshot after transport failure.
   useEffect(() => {
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    async function poll() {
-      try {
-        const next = await request<ChatSnapshot>(api.snapshot);
-        if (disposed) return;
-        setSnapshot(next);
-        if (!busy) {
-          setMessages(next.messages);
-          void resumeStream();
-        }
-      } catch (error) {
-        if (!disposed) setFailure(String(error));
-      } finally {
-        if (!disposed) timer = setTimeout(poll, 2000);
+    const source = new EventSource(api.events);
+    source.onmessage = (event) => {
+      const next = JSON.parse(event.data) as ChatSnapshot;
+      setSnapshot(next);
+      if (!busyRef.current) {
+        setMessages(next.messages);
+        void resumeStream();
       }
-    }
-    timer = setTimeout(poll, 2000);
-    return () => {
-      disposed = true;
-      clearTimeout(timer);
     };
-  }, [id, busy, setMessages, resumeStream]);
+    source.onerror = () =>
+      setFailure(
+        "Live updates disconnected; reconnecting. Your draft is preserved.",
+      );
+    source.onopen = () => setFailure("");
+    return () => source.close();
+  }, [id, setMessages, resumeStream]);
+  /** Submit with the last observed revision; a rejected send keeps the draft for the user. */
   async function send(event: FormEvent) {
     event.preventDefault();
     if (!input.trim() || sending || stale) return;
@@ -140,7 +142,10 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
   return (
     <>
       <p role="status">{busy ? "Working…" : "Ready"}</p>
-      <SandboxStatus api={api.diagnostics} />
+      <SandboxStatus
+        diagnostics={snapshot.diagnostics}
+        retryApi={api.cleanup}
+      />
       <Transcript messages={messages} />
       {stale && (
         <p role="alert">
@@ -166,7 +171,9 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
           >
             Refresh history
           </button>
-          <button disabled={sending || busy || stale || !input.trim()}>
+          <button
+            disabled={sending || stale || snapshot.blocked || !input.trim()}
+          >
             Send
           </button>
           <button

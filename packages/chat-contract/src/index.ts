@@ -1,6 +1,9 @@
 import type { UIMessage, UIMessageChunk } from "ai";
 import { z } from "zod";
 
+// Prototype course configuration; PrairieLearn will resolve this from the authorized course.
+export const GITHUB_REPOSITORY = "miguelaenlle/course-agent-push-sync-test";
+
 export const CONVERSATION_ID = "playground";
 export const CHAT_API = "/api/chat";
 export const HISTORY_API = `${CHAT_API}/history`;
@@ -15,6 +18,15 @@ export const sendRequestSchema = z.object({
 });
 export type SendRequest = z.infer<typeof sendRequestSchema>;
 
+export const cleanupDiagnosticsSchema = z.object({
+  id: z.string(),
+  stage: z.enum(["stop", "backup", "destroy"]),
+  attempts: z.number().int().positive(),
+  error: z.string().optional(),
+  retryAt: z.number().nullable(),
+});
+export type CleanupDiagnostics = z.infer<typeof cleanupDiagnosticsSchema>;
+
 export const sandboxDiagnosticsSchema = z.object({
   state: z.enum([
     "absent",
@@ -25,6 +37,8 @@ export const sandboxDiagnosticsSchema = z.object({
     "destroying",
     "cleanup_failed",
   ]),
+  cleanup: cleanupDiagnosticsSchema.optional(),
+  checkpointError: z.string().optional(),
   idleExpiresAt: z.number().nullable(),
   interactionExpiresAt: z.number().nullable(),
 });
@@ -36,9 +50,16 @@ export interface ChatConnection {
   close(): void;
 }
 
+/** Backend provider boundary: controls/snapshots are JSON; observation yields standard AI SDK chunks. */
 export interface ChatProvider {
+  watch(
+    signal: AbortSignal,
+    changed: () => void,
+    failed: () => void,
+  ): Promise<() => void>;
   getSnapshot(signal: AbortSignal): Promise<ChatSnapshot>;
   getDiagnostics(signal: AbortSignal): Promise<SandboxDiagnostics>;
+  retryCleanup(signal: AbortSignal): Promise<void>;
   getHistory(signal: AbortSignal): Promise<UIMessage[]>;
   send(input: SendRequest, signal: AbortSignal): Promise<void>;
   cancel(signal: AbortSignal): Promise<void>;
@@ -51,10 +72,19 @@ export function conversationApi(id: string) {
     chat,
     history: `${chat}/history`,
     snapshot: `${chat}/snapshot`,
+    events: `${chat}/events`,
     diagnostics: `${chat}/diagnostics`,
+    cleanup: `${chat}/cleanup`,
     cancel: `${chat}/cancel`,
+    approval: `${chat}/approval`,
   };
 }
+export type ChatSnapshot = {
+  messages: UIMessage[];
+  revision: number;
+  blocked?: boolean;
+  diagnostics?: SandboxDiagnostics;
+};
 export class ChatError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
@@ -62,5 +92,3 @@ export class ChatError extends Error {
     this.status = status;
   }
 }
-
-export type ChatSnapshot = { messages: UIMessage[]; revision: number };
