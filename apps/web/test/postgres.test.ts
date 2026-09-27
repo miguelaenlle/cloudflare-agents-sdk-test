@@ -90,12 +90,12 @@ test("Postgres admissions, notification delivery, and durable manual Retry", asy
           messages: [],
           revision: 0,
           blocked: true,
-          pendingTool: { id, name: "push_sync", args: approval },
+          pendingTool: { id, sequence: 1, name: "push_sync", args: approval },
         };
         await store.publicationSnapshot(convo.id, initial);
         let deliveries = 0;
         const chat = {
-          decide: async () => {
+          deliverToolResult: async () => {
             deliveries++;
             if (deliveries === 1) throw new Error("delivery failed");
           },
@@ -109,6 +109,26 @@ test("Postgres admissions, notification delivery, and durable manual Retry", asy
         await assert.rejects(
           store.recordDecision(convo.id, decision, chat),
           /delivery failed/,
+        );
+        await assert.rejects(
+          store.admit(convo.id, {
+            id: randomUUID(),
+            text: "bypass",
+            expectedRevision: 1,
+          }),
+          /pending publication/,
+        );
+        const newer = {
+          ...initial,
+          pendingTool: {
+            ...initial.pendingTool,
+            id: randomUUID(),
+            sequence: 2,
+          },
+        };
+        assert.equal(
+          (await store.publicationSnapshot(convo.id, newer)).approval?.id,
+          id,
         );
         const failed = await store.publicationSnapshot(convo.id, initial);
         assert.equal(failed.approval?.status, "approved");
@@ -124,9 +144,19 @@ test("Postgres admissions, notification delivery, and durable manual Retry", asy
           ),
           /different input/,
         );
-        assert.equal(
-          (await store.publicationSnapshot(convo.id, initial)).revision,
-          1,
+        await store.publicationSnapshot(convo.id, newer);
+        await store.publicationSnapshot(convo.id, initial); // A delayed old snapshot must not replace the new record.
+        const rows = await store.db.query(
+          "SELECT id FROM publications WHERE conversation_id=$1",
+          [convo.id],
+        );
+        assert.deepEqual(
+          rows.rows.map((r) => r.id),
+          [newer.pendingTool.id],
+        );
+        await assert.rejects(
+          store.recordDecision(convo.id, decision, chat),
+          /Proposal changed/,
         );
       },
     );

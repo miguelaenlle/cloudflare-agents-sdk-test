@@ -1,3 +1,4 @@
+import { OperationTimeout } from "./cleanup-error.ts";
 import { z } from "zod";
 import type {
   DynamicToolCallParams,
@@ -58,7 +59,10 @@ export function within<T>(
   return Promise.race([
     promise,
     new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(message)), milliseconds);
+      timer = setTimeout(
+        () => reject(new OperationTimeout(message)),
+        milliseconds,
+      );
     }),
   ]).finally(() => clearTimeout(timer));
 }

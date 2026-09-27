@@ -3,19 +3,15 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import {
   ChatError,
-  approvalSchema,
+  approvalDisplaySchema,
   type ApprovalDecision,
-  type Approval,
+  type ApprovalDisplay,
   type ChatSnapshot,
   type ChatProvider,
   type SendRequest,
 } from "@playground/chat-contract";
-import {
-  Publisher,
-  PublishRejected,
-  destination,
-  type Publication,
-} from "./publish.ts";
+import { Publisher, PublishRejected, type Publication } from "./publish.ts";
+import { prepareTool, historicalApprovals } from "./tools.ts";
 
 const blocks = (
   await readFile(new URL("./conversations.sql", import.meta.url), "utf8")
@@ -87,6 +83,17 @@ export async function reserve(
     await client.query(sql("begin"));
     const row = (await client.query(sql("lock_conversation"), [id])).rows[0];
     if (!row) throw new ChatError(404, "Conversation not found.");
+    if (
+      typeof payload === "object" &&
+      payload !== null &&
+      "kind" in payload &&
+      payload.kind === "message" &&
+      (await client.query(sql("pending_publication"), [id])).rowCount
+    )
+      throw new ChatError(
+        409,
+        "Resolve the pending publication before sending another message.",
+      );
     const existing = (
       await client.query(sql("select_operation"), [id, operation])
     ).rows[0];
@@ -155,17 +162,8 @@ export async function publicationSnapshot(
   snapshot: ChatSnapshot,
 ): Promise<ChatSnapshot> {
   const tool = snapshot.pendingTool;
-  if (tool?.name === "push_sync") {
-    const approval = approvalSchema.parse({
-      ...(tool.args as object),
-      id: tool.id,
-    });
-    const job: Publication = {
-      id: tool.id,
-      destination: destination(),
-      approval,
-      createdAt: new Date().toISOString(),
-    };
+  if (tool) {
+    const job = prepareTool(tool);
     await db.query(sql("insert_publication"), [
       job.id,
       id,
@@ -173,8 +171,8 @@ export async function publicationSnapshot(
     ]);
   }
   const jobs = (await db.query(sql("list_publications"), [id])).rows;
-  const approvals: Approval[] = jobs.map((r) => ({
-    ...r.job.approval,
+  const currentApprovals: ApprovalDisplay[] = jobs.map((r) => ({
+    ...approvalDisplaySchema.parse(r.job.approval),
     status: r.decision
       ? r.decision.approved
         ? "approved"
@@ -182,6 +180,12 @@ export async function publicationSnapshot(
       : "pending",
     result: r.outcome?.result,
   }));
+  const approvals = [
+    ...historicalApprovals(snapshot.messages).filter(
+      (old) => !currentApprovals.some((a) => a.id === old.id),
+    ),
+    ...currentApprovals,
+  ];
   const current = jobs.find((r) => r.id === tool?.id) ?? jobs.at(-1);
   let publication: ChatSnapshot["publication"];
   if (current && !current.delivered) {
@@ -274,28 +278,16 @@ export async function recordDecision(
           throw new Error(
             "Proposal has not been validated. Refresh and Retry.",
           );
-        let sha: string;
         try {
-          sha = saved.published_sha ?? (await publisher(job).push(job));
+          const sha = saved.published_sha ?? (await publisher(job).push(job));
+          // Checkpoint publication before sync; Retry reconciles an uncertain GitHub acknowledgment.
+          await db.query(sql("save_sha"), [input.id, sha]);
+          console.log(`Approval ${input.id}: sync would go here`);
+          result = `Push succeeded: ${job.destination.repository} branch ${job.destination.branch}, commit ${sha}. Course Sync: simulated (sync would go here). Run git fetch origin, reconcile your checkout with ${sha} while preserving newer edits, then git pull --ff-only before continuing.`;
         } catch (error) {
           if (!(error instanceof PublishRejected)) throw error;
-          await db.query(sql("save_outcome"), [
-            input.id,
-            JSON.stringify({
-              id: input.id,
-              result: `Publication failed: ${error.message} Course Sync did not run. Prepare a new proposal.`,
-            }),
-          ]);
-          saved = await row(input.id);
-          await chat.decide(saved.outcome, AbortSignal.timeout(30_000));
-          await db.query(sql("mark_delivered"), [input.id]);
-          await notify(id);
-          return;
+          result = `Publication failed: ${error.message} Course Sync did not run. Prepare a new proposal.`;
         }
-        // Save the external effect before sync. An uncertain write is rediscovered by its operation identity.
-        await db.query(sql("save_sha"), [input.id, sha]);
-        console.log(`Approval ${input.id}: sync would go here`);
-        result = `Push succeeded: ${job.destination.repository} branch ${job.destination.branch}, commit ${sha}. Course Sync: simulated (sync would go here). Run git fetch origin, reconcile your checkout with ${sha} while preserving newer edits, then git pull --ff-only before continuing.`;
       }
       await db.query(sql("save_outcome"), [
         input.id,
@@ -304,7 +296,20 @@ export async function recordDecision(
       saved = await row(input.id);
     }
     if (!saved.delivered) {
-      await chat.decide(saved.outcome, AbortSignal.timeout(30_000));
+      await chat.deliverToolResult(
+        {
+          ...saved.outcome,
+          display: {
+            name: "push_sync",
+            value: {
+              ...approvalDisplaySchema.parse(saved.job.approval),
+              status: saved.decision.approved ? "approved" : "denied",
+              result: saved.outcome.result,
+            },
+          },
+        },
+        AbortSignal.timeout(30_000),
+      );
       await db.query(sql("mark_delivered"), [input.id]);
     }
     await notify(id);

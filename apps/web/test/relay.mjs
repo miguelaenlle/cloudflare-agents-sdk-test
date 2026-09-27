@@ -737,8 +737,8 @@ try {
   assert.equal(after.approval.status, "approved");
   assert.equal(after.messages.filter((m) => m.id === decision.id).length, 1);
   assert.deepEqual(after.messages.find((m) => m.id === decision.id).metadata, {
-    source: "approval-result",
-    approvalId: decision.id,
+    source: "tool-result",
+    toolCallId: decision.id,
   });
   assert.ok(
     after.messages.some((m) =>
@@ -814,7 +814,7 @@ try {
   const settled = await (await fetch(`${otherApi}/snapshot`)).json();
   assert.ok(
     settled.messages.some((m) =>
-      m.parts.some((p) => p.type === "data-approval" && p.data.id === deny.id),
+      m.parts.some((p) => p.type === "data-tool" && p.data.id === deny.id),
     ),
   );
   assert.equal(
@@ -839,6 +839,26 @@ try {
   assert.equal(proposalHistory.approvals[0].id, deny.id);
   assert.equal(proposalHistory.approvals[0].status, "denied");
   assert.equal(proposalHistory.approvals[1].status, "pending");
+  const retained = await admin.query(
+    `SELECT id FROM ${schema}.publications WHERE conversation_id=$1`,
+    [created.id],
+  );
+  assert.deepEqual(
+    retained.rows.map((row) => row.id),
+    [proposalHistory.approval.id],
+  );
+  assert.equal((await postJson(`${otherApi}/approval`, deny)).status, 409);
+  assert.ok(
+    proposalHistory.messages.some((message) =>
+      message.parts.some(
+        (part) =>
+          part.type === "data-tool-display" &&
+          part.data.id === deny.id &&
+          part.data.value.status === "denied",
+      ),
+    ),
+  );
+
   console.log(
     "Passed: warm denial is a native tool result, relay restart retains catalog, tampered/conflicting decisions are rejected.",
   );

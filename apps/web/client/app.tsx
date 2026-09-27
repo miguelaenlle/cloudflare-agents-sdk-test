@@ -4,7 +4,7 @@ import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
 import {
   conversationApi,
-  type Approval,
+  type ApprovalDisplay,
   type ChatSnapshot,
 } from "@playground/chat-contract";
 import { SandboxStatus } from "./sandbox-status.tsx";
@@ -48,7 +48,7 @@ function ApprovalCard({
   sending,
   decide,
 }: {
-  approval: Approval;
+  approval: ApprovalDisplay;
   snapshot: ChatSnapshot;
   sending: boolean;
   decide: (approved: boolean) => Promise<void>;
@@ -139,7 +139,7 @@ function Transcript({
     snapshot.approvals ?? (snapshot.approval ? [snapshot.approval] : []);
   const approvalIds = new Set(approvals.map((approval) => approval.id));
   const rendered = new Set<string>();
-  function card(approval: Approval, key: string | number) {
+  function card(approval: ApprovalDisplay, key: string | number) {
     rendered.add(approval.id);
     return (
       <ApprovalCard
@@ -170,17 +170,21 @@ function Transcript({
             ((typeof metadata === "object" &&
               metadata !== null &&
               "source" in metadata &&
-              metadata.source === "approval-result") ||
+              metadata.source === "tool-result") ||
               // Legacy continuations used the approval ID before metadata was added.
               approvalIds.has(message.id));
-          return !interleaved.has(message.id) && !approvalResult;
+          return (
+            !interleaved.has(message.id) &&
+            !approvalResult &&
+            !message.parts.some((part) => part.type === "data-tool-display")
+          );
         })
         .map((message) => (
           <article key={message.id}>
             <strong>{message.role}</strong>
             {message.parts.map((part, index) => {
               if (
-                part.type === "data-approval" &&
+                part.type === "data-tool" &&
                 typeof part.data === "object" &&
                 part.data &&
                 "id" in part.data
@@ -211,7 +215,7 @@ function Transcript({
                   messages.some((message) =>
                     message.parts.some(
                       (p) =>
-                        p.type === "data-approval" &&
+                        p.type === "data-tool" &&
                         typeof p.data === "object" &&
                         p.data &&
                         "id" in p.data &&

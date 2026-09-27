@@ -41,7 +41,11 @@ ROLLBACK;
 SELECT * FROM publications WHERE id=$1;
 
 -- BLOCK insert_publication
-INSERT INTO publications (id,conversation_id,job) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING;
+INSERT INTO publications (id,conversation_id,job) VALUES ($1,$2,$3)
+ON CONFLICT (conversation_id) DO UPDATE SET
+  id=EXCLUDED.id, job=EXCLUDED.job, decision=NULL, published_sha=NULL,
+  outcome=NULL, delivered=false, created_at=now()
+WHERE publications.delivered AND (publications.job->>'sequence')::bigint < (EXCLUDED.job->>'sequence')::bigint;
 
 -- BLOCK list_publications
 SELECT * FROM publications WHERE conversation_id=$1 ORDER BY created_at;
@@ -69,3 +73,6 @@ UPDATE publications SET published_sha=$2 WHERE id=$1;
 
 -- BLOCK release_publication
 SELECT pg_advisory_unlock(hashtextextended($1,0));
+
+-- BLOCK pending_publication
+SELECT id FROM publications WHERE conversation_id=$1 AND NOT delivered;
