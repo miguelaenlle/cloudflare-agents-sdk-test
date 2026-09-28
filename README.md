@@ -25,3 +25,5 @@ The relay stores its conversation catalog and admission revisions in Postgres (`
 ## Steering and richer streaming
 
 Send during execution steers the active native turn. Only confirmed completion permits falling back to a new turn; uncertain acknowledgments are not replayed. Steering markers split live output into segments. Reasoning summaries are rendered separately; these are the model-provided summaries, not hidden reasoning.
+
+For the replacement push-sync stack, see [Git access](docs/git-access.md) and [durable push-sync](docs/durable-push-sync.md).

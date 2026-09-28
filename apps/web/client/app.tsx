@@ -2,7 +2,11 @@ import { useEffect, useState, useRef, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
-import { conversationApi, type ChatSnapshot } from "@playground/chat-contract";
+import {
+  conversationApi,
+  type ApprovalDisplay,
+  type ChatSnapshot,
+} from "@playground/chat-contract";
 import { SandboxStatus } from "./sandbox-status.tsx";
 import "./style.css";
 
@@ -38,11 +42,129 @@ function steering(
     return;
   return { id: part.data.id, text: part.data.text };
 }
-function Transcript({ messages }: { messages: UIMessage[] }) {
+function ApprovalCard({
+  approval,
+  snapshot,
+  sending,
+  decide,
+  retryPrepare,
+}: {
+  approval: ApprovalDisplay;
+  snapshot: ChatSnapshot;
+  sending: boolean;
+  decide: (approved: boolean) => Promise<void>;
+  retryPrepare: () => Promise<void>;
+}) {
+  const current = snapshot.approval?.id === approval.id;
+  const publication = current ? snapshot.publication : undefined;
+  return (
+    <section className="approval-card" aria-label="Publication approval">
+      <strong>Review changes · {approval.status}</strong>
+      {publication && (
+        <p>
+          {publication.repository} · {publication.branch}
+        </p>
+      )}
+      <details>
+        <summary>View diff</summary>
+        <p>
+          Base <code>{approval.baseSha.slice(0, 8)}</code> → proposed{" "}
+          <code>{approval.proposedSha.slice(0, 8)}</code>
+        </p>
+        <pre>{approval.diff}</pre>
+      </details>
+      {approval.status === "pending" ? (
+        <>
+          <p>Approve publishes these files. Course Sync is simulated.</p>
+          {publication?.error && <p role="alert">{publication.error}</p>}
+          {publication?.status === "invalid" && (
+            <button disabled={sending} onClick={() => void retryPrepare()}>
+              Retry preparation
+            </button>
+          )}
+          <div className="actions">
+            <button
+              disabled={
+                !current ||
+                sending ||
+                publication?.status === "invalid" ||
+                publication?.status === "publishing"
+              }
+              onClick={() => void decide(true)}
+            >
+              Approve
+            </button>
+            <button
+              disabled={
+                !current || sending || publication?.status === "publishing"
+              }
+              onClick={() => void decide(false)}
+            >
+              Deny
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <p>
+            {approval.status === "approved"
+              ? "You approved these changes."
+              : "You denied these changes."}
+          </p>
+          {approval.result && (
+            <details>
+              <summary>Result</summary>
+              <p>{approval.result}</p>
+            </details>
+          )}
+          {current && snapshot.blocked && (
+            <button
+              disabled={sending}
+              onClick={() => void decide(approval.status === "approved")}
+            >
+              Retry completion
+            </button>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+/** Render user-visible history; internal approval continuations stay available to Codex but are hidden here. */
+function Transcript({
+  messages,
+  snapshot,
+  sending,
+  decide,
+  retryPrepare,
+}: {
+  messages: UIMessage[];
+  snapshot: ChatSnapshot;
+  sending: boolean;
+  decide: (approved: boolean) => Promise<void>;
+  retryPrepare: () => Promise<void>;
+}) {
+  const approvals =
+    snapshot.approvals ?? (snapshot.approval ? [snapshot.approval] : []);
+  const approvalIds = new Set(approvals.map((approval) => approval.id));
+  const rendered = new Set<string>();
+  function card(approval: ApprovalDisplay, key: string | number) {
+    rendered.add(approval.id);
+    return (
+      <ApprovalCard
+        key={key}
+        approval={approval}
+        snapshot={snapshot}
+        sending={sending}
+        decide={decide}
+        retryPrepare={retryPrepare}
+      />
+    );
+  }
   const interleaved = new Set(
-    messages.flatMap((m) =>
-      m.parts.flatMap((p) => {
-        const value = steering(p);
+    messages.flatMap((message) =>
+      message.parts.flatMap((part) => {
+        const value = steering(part);
         return value ? [value.id] : [];
       }),
     ),
@@ -51,11 +173,67 @@ function Transcript({ messages }: { messages: UIMessage[] }) {
     <section aria-label="Conversation">
       {!messages.length && <p>No messages yet.</p>}
       {messages
-        .filter((m) => !interleaved.has(m.id))
+        .filter((message) => {
+          const metadata = message.metadata;
+          const approvalResult =
+            message.role === "user" &&
+            ((typeof metadata === "object" &&
+              metadata !== null &&
+              "source" in metadata &&
+              metadata.source === "tool-result") ||
+              // Legacy continuations used the approval ID before metadata was added.
+              approvalIds.has(message.id));
+          return (
+            !interleaved.has(message.id) &&
+            !approvalResult &&
+            !message.parts.some((part) => part.type === "data-tool-display")
+          );
+        })
         .map((message) => (
           <article key={message.id}>
             <strong>{message.role}</strong>
             {message.parts.map((part, index) => {
+              if (
+                part.type === "data-tool" &&
+                typeof part.data === "object" &&
+                part.data &&
+                "id" in part.data
+              ) {
+                const data = part.data;
+                const approval = approvals.find(
+                  (value) => value.id === data.id,
+                );
+                return approval ? card(approval, index) : null;
+              }
+              // Older transcripts have a native tool part but no explicit approval marker.
+              if (
+                ((part.type === "dynamic-tool" &&
+                  part.toolName === "push_sync") ||
+                  part.type === "tool-push_sync") &&
+                typeof part.input === "object" &&
+                part.input &&
+                "proposedSha" in part.input
+              ) {
+                const input = part.input;
+                const approval = approvals.find(
+                  (value) =>
+                    value.proposedSha === input.proposedSha &&
+                    !rendered.has(value.id),
+                );
+                const hasMarker =
+                  approval &&
+                  messages.some((message) =>
+                    message.parts.some(
+                      (p) =>
+                        p.type === "data-tool" &&
+                        typeof p.data === "object" &&
+                        p.data &&
+                        "id" in p.data &&
+                        p.data.id === approval.id,
+                    ),
+                  );
+                if (approval && !hasMarker) return card(approval, index);
+              }
               const correction = steering(part);
               if (correction)
                 return (
@@ -88,6 +266,9 @@ function Transcript({ messages }: { messages: UIMessage[] }) {
             })}
           </article>
         ))}
+      {approvals
+        .filter((approval) => !rendered.has(approval.id))
+        .map((approval) => card(approval, approval.id))}
     </section>
   );
 }
@@ -112,6 +293,7 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
   const busy = status === "submitted" || status === "streaming";
   // Our pending send/approval reserves a revision before its response arrives.
   const stale = !sending && revision !== snapshot.revision;
+  const approval = snapshot.approval;
   function draft(text: string) {
     setInput(text);
     sessionStorage.setItem(`draft:${id}`, text);
@@ -175,14 +357,60 @@ function Conversation({ id, initial }: { id: string; initial: ChatSnapshot }) {
       setSending(false);
     }
   }
+  async function retryPrepare() {
+    if (!approval) return;
+    setSending(true);
+    setFailure("");
+    try {
+      await request(`${api.approval}/prepare`, { id: approval.id });
+      await refresh();
+    } catch (error) {
+      setFailure(String(error));
+    } finally {
+      setSending(false);
+    }
+  }
+  async function decide(approved: boolean) {
+    if (!approval) return;
+    setSending(true);
+    setFailure("");
+    try {
+      await request(api.approval, {
+        id: approval.id,
+        digest: approval.digest,
+        expectedRevision: revision,
+        approved,
+      });
+      await refresh();
+    } catch (error) {
+      setFailure(String(error));
+    } finally {
+      setSending(false);
+    }
+  }
   return (
     <>
-      <p role="status">{busy ? "Working…" : "Ready"}</p>
+      <p role="status">
+        {approval?.status === "pending"
+          ? "Waiting for approval"
+          : busy
+            ? "Working…"
+            : "Ready"}
+      </p>
       <SandboxStatus
         diagnostics={snapshot.diagnostics}
         retryApi={api.cleanup}
       />
-      <Transcript messages={messages} />
+      {snapshot.pendingTool?.error && (
+        <p role="alert">{snapshot.pendingTool.error}</p>
+      )}
+      <Transcript
+        messages={messages}
+        snapshot={snapshot}
+        sending={sending}
+        decide={decide}
+        retryPrepare={retryPrepare}
+      />
       {stale && (
         <p role="alert">
           This conversation changed. Refresh history before sending. Your draft

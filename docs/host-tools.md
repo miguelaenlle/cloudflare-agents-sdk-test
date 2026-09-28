@@ -1,5 +1,7 @@
 # Minimal host-executed tool
 
+This describes the live `host_echo` baseline. The durable extension and push-sync workflow are documented in [durable-push-sync.md](./durable-push-sync.md).
+
 This branch targets PR #16. It demonstrates live execution through the existing relay watch WebSocket; it does not include PR #17's approvals or PR #18's publication workflow.
 
 ```text
