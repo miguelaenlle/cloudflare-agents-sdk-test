@@ -1,11 +1,16 @@
 import type { UIMessageChunk } from "ai";
 import type { AppServer } from "./app-server.ts";
 import { CodexEvents } from "./codex-events.ts";
-import type { Turn } from "./protocol.ts";
+import type {
+  DynamicToolCallParams,
+  DynamicToolCallResponse,
+  Turn,
+  TurnSteerParams,
+} from "./protocol.ts";
 
 export type CodexTurn = Awaited<ReturnType<typeof openCodexTurn>>;
 
-// Owns native protocol and event translation; the Chat DO owns durable state and cleanup.
+/** Own native turn controls and event translation; the Chat DO owns persistence, deadlines, and cleanup. */
 export async function openCodexTurn(
   client: AppServer,
   {
@@ -56,16 +61,30 @@ export async function openCodexTurn(
     threadId: thread.id,
     terminal: false,
     completed,
+    /** Submit one prompt; the returned turn acknowledges acceptance, not completion. */
     async start(prompt: string, messageId: string) {
       const { turn } = await client.request("turn/start", {
         threadId: thread.id,
         // Cloudflare owns isolation and outbound network restrictions.
         sandboxPolicy: { type: "externalSandbox", networkAccess: "restricted" },
+        summary: "auto",
         clientUserMessageId: messageId,
         input: [{ type: "text", text: prompt, text_elements: [] }],
       });
       turnId = turn.id;
       return turn;
+    },
+    /** Add input to the current native turn and mark its position in the UI stream after acceptance. */
+    async steer(input: TurnSteerParams) {
+      const result = await control(client.request("turn/steer", input));
+      events.steering(
+        input.clientUserMessageId ?? crypto.randomUUID(),
+        input.input
+          .filter((p) => p.type === "text")
+          .map((p) => p.text)
+          .join("\n"),
+      );
+      return result;
     },
     interrupt(turnId: string) {
       return control(

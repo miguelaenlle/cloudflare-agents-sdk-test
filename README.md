@@ -1,6 +1,6 @@
-# Conversation identity and concurrency
+# Steering and richer streaming
 
-This is layer 3 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
+This is layer 4 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
 
 Create a dedicated local Postgres database with `createdb course_agent`, and set `DATABASE_URL=postgresql://localhost/course_agent` on the relay.
 
@@ -19,3 +19,7 @@ After the configured idle interval (10 minutes) waiting for the user, back up be
 ## Conversations and concurrency
 
 The relay stores its conversation catalog and admission revisions in Postgres (`DATABASE_URL`, default `postgresql://localhost/course_agent`). Each ID routes to its own Chat DO. Sends compare a persisted revision; stale tabs retain their draft and must refresh. Test two tabs of one conversation, plus an independent conversation. Production still requires PrairieLearn authorization and shared storage.
+
+## Steering and richer streaming
+
+Send during execution steers the active native turn. Only confirmed completion permits falling back to a new turn; uncertain acknowledgments are not replayed. Steering markers split live output into segments. Reasoning summaries are rendered separately; these are the model-provided summaries, not hidden reasoning.

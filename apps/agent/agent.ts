@@ -207,11 +207,6 @@ export class Chat extends AIChatAgent<Env, CodexState> {
    */
   private async send(input: SendRequest) {
     if (this.messages.some((message) => message.id === input.id)) return;
-    if (this.turnInProgress)
-      throw new ChatError(
-        409,
-        "A turn is already running. Stop it before sending another message.",
-      );
     const phase = this.state.sandbox?.phase;
     if (phase && ["suspending", "destroying", "cleanup_failed"].includes(phase))
       throw new ChatError(
@@ -247,6 +242,38 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       role: "user" as const,
       parts: [{ type: "text" as const, text: input.text }],
     };
+    const run = this.state.run;
+    const active = this.active;
+    if (active && !active.terminal && run?.threadId && run.turnId) {
+      this.ensureUsable(run.sandboxId);
+      let steered = false;
+      try {
+        await active.steer({
+          threadId: run.threadId,
+          expectedTurnId: run.turnId,
+          clientUserMessageId: input.id,
+          input: [{ type: "text", text: input.text, text_elements: [] }],
+        });
+        steered = true;
+      } catch (error) {
+        // Only a rejected RPC plus a confirmed terminal turn allows start instead.
+        // A timeout/disconnect can hide acceptance and must never resubmit the message.
+        if (!(error instanceof AppServerError)) throw error;
+        if (!active.terminal) {
+          const { thread } = await active.client.request("thread/read", {
+            threadId: run.threadId,
+            includeTurns: true,
+          });
+          const turn = thread.turns.find((turn) => turn.id === run.turnId);
+          if (!turn || turn.status === "inProgress") throw error;
+        }
+      }
+      if (steered) {
+        await this.persistMessages([...this.messages, message]);
+        await this.interaction();
+        return;
+      }
+    }
     // Finish transcript persistence before the next turn can own the stream.
     await within(
       this.chatTask ?? Promise.resolve(),

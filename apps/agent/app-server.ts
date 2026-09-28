@@ -65,7 +65,6 @@ export function within<T>(
 }
 
 // Cloudflare supplies the socket. This client owns only Codex's JSON-RPC protocol.
-/** Correlate native RPC replies and notifications; never replay an uncertain mutation. */
 export class AppServer {
   private socket: Socket;
   private nextId = 0;
@@ -106,6 +105,7 @@ export class AppServer {
               "item/started",
               "item/completed",
               "item/agentMessage/delta",
+              "item/reasoning/summaryTextDelta",
             ].includes(frame.method)
           ) {
             // Authenticated, version-pinned protocol; generated types describe the payload.

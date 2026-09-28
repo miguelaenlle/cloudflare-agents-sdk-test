@@ -1,5 +1,5 @@
 # Review this update
 
-Postgres admission revisions and catalog; shared notifications; SSE snapshots; no browser polling; stale drafts preserved.
+Steering remains native turn/steer. Inspect only the integration with relay-owned admission and lifecycle guards.
 
-Previous head: `f5f324bc55f2289b3109af7ef91b2d54ec268c8c`. Use GitHub’s “Changes since last review” or compare this head against the current branch.
+Previous head: `fc3b2d4f8d0105556998f6b471e9dac6771c6b9c`. Use GitHub’s “Changes since last review” or compare this head against the current branch.

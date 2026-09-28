@@ -21,6 +21,7 @@ try {
     ...prefix,
     "app-server",
     "generate-ts",
+    "--experimental",
     "--out",
     output,
   ]);
@@ -46,8 +47,23 @@ try {
       const name = source.match(/export type (\w+)\s*=/)[1];
       source = imports.join("\n") + `\nexport type ${name} = ${body};\n`;
     }
+    // The generator has distinct root and v2 types with this name; preserve that distinction when flattening.
+    if (
+      file === join(output, "WebSearchAction.ts") ||
+      [...source.matchAll(/import type .*? from "(.+?)";/g)].some(
+        (match) =>
+          resolve(dirname(file), match[1] + ".ts") ===
+          join(output, "WebSearchAction.ts"),
+      )
+    )
+      source = source.replace(/\bWebSearchAction\b/g, "LegacyWebSearchAction");
     source = source.replace(/^import type .*? from "(.+?)";\n/gm, (_, path) => {
-      visit(resolve(dirname(file), path + ".ts"));
+      visit(
+        resolve(
+          dirname(file),
+          path.replace("LegacyWebSearchAction", "WebSearchAction") + ".ts",
+        ),
+      );
       return "";
     });
     definitions.push(source.replace(/^\/\/.*\n/gm, "").trim());
@@ -67,8 +83,12 @@ try {
     "item/started",
     "item/completed",
     "item/agentMessage/delta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
   ]);
+  visit(join(output, "ServerRequest.ts"), ["item/tool/call"]);
   for (const name of [
+    "v2/DynamicToolCallResponse",
     "InitializeResponse",
     "v2/ThreadStartResponse",
     "v2/ThreadResumeResponse",
