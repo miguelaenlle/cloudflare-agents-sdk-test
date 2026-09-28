@@ -1,6 +1,8 @@
-# Sandbox lifecycle and recovery
+# Conversation identity and concurrency
 
-This is layer 2 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
+This is layer 3 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
+
+Create a dedicated local Postgres database with `createdb course_agent`, and set `DATABASE_URL=postgresql://localhost/course_agent` on the relay.
 
 ## Local inference
 
@@ -13,3 +15,7 @@ Run `pnpm typecheck`, `pnpm build`, and `pnpm test` for this layer. The tests us
 ## Lifecycle
 
 After the configured idle interval (10 minutes) waiting for the user, back up before destroying. After six hours without accepted user interaction, attempt a bounded final backup and destroy. Restore the workspace/native thread on the next prompt. Diagnostics show state and countdowns. Unexpected loss can lose work since the last backup. Basic Stop is hardened with reconciliation and durable cleanup in this layer. Test idle restoration by creating a file, waiting for idle expiration, then reading it in the next turn.
+
+## Conversations and concurrency
+
+The relay stores its conversation catalog and admission revisions in Postgres (`DATABASE_URL`, default `postgresql://localhost/course_agent`). Each ID routes to its own Chat DO. Sends compare a persisted revision; stale tabs retain their draft and must refresh. Test two tabs of one conversation, plus an independent conversation. Production still requires PrairieLearn authorization and shared storage.

@@ -1,5 +1,5 @@
 # Review this update
 
-Seven-day latest checkpoint; guarded setup; fresh-start failure cleanup; visible cleanup errors and native acceptance recovery.
+Postgres admission revisions and catalog; shared notifications; SSE snapshots; no browser polling; stale drafts preserved.
 
-Previous head: `59ce5b10608ddd45a4d5b054d73e7757f5d64cff`. Use GitHub’s “Changes since last review” or compare this head against the current branch.
+Previous head: `f5f324bc55f2289b3109af7ef91b2d54ec268c8c`. Use GitHub’s “Changes since last review” or compare this head against the current branch.
