@@ -92,3 +92,33 @@ export class ChatError extends Error {
     this.status = status;
   }
 }
+
+/** Custom relay frames share the Agents socket, but are separate from its chat protocol. */
+export const hostToolCallSchema = z.object({
+  type: z.literal("host-tool-call"),
+  id: z.string().uuid(),
+  name: z.string().max(100),
+  input: z.unknown(),
+});
+export const hostToolResultSchema = z.object({
+  type: z.literal("host-tool-result"),
+  id: z.string().uuid(),
+  result: z.discriminatedUnion("ok", [
+    z.object({ ok: z.literal(true), output: z.unknown() }),
+    z.object({ ok: z.literal(false), error: z.string().max(1000) }),
+  ]),
+});
+export const hostToolDefinitions = [
+  {
+    type: "function" as const,
+    name: "host_echo",
+    description:
+      "Echo text through the trusted PL relay. Use this to demonstrate host execution.",
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string", maxLength: 4096 } },
+      required: ["text"],
+      additionalProperties: false,
+    },
+  },
+];

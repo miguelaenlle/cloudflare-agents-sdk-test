@@ -1,3 +1,5 @@
+import type { Connection, ConnectionContext, WSMessage } from "agents";
+import { HostTools } from "./host-tools.ts";
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import { getSandbox } from "@cloudflare/sandbox";
 import {
@@ -58,6 +60,47 @@ const interruptedMessage =
 export class Chat extends AIChatAgent<Env, CodexState> {
   initialState: CodexState = {};
   private active?: CodexTurn;
+  private hostTools = new HostTools();
+
+  override async onConnect(connection: Connection, context: ConnectionContext) {
+    await super.onConnect(connection, context);
+    // The Worker authenticates relay requests. Browsers cannot set this upgrade header.
+    if (
+      context.request.headers.get("X-Host-Tools") === "1" &&
+      !context.request.headers.has("Origin")
+    )
+      connection.setState({ ...connection.state, hostExecutor: true });
+  }
+
+  override async onMessage(connection: Connection, message: WSMessage) {
+    if (typeof message === "string" && message.length <= 65536) {
+      let frame;
+      try {
+        frame = JSON.parse(message);
+      } catch {
+        return;
+      }
+      if (frame?.type === "host-tool-result") {
+        this.hostTools.receive(connection.id, frame);
+        return;
+      }
+    }
+    return super.onMessage(connection, message);
+  }
+
+  override async onClose(
+    connection: Connection,
+    code: number,
+    reason: string,
+    wasClean: boolean,
+  ) {
+    this.hostTools.cancel(
+      "Host disconnected; outcome may be unknown. It was not retried.",
+      connection.id,
+    );
+    return super.onClose(connection, code, reason, wasClean);
+  }
+
   // Serialize Send/Stop/decisions, not the full model turn: users must retain control while it runs.
   private controlTail: Promise<unknown> = Promise.resolve();
   private chatTask?: Promise<void>;
@@ -327,6 +370,9 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       return;
     }
     const active = this.active;
+    this.hostTools.cancel(
+      "Host tool wait cancelled by Stop; host execution may already have happened.",
+    );
     if (active && run.threadId && run.turnId) {
       await active.interrupt(run.turnId);
       await this.interaction();
@@ -854,6 +900,14 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               model: this.env.CODEX_MODEL,
               runId: run.id,
               write,
+              onToolCall: (params) =>
+                this.hostTools.call(
+                  params.tool,
+                  params.arguments,
+                  Array.from(
+                    this.getConnections<{ hostExecutor?: boolean }>(),
+                  ).filter((c) => c.state?.hostExecutor),
+                ),
               onTurnStarted: (turnId) =>
                 this.setRun({ ...this.state.run!, turnId, accepted: true }),
             });
@@ -925,6 +979,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               }
             }
           } finally {
+            this.hostTools.cancel("Native turn ended before host completion.");
             await execution?.close();
             client?.close();
             this.active = undefined;

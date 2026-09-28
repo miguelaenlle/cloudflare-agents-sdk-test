@@ -1,3 +1,5 @@
+> This branch adds a minimal host-executed tool on top of PR #16. See [the demo and review guide](docs/host-tools.md).
+
 # Steering and richer streaming
 
 This is layer 4 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.

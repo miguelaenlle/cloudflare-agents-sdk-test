@@ -249,7 +249,10 @@ export class TestSandbox extends DurableObject {
       textItem("start", "Started. "),
       command("completed"),
       textItem("finish", "Finished."),
-      ...turn.items.filter((item) => item.type === "userMessage"),
+      ...turn.items.filter(
+        (item) =>
+          item.type === "userMessage" || item.type === "dynamicToolCall",
+      ),
     ];
     await this.save(state);
     for (const item of turn.items.slice(1))
@@ -304,10 +307,33 @@ export class TestSandbox extends DurableObject {
         "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n",
     };
   }
-  async requestApproval() {
+  async requestApproval(
+    tool = "push_sync",
+    args: Record<string, string> = {
+      baseSha: "a".repeat(40),
+      proposedSha: "b".repeat(40),
+    },
+  ) {
     const state = await this.state();
     state.waitingTool = true;
+    const item: ThreadItem = {
+      type: "dynamicToolCall",
+      id: "approval-call",
+      namespace: null,
+      tool,
+      arguments: args,
+      status: "inProgress",
+      contentItems: null,
+      success: null,
+      durationMs: null,
+    };
+    state.turns.at(-1)!.items.push(item);
     await this.save(state);
+    this.emit("item/started", {
+      threadId: "native-thread",
+      turnId: state.turns.at(-1)!.id,
+      item,
+    });
     for (const socket of this.sockets)
       socket.send(
         JSON.stringify({
@@ -318,18 +344,36 @@ export class TestSandbox extends DurableObject {
             turnId: state.turns.at(-1)!.id,
             callId: "approval-call",
             namespace: null,
-            tool: "push_sync",
-            arguments: { baseSha: "a".repeat(40), proposedSha: "b".repeat(40) },
+            tool,
+            arguments: args,
           },
         }),
       );
   }
-  private async acceptToolResult(result: unknown) {
+  private async acceptToolResult(result: {
+    success: boolean;
+    contentItems: Extract<
+      ThreadItem,
+      { type: "dynamicToolCall" }
+    >["contentItems"];
+  }) {
     const state = await this.state();
     state.toolResults = [...(state.toolResults ?? []), result];
     state.waitingTool = false;
+    const turn = state.turns.at(-1)!;
+    const item = turn.items.find((item) => item.type === "dynamicToolCall");
+    if (item?.type === "dynamicToolCall") {
+      Object.assign(item, result, { status: "completed" });
+      this.emit("item/completed", {
+        threadId: "native-thread",
+        turnId: turn.id,
+        item,
+      });
+    }
     await this.save(state);
-    await this.ctx.storage.setAlarm(Date.now() + 100);
+    await this.ctx.storage.setAlarm(
+      Math.max(Date.now() + 100, turn.startedAt! * 1000 + 8000),
+    );
   }
   async startProcess(_command: string, _options: { processId: string }) {
     const state = await this.state();

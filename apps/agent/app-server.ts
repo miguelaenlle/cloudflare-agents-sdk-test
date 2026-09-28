@@ -1,6 +1,8 @@
 import { OperationTimeout } from "./cleanup-error.ts";
 import { z } from "zod";
 import type {
+  DynamicToolCallParams,
+  DynamicToolCallResponse,
   ClientRequest,
   ServerNotification,
   InitializeResponse,
@@ -74,6 +76,9 @@ export class AppServer {
   >();
   private subscribers = new Set<(event: ServerNotification) => void>();
   private closed = false;
+  toolHandler?: (
+    params: DynamicToolCallParams,
+  ) => Promise<DynamicToolCallResponse>;
   readonly disconnected: Promise<never>;
   private rejectDisconnected!: (error: Error) => void;
 
@@ -88,16 +93,35 @@ export class AppServer {
         const frame = envelope.parse(JSON.parse(String(event.data)));
         if (frame.method) {
           if (frame.id !== undefined) {
-            // No approval or interactive-tool UI in this prototype. Never hang on an unsupported request.
-            socket.send(
-              JSON.stringify({
-                id: frame.id,
-                error: {
-                  code: -32601,
-                  message: "Client interaction is not supported",
-                },
-              }),
-            );
+            const id = frame.id;
+            if (frame.method === "item/tool/call" && this.toolHandler) {
+              void this.toolHandler(frame.params as DynamicToolCallParams)
+                .catch(() => ({
+                  success: false,
+                  contentItems: [
+                    {
+                      type: "inputText" as const,
+                      text: "Host tool execution failed.",
+                    },
+                  ],
+                }))
+                .then((result) => {
+                  if (!this.closed) socket.send(JSON.stringify({ id, result }));
+                })
+                .catch(() =>
+                  this.fail(new Error("Could not deliver host tool result.")),
+                );
+            } else {
+              socket.send(
+                JSON.stringify({
+                  id,
+                  error: {
+                    code: -32601,
+                    message: "Client interaction is not supported",
+                  },
+                }),
+              );
+            }
           } else if (
             [
               "turn/started",
@@ -179,7 +203,8 @@ export class AppServer {
 
   async initialize() {
     await this.request("initialize", {
-      capabilities: null,
+      // Dynamic host tools require this opt-in before thread/start.
+      capabilities: { experimentalApi: true, requestAttestation: false },
       clientInfo: {
         name: "pl_sandbox_prototype",
         title: "PL sandbox prototype",
