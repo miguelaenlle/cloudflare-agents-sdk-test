@@ -4,7 +4,7 @@ import { safeFailure } from "./cleanup-error.ts";
 import { AppServer } from "./app-server.ts";
 
 export type CodexSandbox = ReturnType<typeof getSandbox>;
-export const SANDBOX_IDLE_MS = 30_000;
+export const SANDBOX_IDLE_MS = 10 * 60_000;
 export const USER_IDLE_MS = 6 * 60 * 60_000;
 export const SERVER_ID = "codex-app-server";
 export const SERVER_PORT = 4500;
