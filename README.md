@@ -12,4 +12,4 @@ Run `pnpm typecheck`, `pnpm build`, and `pnpm test` for this layer. The tests us
 
 ## Lifecycle
 
-After the configured idle interval (currently 30 seconds for testing) waiting for the user, back up before destroying. After six hours without accepted user interaction, attempt a bounded final backup and destroy. Restore the workspace/native thread on the next prompt. Diagnostics show state and countdowns. Unexpected loss can lose work since the last backup. Basic Stop is hardened with reconciliation and durable cleanup in this layer. Test idle restoration by creating a file, waiting for idle expiration, then reading it in the next turn.
+After the configured idle interval (10 minutes) waiting for the user, back up before destroying. After six hours without accepted user interaction, attempt a bounded final backup and destroy. Restore the workspace/native thread on the next prompt. Diagnostics show state and countdowns. Unexpected loss can lose work since the last backup. Basic Stop is hardened with reconciliation and durable cleanup in this layer. Test idle restoration by creating a file, waiting for idle expiration, then reading it in the next turn.
