@@ -8,6 +8,7 @@ import {
   type UIMessageChunk,
 } from "ai";
 import {
+  GITHUB_REPOSITORY,
   ChatError,
   sendRequestSchema,
   type SendRequest,
@@ -865,6 +866,7 @@ export class Chat extends AIChatAgent<Env, CodexState> {
               this.sandbox(sandbox.id),
               this.state,
               {
+                repository: GITHUB_REPOSITORY,
                 onCheckpointUnavailable: (warning) => {
                   const old = this.state.checkpoint?.backup.id;
                   this.setState({
