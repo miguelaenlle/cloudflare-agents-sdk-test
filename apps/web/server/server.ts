@@ -46,6 +46,10 @@ async function streamChat(response: Response) {
   }
 }
 
+app.get("/api/chat/diagnostics", async (_request, response) => {
+  response.setHeader("Cache-Control", "no-store");
+  response.json(await provider.getDiagnostics(clientSignal(response)));
+});
 app.get(HISTORY_API, async (_request, response) => {
   const messages = await provider.getHistory(clientSignal(response));
   response.setHeader("Cache-Control", "no-store");

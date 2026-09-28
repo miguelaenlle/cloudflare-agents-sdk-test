@@ -1,42 +1,176 @@
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import { getSandbox } from "@cloudflare/sandbox";
-import { createUIMessageStream, createUIMessageStreamResponse } from "ai";
+import {
+  createUIMessageStream,
+  createUIMessageStreamResponse,
+  type UIMessageChunk,
+} from "ai";
 import {
   ChatError,
   sendRequestSchema,
   type SendRequest,
+  type SandboxDiagnostics,
 } from "@playground/chat-contract";
-import { within } from "./app-server.ts";
+import { cleanupError } from "./cleanup-error.ts";
+import { AppServer, AppServerError, within } from "./app-server.ts";
 import type { Sandbox } from "./sandbox.ts";
-import { connectCodex, type CodexSandbox, type CodexState } from "./codex.ts";
 import { openCodexTurn, type CodexTurn } from "./codex-turn.ts";
+import {
+  checkpointCodex,
+  connectCodex,
+  ContainerLost,
+  SANDBOX_IDLE_MS,
+  USER_IDLE_MS,
+  type CodexSandbox,
+  type CodexState,
+  type Run,
+} from "./codex.ts";
+import type { Turn } from "./protocol.ts";
 
 export interface Env {
   Sandbox: DurableObjectNamespace<Sandbox>;
   Chat: DurableObjectNamespace<Chat>;
+  BACKUP_BUCKET: R2Bucket;
   CODEX_MODEL?: string;
   RELAY_TOKEN?: string;
   LOCAL_DEV?: string;
   UI_ORIGIN: string;
 }
+type Expiration = {
+  id: string;
+  reason: "idle" | "interaction" | "retry" | "startup-cancel";
+  waitingSince?: number;
+  attempt?: number;
+  retryOf?: string;
+};
+const MAX_CLEANUP_ATTEMPTS = 3;
 const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : "Codex failed.";
+const expiredMessage =
+  "User interaction deadline reached. Sandbox cleanup started; another turn must wait for confirmed destruction.";
+const interruptedMessage =
+  "Task interrupted. It was not automatically repeated. You can send another message to continue.";
 
+/**
+ * One durable conversation: SQLite owns history, lifecycle state, and execution state.
+ * Live sockets/promises belong to this instance only; recovery consults Codex native history.
+ */
 export class Chat extends AIChatAgent<Env, CodexState> {
   initialState: CodexState = {};
   private active?: CodexTurn;
+  // Serialize Send/Stop/decisions, not the full model turn: users must retain control while it runs.
   private controlTail: Promise<unknown> = Promise.resolve();
   private chatTask?: Promise<void>;
   private acceptance?: { resolve(): void; reject(error: unknown): void };
+  private turnInProgress = false;
+  // Capture has no resumable work; a DO restart must not preserve an in-flight lock.
+  private recovery?: Promise<void>;
+  // Cleanup joins setup instead of cancelling individual SDK operations.
+  private startup?: Promise<unknown>;
 
-  protected sandbox(id: string): CodexSandbox {
-    return getSandbox(this.env.Sandbox, id, { sleepAfter: "10m" });
+  protected get interactionTimeoutMs() {
+    return USER_IDLE_MS;
   }
+  protected now() {
+    return Date.now();
+  }
+  protected sandbox(id: string): CodexSandbox {
+    return getSandbox(this.env.Sandbox, id, {
+      keepAlive: false,
+      sleepAfter: "6h",
+    });
+  }
+  private usable(id: string) {
+    return (
+      this.state.sandbox?.id === id &&
+      !["destroying", "cleanup_failed"].includes(this.state.sandbox.phase)
+    );
+  }
+  private ensureUsable(id: string) {
+    if (!this.usable(id)) throw new Error("Sandbox cleanup is pending.");
+  }
+  private setRun(run: Run) {
+    if (this.state.run?.id === run.id && this.usable(run.sandboxId))
+      this.setState({ ...this.state, run });
+  }
+
+  /** Renew the durable user-interaction deadline; stale alarms are fenced by sandbox identity. */
+  private async interaction() {
+    const sandbox = this.state.sandbox!;
+    this.ensureUsable(sandbox.id);
+    const at = this.now();
+    const schedule = await this.schedule(
+      new Date(Math.ceil((at + this.interactionTimeoutMs) / 1000) * 1000),
+      "expireSandbox",
+      { id: sandbox.id, reason: "interaction" } satisfies Expiration,
+    );
+    this.ensureUsable(sandbox.id);
+    this.setState({
+      ...this.state,
+      sandbox: {
+        ...this.state.sandbox!,
+        lastUserInteractionAt: at,
+        deadlineSchedule: schedule.id,
+      },
+    });
+    if (sandbox.deadlineSchedule)
+      await this.cancelSchedule(sandbox.deadlineSchedule);
+  }
+
+  /** HTTP controls and snapshots; AIChatAgent separately owns the resumable message stream. */
   override async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
+    if (request.method === "GET" && path.endsWith("/snapshot")) {
+      return Response.json(
+        {
+          messages: this.messages,
+          revision: 0, // The relay supplies its authoritative admission revision.
+          blocked: false,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
+    if (request.method === "POST" && path.endsWith("/cleanup")) {
+      const sandbox = this.state.sandbox;
+      if (
+        !sandbox?.cleanup?.error ||
+        !["waiting_for_user", "cleanup_failed"].includes(sandbox.phase)
+      )
+        return Response.json(
+          { error: "No failed cleanup to retry." },
+          { status: 409 },
+        );
+      this.ctx.waitUntil(
+        this.expireSandbox({
+          id: sandbox.id,
+          reason: sandbox.phase === "cleanup_failed" ? "retry" : "idle",
+          waitingSince: sandbox.waitingSince,
+        }),
+      );
+      return new Response(null, { status: 202 });
+    }
+    if (request.method === "GET" && path.endsWith("/diagnostics")) {
+      const sandbox = this.state.sandbox;
+      return Response.json(
+        {
+          state: sandbox?.phase ?? "absent",
+          cleanup: sandbox?.cleanup,
+          checkpointError: this.state.lastCheckpointError,
+          idleExpiresAt:
+            sandbox?.phase === "waiting_for_user" &&
+            sandbox.waitingSince !== undefined
+              ? sandbox.waitingSince + SANDBOX_IDLE_MS
+              : null,
+          interactionExpiresAt: sandbox
+            ? sandbox.lastUserInteractionAt + this.interactionTimeoutMs
+            : null,
+        } satisfies SandboxDiagnostics,
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
     if (
       request.method !== "POST" ||
-      (!path.endsWith("/message") && !path.endsWith("/cancel"))
+      (!path.endsWith("/cancel") && !path.endsWith("/message"))
     )
       return super.onRequest(request);
     let input: SendRequest | undefined;
@@ -46,18 +180,15 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       );
       if (!parsed.success)
         return Response.json(
-          { error: "Expected a message ID and text." },
+          { error: "Expected a message ID and nonempty text." },
           { status: 400 },
         );
       input = parsed.data;
     }
-    const operation = this.controlTail.then(async () => {
-      if (input) return this.send(input);
-      if (this.active && this.state.run?.turnId) {
-        await this.active.interrupt(this.state.run.turnId);
-        await within(this.active.completed, 5000, "Stop unconfirmed.");
-      }
-    });
+    // Serialize short control operations, not whole agent turns. The DO decides start vs. steer.
+    const operation = this.controlTail.then(() =>
+      input ? this.send(input) : this.cancel(),
+    );
     this.controlTail = operation.catch(() => {});
     try {
       await operation;
@@ -69,12 +200,64 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       );
     }
   }
+
+  /**
+   * Admit a prompt after lifecycle checks. The relay owns revision admission.
+   * Return on native acceptance, not completion.
+   */
   private async send(input: SendRequest) {
     if (this.messages.some((message) => message.id === input.id)) return;
-    // No automatic replay after an uncertain submission or process loss.
-    if (this.state.run?.status === "running")
-      throw new ChatError(409, "A turn is running or requires recovery.");
-    await this.chatTask;
+    if (this.turnInProgress)
+      throw new ChatError(
+        409,
+        "A turn is already running. Stop it before sending another message.",
+      );
+    const phase = this.state.sandbox?.phase;
+    if (phase && ["suspending", "destroying", "cleanup_failed"].includes(phase))
+      throw new ChatError(
+        409,
+        "Sandbox cleanup is pending. Your message was not sent.",
+      );
+    if (this.turnInProgress && (!this.active || !this.state.run?.turnId))
+      throw new ChatError(
+        409,
+        "Codex is still starting. Retry when startup completes.",
+      );
+    const lifecycle = this.state.sandbox;
+    if (
+      lifecycle &&
+      this.now() >= lifecycle.lastUserInteractionAt + this.interactionTimeoutMs
+    ) {
+      this.ctx.waitUntil(
+        this.expireSandbox({ id: lifecycle.id, reason: "interaction" }),
+      );
+      throw new ChatError(
+        409,
+        "Sandbox expired. Wait for cleanup before sending.",
+      );
+    }
+    if (
+      !this.active &&
+      !this.turnInProgress &&
+      this.state.run?.status === "running"
+    )
+      await this.reconcile();
+    const message = {
+      id: input.id,
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: input.text }],
+    };
+    // Finish transcript persistence before the next turn can own the stream.
+    await within(
+      this.chatTask ?? Promise.resolve(),
+      5_000,
+      "Previous turn is still finishing. Retry shortly.",
+    );
+    if (this.state.sandbox && this.state.sandbox.phase !== "waiting_for_user")
+      throw new ChatError(
+        409,
+        "Sandbox cleanup is pending. Your message was not sent.",
+      );
     let resolve!: () => void;
     let reject!: (error: unknown) => void;
     const accepted = new Promise<void>((res, rej) => {
@@ -83,33 +266,444 @@ export class Chat extends AIChatAgent<Env, CodexState> {
     });
     this.acceptance = { resolve, reject };
     const task = this.saveMessages((messages) => [
-      ...messages,
-      {
-        id: input.id,
-        role: "user",
-        parts: [{ type: "text", text: input.text }],
-      },
+      ...messages.filter((saved) => saved.id !== input.id),
+      message,
     ])
-      .then((result) =>
-        reject(new Error(result.error ?? "Startup was not confirmed.")),
-      )
-      .catch(reject);
+      .then((result) => {
+        reject(
+          new Error(result.error ?? "Turn ended before startup was confirmed."),
+        );
+      })
+      .catch((error: unknown) => {
+        reject(error);
+      });
     this.chatTask = task;
     this.ctx.waitUntil(task);
     try {
       await within(
         accepted,
-        25000,
-        "Message acceptance unconfirmed; check history before retrying.",
+        25_000,
+        "Message acceptance is unconfirmed. Check history before retrying.",
       );
     } finally {
       this.acceptance = undefined;
     }
   }
+
+  /** Ask Codex to interrupt; cancellation is distinct from closing a browser stream. */
+  private async cancel() {
+    const run = this.state.run;
+    if (run?.status !== "running") return;
+    this.ensureUsable(run.sandboxId);
+    if (this.turnInProgress && !run.submitted) {
+      this.setRun({ ...run, cancelRequested: true });
+      return;
+    }
+    const active = this.active;
+    if (active && run.threadId && run.turnId) {
+      await active.interrupt(run.turnId);
+      await this.interaction();
+      await within(
+        active.completed,
+        5_000,
+        "Stop is unconfirmed. Another turn remains blocked.",
+      );
+    } else if (this.turnInProgress) {
+      throw new Error(
+        "Native turn acceptance is pending. Try Stop again shortly.",
+      );
+    } else {
+      await this.reconcile();
+    }
+  }
+
   protected override async onChatRecovery() {
-    // Lifecycle reconciliation is introduced in the next PR; fail closed here.
+    await this.reconcile();
     return { persist: false, continue: false };
   }
+
+  /** Replace the durable checkpoint pointer before making the previous archive eligible for deletion. */
+  private saveCheckpoint(checkpoint: NonNullable<CodexState["checkpoint"]>) {
+    const previous = this.state.checkpoint?.backup.id;
+    this.setState({
+      ...this.state,
+      checkpoint,
+      lastCheckpointError: undefined,
+      obsoleteCheckpoints: [
+        ...new Set([
+          ...(this.state.obsoleteCheckpoints ?? []),
+          ...(previous && previous !== checkpoint.backup.id ? [previous] : []),
+        ]),
+      ],
+    });
+  }
+
+  /** Retry deletion of obsolete R2 archives only after the container has been destroyed. */
+  async pruneCheckpoints() {
+    // A warm restored filesystem may still depend on the previous backup's overlay.
+    if (this.state.sandbox) return;
+    for (const id of this.state.obsoleteCheckpoints ?? []) {
+      if (id === this.state.checkpoint?.backup.id) continue;
+      try {
+        // Object layout belongs to the pinned Sandbox SDK 0.12.9.
+        await within(
+          this.env.BACKUP_BUCKET.delete([
+            `backups/${id}/data.sqsh`,
+            `backups/${id}/meta.json`,
+          ]),
+          10_000,
+          "Backup deletion timed out.",
+        );
+      } catch {
+        console.error(
+          "Could not remove superseded checkpoint; retrying in 60 seconds.",
+        );
+        await this.schedule(60, "pruneCheckpoints");
+        return;
+      }
+      this.setState({
+        ...this.state,
+        obsoleteCheckpoints: this.state.obsoleteCheckpoints?.filter(
+          (candidate) => candidate !== id,
+        ),
+      });
+    }
+  }
+
+  /** Save workspace files and the native thread ID together; UI history remains in the Chat DO. */
+  private async checkpoint(id: string) {
+    const sandbox = this.sandbox(id);
+    const threadId = this.state.threadId;
+    const backup = await within(
+      (async () => {
+        if (!(await sandbox.exists("/tmp/codex-app-server-ready")).exists)
+          throw new ContainerLost();
+        this.ensureUsable(id);
+        return checkpointCodex(sandbox, this.env.LOCAL_DEV === "true");
+      })(),
+      60_000,
+      "Backup timed out.",
+    );
+    if (this.usable(id)) this.saveCheckpoint({ backup, threadId });
+  }
+
+  /** Record completion or a pending approval and arm idle cleanup, without creating a backup. */
+  private async finishRun(run: Run, status: Run["status"]) {
+    if (!this.usable(run.sandboxId)) return;
+    if (this.state.sandbox?.phase === "suspending") {
+      this.setState({ ...this.state, run: { ...this.state.run!, status } });
+      return;
+    }
+    const waitingSince = this.now();
+    this.setState({
+      ...this.state,
+      run: { ...this.state.run!, status },
+      sandbox: {
+        ...this.state.sandbox!,
+        phase: "waiting_for_user",
+        waitingSince,
+      },
+    });
+    await this.schedule(
+      new Date(Math.ceil((waitingSince + SANDBOX_IDLE_MS) / 1000) * 1000),
+      "expireSandbox",
+      { id: run.sandboxId, reason: "idle", waitingSince } satisfies Expiration,
+    );
+  }
+
+  // After connection/DO loss, stop surviving work before allowing another prompt.
+  // A missing acknowledgment never causes an automatic replay of turn/start.
+  private reconcile(): Promise<void> {
+    if (this.recovery) return this.recovery;
+    this.recovery = this.reconcileRun().finally(() => {
+      this.recovery = undefined;
+    });
+    return this.recovery;
+  }
+  /** Inspect surviving native history without replaying an uncertain prompt or restoring a lost container. */
+  private async reconcileRun() {
+    const run = this.state.run;
+    if (run?.status !== "running" || this.active) return;
+    this.ensureUsable(run.sandboxId);
+    let client: AppServer | undefined;
+    let outcome = interruptedMessage;
+    let status: Run["status"] = "interrupted";
+    try {
+      const connection = await connectCodex(
+        this.sandbox(run.sandboxId),
+        this.state,
+        {
+          recovery: true,
+        },
+      );
+      client = connection.client;
+      this.ensureUsable(run.sandboxId);
+      if (run.threadId) {
+        const { thread } = await client.request("thread/resume", {
+          threadId: run.threadId,
+        });
+        const turn = thread.turns.find((turn) => turn.status === "inProgress");
+        if (turn) {
+          let resolve!: (turn: Turn) => void;
+          const done = new Promise<Turn>((r) => {
+            resolve = r;
+          });
+          const unsubscribe = client.subscribe((event) => {
+            if (
+              event.method === "turn/completed" &&
+              event.params.threadId === run.threadId &&
+              event.params.turn.id === turn.id
+            )
+              resolve(event.params.turn);
+          });
+          try {
+            await client.request("turn/interrupt", {
+              threadId: run.threadId,
+              turnId: turn.id,
+            });
+            await within(
+              Promise.race([done, client.disconnected]),
+              5_000,
+              "Recovery could not confirm Stop.",
+            );
+          } finally {
+            unsubscribe();
+          }
+        }
+        // Inspect again after interruption: do not infer completion from the RPC acknowledgment.
+        const current = (
+          await client.request("thread/read", {
+            threadId: run.threadId,
+            includeTurns: true,
+          })
+        ).thread;
+        if (current.turns.some((turn) => turn.status === "inProgress"))
+          throw new Error("Codex is still active.");
+        const completed =
+          current.turns.find((turn) => turn.id === run.turnId) ??
+          current.turns.find((turn) =>
+            turn.items.some(
+              (item) =>
+                item.type === "userMessage" && item.clientId === run.messageId,
+            ),
+          );
+        this.setRun({
+          ...this.state.run!,
+          accepted: !!completed,
+          submitted: !!completed,
+          turnId: completed?.id,
+        });
+        if (completed?.status === "completed") {
+          status = "completed";
+          outcome =
+            completed.items
+              .filter((item) => item.type === "agentMessage")
+              .map((item) => item.text)
+              .join("\n") || "Turn completed before reconnection.";
+        } else if (completed?.status === "failed") {
+          status = "failed";
+          outcome = `Task failed: ${completed.error?.message ?? "Codex turn failed."}`;
+        }
+      }
+      await this.finishRun(run, status);
+    } catch (error) {
+      if (!(error instanceof ContainerLost)) throw error;
+      // No surviving execution, but the old generation must still be cleaned up.
+      await this.destroyGeneration(run.sandboxId);
+      outcome = error.message;
+    } finally {
+      client?.close();
+    }
+    await this.persistMessages([
+      ...this.messages.filter((message) => message.id !== `codex-${run.id}`),
+      {
+        id: `codex-${run.id}`,
+        role: "assistant",
+        parts: [{ type: "text", text: outcome }],
+      },
+    ]);
+  }
+
+  /** Destroy this generation, then clear its durable lease; never clear a newer sandbox by accident. */
+  private async destroyGeneration(id: string) {
+    if (this.state.sandbox?.id !== id) return;
+    this.setState({
+      ...this.state,
+      sandbox: { ...this.state.sandbox, phase: "destroying" },
+    });
+    this.active?.client.close();
+    try {
+      await within(
+        this.sandbox(id).destroy(),
+        30_000,
+        "Sandbox destruction unconfirmed.",
+      );
+      if (this.state.sandbox?.id !== id) return;
+      if (this.state.obsoleteCheckpoints?.length)
+        await this.schedule(60, "pruneCheckpoints");
+      this.setState({
+        ...this.state,
+        sandbox: undefined,
+        threadId: this.state.checkpoint?.threadId,
+        run:
+          this.state.run?.status === "running"
+            ? { ...this.state.run, status: "interrupted" }
+            : this.state.run,
+      });
+      await this.pruneCheckpoints();
+    } catch (error) {
+      if (this.state.sandbox?.id === id)
+        this.setState({
+          ...this.state,
+          sandbox: { ...this.state.sandbox, phase: "cleanup_failed" },
+        });
+      throw error;
+    }
+  }
+
+  /**
+   * Durable alarm: stop, checkpoint, then destroy. Idle backup failure retains the box for retry;
+   * the interaction deadline still destroys it and preserves a visible data-loss warning.
+   */
+  async expireSandbox(expiration: Expiration) {
+    const { id, reason, attempt = 0 } = expiration;
+    // A deployment can leave callbacks from the old absolute-lifetime policy.
+    if (!["idle", "interaction", "retry", "startup-cancel"].includes(reason))
+      return;
+    const state = this.state.sandbox;
+    if (!state || state.id !== id) return;
+    if (expiration.retryOf && expiration.retryOf !== state.cleanup?.id) return;
+    if (
+      reason === "idle" &&
+      (state.phase !== "waiting_for_user" ||
+        state.waitingSince !== expiration.waitingSince ||
+        this.now() < (state.waitingSince ?? this.now()) + SANDBOX_IDLE_MS)
+    )
+      return;
+    if (
+      reason === "interaction" &&
+      this.now() < state.lastUserInteractionAt + this.interactionTimeoutMs
+    )
+      return;
+    if (reason === "retry" && state.phase !== "cleanup_failed") return;
+    // Setup may still be restoring files or opening a native thread. Fence sends,
+    // then join it before any checkpoint/destruction can touch the same container.
+    if (this.startup) {
+      this.setState({
+        ...this.state,
+        sandbox: { ...state, phase: "destroying" },
+      });
+      await this.startup.catch(() => {});
+      if (this.state.sandbox?.id !== id) return;
+    }
+    let checkpointOnly = reason === "idle" || reason === "startup-cancel";
+    const cleanup = {
+      id: crypto.randomUUID(),
+      attempts: attempt + 1,
+      retryAt: null,
+    };
+    let stage: "stop" | "backup" | "destroy" =
+      reason === "retry" ? "destroy" : "stop";
+    const reportStage = () => {
+      if (this.state.sandbox?.id === id)
+        this.setState({
+          ...this.state,
+          sandbox: {
+            ...this.state.sandbox,
+            cleanup: { ...cleanup, stage },
+          },
+        });
+    };
+    reportStage();
+    try {
+      if (reason === "idle" || reason === "startup-cancel") {
+        this.setState({
+          ...this.state,
+          sandbox: { ...this.state.sandbox!, phase: "suspending" },
+        });
+        this.setState({
+          ...this.state,
+          sandbox: { ...this.state.sandbox!, phase: "suspending" },
+        });
+        stage = "backup";
+        reportStage();
+        await this.checkpoint(id);
+        if (!this.usable(id)) return;
+      } else if (reason === "interaction") {
+        this.setState({
+          ...this.state,
+          sandbox: { ...this.state.sandbox!, phase: "destroying" },
+        });
+        const active = this.active;
+        const run = this.state.run;
+        try {
+          if (run?.status === "running" && run.submitted) {
+            if (!active || !run.threadId || !run.turnId)
+              throw new Error(
+                "Native execution is unconfirmed; skip final backup.",
+              );
+            await within(
+              active.interrupt(run.turnId).then(() => active.completed),
+              5_000,
+              "Deadline Stop timed out.",
+            );
+          }
+          const backup = await within(
+            checkpointCodex(this.sandbox(id), this.env.LOCAL_DEV === "true"),
+            60_000,
+            "Deadline checkpoint timed out.",
+          );
+          if (this.state.sandbox?.id === id)
+            this.saveCheckpoint({ backup, threadId: this.state.threadId });
+        } catch (error) {
+          this.setState({
+            ...this.state,
+            lastCheckpointError: `Final checkpoint unavailable; changes since the last checkpoint may be lost. ${cleanupError("backup", error)}`,
+          });
+        }
+      }
+      checkpointOnly = false;
+      stage = "destroy";
+      reportStage();
+      await this.destroyGeneration(id);
+    } catch (error) {
+      console.error("Sandbox cleanup failed:", cleanupError(stage, error));
+      if (this.state.sandbox?.id !== id) return;
+      if (checkpointOnly) {
+        if (!this.usable(id)) return;
+        this.setState({
+          ...this.state,
+          sandbox: { ...this.state.sandbox, phase: "waiting_for_user" },
+        });
+      }
+      const retryAt =
+        attempt + 1 < MAX_CLEANUP_ATTEMPTS ? this.now() + 30_000 : null;
+      this.setState({
+        ...this.state,
+        sandbox: {
+          ...this.state.sandbox!,
+          cleanup: {
+            ...cleanup,
+            stage,
+            error: cleanupError(stage, error),
+            retryAt,
+          },
+        },
+      });
+      if (retryAt !== null)
+        await this.schedule(30, "expireSandbox", {
+          ...expiration,
+          reason: checkpointOnly ? "idle" : "retry",
+          attempt: attempt + 1,
+          retryOf: cleanup.id,
+        });
+    }
+  }
+
+  /**
+   * AIChatAgent invokes this after saving the admitted user message. Run Codex independently of
+   * browser connectivity and return AI SDK chunks for the library to stream and persist.
+   */
   override async onChatMessage() {
     const acceptance = this.acceptance;
     const message = this.messages.findLast(
@@ -119,85 +713,209 @@ export class Chat extends AIChatAgent<Env, CodexState> {
       .filter((part) => part.type === "text")
       .map((part) => part.text)
       .join("\n");
-    if (!message || !prompt) throw new Error("Send a text prompt.");
-    if (this.state.run?.status === "running")
-      throw new Error("A turn is already active.");
-    const run = {
+    if (!message || !prompt) throw new Error("Send a text prompt to Codex.");
+    if (this.turnInProgress)
+      throw new Error("The previous Codex run is still active.");
+    if (this.state.run?.messageId === message.id)
+      throw new Error("This prompt was already attempted. Send a new message.");
+    const old = this.state.sandbox;
+    if (
+      old &&
+      (old.phase === "cleanup_failed" ||
+        this.now() >= old.lastUserInteractionAt + this.interactionTimeoutMs)
+    ) {
+      await this.expireSandbox({
+        id: old.id,
+        reason: old.phase === "cleanup_failed" ? "retry" : "interaction",
+        attempt: MAX_CLEANUP_ATTEMPTS - 1,
+      });
+      if (this.state.sandbox) throw new Error("Sandbox cleanup is pending.");
+    }
+    if (this.state.run?.status === "running") await this.reconcile();
+    if (this.state.sandbox && this.state.sandbox.phase !== "waiting_for_user")
+      throw new Error("Sandbox cleanup is pending.");
+    const fresh = !this.state.sandbox && !this.state.checkpoint;
+    const sandbox = this.state.sandbox ?? {
+      id: crypto.randomUUID(),
+      phase: "starting" as const,
+      lastUserInteractionAt: this.now(),
+    };
+    const run: Run = {
       id: crypto.randomUUID(),
       messageId: message.id,
-      sandboxId: this.name,
-      status: "running" as const,
+      sandboxId: sandbox.id,
+      status: "running",
     };
-    this.setState({ ...this.state, run });
+    this.setState({
+      ...this.state,
+      run,
+      sandbox: {
+        ...sandbox,
+        phase: this.state.sandbox ? "waiting_for_agent" : "starting",
+        waitingSince: undefined,
+        cleanup: undefined,
+      },
+    });
+    this.turnInProgress = true;
+    try {
+      await this.interaction();
+    } catch (error) {
+      this.setState({
+        ...this.state,
+        run: { ...run, status: "failed" },
+        sandbox: {
+          ...this.state.sandbox!,
+          phase: "waiting_for_user",
+          waitingSince: this.now(),
+        },
+      });
+      this.turnInProgress = false;
+      throw error;
+    }
     return createUIMessageStreamResponse({
       stream: createUIMessageStream({
         onError: messageOf,
         execute: async ({ writer }) => {
+          const write = (chunk: UIMessageChunk) => writer.write(chunk);
+          let client: AppServer | undefined;
           let execution: CodexTurn | undefined;
-          let connection: Awaited<ReturnType<typeof connectCodex>> | undefined;
-          writer.write({ type: "start", messageId: `codex-${run.id}` });
+          let terminal = false;
+          let failure: unknown;
+          let status: Run["status"] = "failed";
+          write({
+            type: "start",
+            messageId: `codex-${run.id}`,
+            messageMetadata: { runId: run.id },
+          });
           try {
-            connection = await connectCodex(
-              this.sandbox(run.sandboxId),
+            const connecting = connectCodex(
+              this.sandbox(sandbox.id),
               this.state,
+              {
+                onCheckpointUnavailable: (warning) => {
+                  const old = this.state.checkpoint?.backup.id;
+                  this.setState({
+                    ...this.state,
+                    checkpoint: undefined,
+                    threadId: undefined,
+                    lastCheckpointError: warning,
+                    obsoleteCheckpoints: [
+                      ...new Set([
+                        ...(this.state.obsoleteCheckpoints ?? []),
+                        ...(old ? [old] : []),
+                      ]),
+                    ],
+                  });
+                },
+              },
             );
-            execution = await openCodexTurn(connection.client, {
-              threadId: connection.threadId,
+            this.startup = connecting;
+            const connected = await connecting;
+            client = connected.client;
+            this.ensureUsable(sandbox.id);
+            if (this.state.run?.cancelRequested)
+              throw new Error("Startup cancelled.");
+            if (connected.warning) {
+              const id = `${run.id}:restore-warning`;
+              write({ type: "text-start", id });
+              write({ type: "text-delta", id, delta: connected.warning });
+              write({ type: "text-end", id });
+            }
+            this.ensureUsable(sandbox.id);
+            const opening = openCodexTurn(client, {
+              threadId: connected.threadId,
               model: this.env.CODEX_MODEL,
               runId: run.id,
-              write: (chunk) => writer.write(chunk),
+              write,
               onTurnStarted: (turnId) =>
-                this.setState({
-                  ...this.state,
-                  run: { ...this.state.run!, turnId },
-                }),
+                this.setRun({ ...this.state.run!, turnId, accepted: true }),
             });
+            this.startup = opening;
+            execution = await opening;
+            this.startup = undefined;
+            this.ensureUsable(sandbox.id);
+            if (this.state.run?.cancelRequested)
+              throw new Error("Startup cancelled.");
             this.active = execution;
             this.setState({
               ...this.state,
               threadId: execution.threadId,
               run: { ...run, threadId: execution.threadId, submitted: true },
+              sandbox: { ...this.state.sandbox!, phase: "waiting_for_agent" },
             });
             const started = await execution.start(prompt, message.id);
-            this.setState({
-              ...this.state,
-              run: { ...this.state.run!, turnId: started.id },
+            this.setRun({
+              ...this.state.run!,
+              turnId: started.id,
+              accepted: true,
             });
             acceptance?.resolve();
             const turn = await execution.completed;
-            this.setState({
-              ...this.state,
-              run: {
-                ...this.state.run!,
-                status:
-                  turn.status === "completed"
-                    ? "completed"
-                    : turn.status === "interrupted"
-                      ? "cancelled"
-                      : "failed",
-              },
-            });
-            if (turn.status === "failed")
-              throw new Error(turn.error?.message ?? "Codex failed.");
+            terminal = true;
+            status =
+              turn.status === "completed"
+                ? "completed"
+                : turn.status === "interrupted"
+                  ? "cancelled"
+                  : "failed";
+            if (status === "failed")
+              failure = new Error(turn.error?.message ?? "Codex turn failed.");
+            if (this.usable(run.sandboxId)) await this.finishRun(run, status);
           } catch (error) {
+            this.startup = undefined;
             acceptance?.reject(error);
-            if (!this.state.run?.submitted)
-              this.setState({
-                ...this.state,
-                run: { ...run, status: "failed" },
-              });
-            writer.write({ type: "text-start", id: `${run.id}:error` });
-            writer.write({
-              type: "text-delta",
-              id: `${run.id}:error`,
-              delta: `Task failed: ${messageOf(error)}`,
-            });
-            writer.write({ type: "text-end", id: `${run.id}:error` });
+            failure = error;
+            if (error instanceof AppServerError && !this.state.run?.accepted)
+              this.setRun({ ...this.state.run!, submitted: false });
+            // Only a fresh, never-submitted workspace is disposable. Preserve restored/warm work.
+            if (!this.state.run?.submitted && this.usable(run.sandboxId)) {
+              try {
+                const cancelled = !!this.state.run?.cancelRequested;
+                await execution?.close();
+                execution = undefined;
+                client?.close();
+                await this.finishRun(run, cancelled ? "cancelled" : "failed");
+                if (cancelled && !fresh) {
+                  await this.expireSandbox({
+                    id: run.sandboxId,
+                    reason: "startup-cancel",
+                  });
+                } else if (fresh) {
+                  this.setState({
+                    ...this.state,
+                    sandbox: {
+                      ...this.state.sandbox!,
+                      phase: "cleanup_failed",
+                    },
+                  });
+                  await this.expireSandbox({
+                    id: run.sandboxId,
+                    reason: "retry",
+                  });
+                }
+              } catch {
+                /* Lifecycle diagnostics retain unconfirmed destruction; keep the startup error. */
+              }
+            }
           } finally {
             await execution?.close();
-            connection?.client.close();
+            client?.close();
             this.active = undefined;
-            writer.write({ type: "finish", finishReason: "stop" });
+            if (!failure && !this.usable(run.sandboxId))
+              failure = new Error(expiredMessage);
+            if (failure) {
+              const id = `${run.id}:error`;
+              write({ type: "text-start", id });
+              write({
+                type: "text-delta",
+                id,
+                delta: `Task failed: ${messageOf(failure)}`,
+              });
+              write({ type: "text-end", id });
+            } else if (terminal && status === "cancelled")
+              write({ type: "abort" });
+            write({ type: "finish", finishReason: failure ? "error" : "stop" });
+            this.turnInProgress = false;
           }
         },
       }),

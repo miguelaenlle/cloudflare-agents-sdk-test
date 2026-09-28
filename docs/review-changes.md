@@ -1,5 +1,5 @@
 # Review this update
 
-Comments clarify the Worker routing boundary, native RPC correlation, and outbound credential injection.
+Seven-day latest checkpoint; guarded setup; fresh-start failure cleanup; visible cleanup errors and native acceptance recovery.
 
-Previous head: `8ad11e51a459af493282ae9e7ac5092ece896c40`. Use GitHub’s “Changes since last review” or compare this head against the current branch.
+Previous head: `59ce5b10608ddd45a4d5b054d73e7757f5d64cff`. Use GitHub’s “Changes since last review” or compare this head against the current branch.

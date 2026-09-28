@@ -6,6 +6,8 @@ import { z } from "zod";
 import {
   CONVERSATION_ID,
   ChatError,
+  type ChatSnapshot,
+  sandboxDiagnosticsSchema,
   type ChatConnection,
   type ChatProvider,
 } from "@playground/chat-contract";
@@ -21,6 +23,7 @@ const resumeEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("cf_agent_stream_pending") }),
 ]);
 
+/** Isolate Cloudflare transport behind the provider contract; the browser only sees HTTP and AI SDK SSE. */
 export function createCloudflareProvider(
   workerUrl: URL,
   id = CONVERSATION_ID,
@@ -58,6 +61,68 @@ export function createCloudflareProvider(
   }
 
   return {
+    async watch(signal, changed, failed) {
+      const url = new URL(agentUrl);
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      const socket = new WebSocket(url, {
+        headers: process.env.RELAY_TOKEN
+          ? { Authorization: `Bearer ${process.env.RELAY_TOKEN}` }
+          : {},
+      });
+      const close = () => socket.close();
+      signal.addEventListener("abort", close, { once: true });
+      socket.on("message", (data) => {
+        let message;
+        try {
+          message = JSON.parse(String(data));
+        } catch {
+          close();
+          failed();
+          return;
+        }
+        // SDK broadcasts durable state and message updates; tokens continue over the separate AI SDK stream.
+        if (["cf_agent_state", "cf_agent_chat_messages"].includes(message.type))
+          changed();
+      });
+      socket.on("close", failed);
+      socket.on("error", failed);
+      try {
+        await once(socket, "open", {
+          signal: AbortSignal.any([
+            signal,
+            AbortSignal.timeout(CONNECTION_TIMEOUT_MS),
+          ]),
+        });
+      } catch (error) {
+        close();
+        throw error;
+      }
+      return () => {
+        signal.removeEventListener("abort", close);
+        socket.removeListener("close", failed);
+        socket.removeListener("error", failed);
+        close();
+      };
+    },
+    async getSnapshot(signal) {
+      const response = await request("snapshot", "GET", signal);
+      const value = (await response.json()) as ChatSnapshot;
+      const messages = value.messages.length
+        ? await validateUIMessages({ messages: value.messages })
+        : [];
+      return {
+        messages,
+        blocked: value.blocked,
+        revision: z.number().int().nonnegative().parse(value.revision),
+      };
+    },
+    async getDiagnostics(signal) {
+      const response = await request("diagnostics", "GET", signal);
+      return sandboxDiagnosticsSchema.parse(await response.json());
+    },
+    async retryCleanup(signal) {
+      await request("cleanup", "POST", signal);
+    },
     async getHistory(signal) {
       const response = await request("get-messages", "GET", signal);
       const messages: unknown = await response.json();
