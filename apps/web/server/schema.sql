@@ -12,4 +12,14 @@ CREATE TABLE IF NOT EXISTS operations (
   revision bigint NOT NULL,
   PRIMARY KEY (conversation_id, id)
 );
+CREATE TABLE IF NOT EXISTS publications (
+  id text PRIMARY KEY,
+  conversation_id text NOT NULL UNIQUE REFERENCES conversations(id),
+  job jsonb NOT NULL,
+  decision jsonb,
+  published_sha text,
+  outcome jsonb,
+  delivered boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 INSERT INTO conversations (id, title) VALUES ('playground', 'Playground') ON CONFLICT DO NOTHING;

@@ -5,16 +5,18 @@ import { z } from "zod";
 import {
   ChatError,
   sendRequestSchema,
+  approvalDecisionSchema,
   type ChatProvider,
 } from "@playground/chat-contract";
 import { createCloudflareProvider } from "./providers/cloudflare.ts";
 import {
-  conversationSnapshot,
+  publicationSnapshot,
   subscribe,
   admit,
   listConversations,
   createConversation,
   hasConversation,
+  recordDecision,
 } from "./conversations.ts";
 
 const config = z
@@ -82,7 +84,7 @@ function routes(
       try {
         while (dirty && !signal.aborted) {
           dirty = false;
-          const snapshot = await conversationSnapshot(
+          const snapshot = await publicationSnapshot(
             id,
             await chat.getSnapshot(signal),
           );
@@ -132,7 +134,7 @@ function routes(
   app.get(`${base}/snapshot`, async (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.json(
-      await conversationSnapshot(
+      await publicationSnapshot(
         conversationId(request.params),
         await (
           await provider(request.params)
@@ -173,6 +175,20 @@ function routes(
   });
   app.post(`${base}/cancel`, async (request, response) => {
     await (await provider(request.params)).cancel(clientSignal(response));
+    response.status(204).end();
+  });
+  app.post(`${base}/approval`, async (request, response) => {
+    const parsed = approvalDecisionSchema.safeParse(request.body);
+    if (!parsed.success) {
+      response.status(400).send("Invalid approval decision.");
+      return;
+    }
+    const chat = await provider(request.params);
+    await publicationSnapshot(
+      conversationId(request.params),
+      await chat.getSnapshot(clientSignal(response)),
+    );
+    await recordDecision(conversationId(request.params), parsed.data, chat);
     response.status(204).end();
   });
   app.get(`${base}/:chatId/stream`, async (request, response) => {

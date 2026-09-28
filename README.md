@@ -1,6 +1,6 @@
-# Steering and richer streaming
+# Durable approvals with simulated publication
 
-This is layer 4 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
+This is layer 5 of a new behavior-oriented review stack. The original five-PR stack and `codex/prototype` are unchanged. Each branch contains a runnable application and its applicable tests.
 
 Create a dedicated local Postgres database with `createdb course_agent`, and set `DATABASE_URL=postgresql://localhost/course_agent` on the relay.
 
@@ -18,8 +18,16 @@ After the configured idle interval (10 minutes) waiting for the user, back up be
 
 ## Conversations and concurrency
 
-The relay stores its conversation catalog and admission revisions in Postgres (`DATABASE_URL`, default `postgresql://localhost/course_agent`). Each ID routes to its own Chat DO. Sends compare a persisted revision; stale tabs retain their draft and must refresh. Test two tabs of one conversation, plus an independent conversation. Production still requires PrairieLearn authorization and shared storage.
+The relay stores its catalog, admission revisions and publication decisions in Postgres (`DATABASE_URL`; default `postgresql://localhost/course_agent`). Each conversation routes to its own Chat DO, which retains chat history and lifecycle state. SSE pushes snapshots and diagnostics; stale tabs retain their draft and must refresh. Publication uses GitHub APIs without a relay checkout; incomplete approvals require explicit Retry. See [testing instructions](docs/testing.md) for setup. Production still requires PrairieLearn authorization.
 
 ## Steering and richer streaming
 
 Send during execution steers the active native turn. Only confirmed completion permits falling back to a new turn; uncertain acknowledgments are not replayed. Steering markers split live output into segments. Reasoning summaries are rendered separately; these are the model-provided summaries, not hidden reasoning.
+
+## Durable approval
+
+The agent calls `push_sync` with base/proposed commit SHAs. Capture immutable final file contents and a raw diff; the relay persists the proposal and hold the native tool response pending a decision. Ordinary sends are blocked. After idle cleanup, the saved approval remains actionable and its outcome is delivered to a restored continuation. Warm decisions resolve the live tool result. After restart or failure, the user explicitly retries completion from the saved decision card. The layer-5 publisher is explicitly simulated; no GitHub credential is needed and no push occurs.
+
+## Publication
+
+This layer simulates both publication and Course Sync. Layer 6 adds real GitHub API writes while keeping the same saved-decision and explicit-Retry workflow. The full-stack documents describe that next layer as well.

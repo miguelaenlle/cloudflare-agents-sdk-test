@@ -71,6 +71,12 @@ export class TestSandbox extends DurableObject {
     for (const socket of this.sockets)
       socket.send(JSON.stringify({ method, params }));
   }
+  async structuredFailure() {
+    throw Object.assign(new Error("signed-url-secret"), {
+      name: "InvalidBackupConfigError",
+      code: "INVALID_BACKUP_CONFIG",
+    });
+  }
   async fetch(request: Request) {
     const state = await this.state();
     if (

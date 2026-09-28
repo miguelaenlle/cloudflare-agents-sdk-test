@@ -1,6 +1,12 @@
+import { execFileSync } from "node:child_process";
+import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { cleanupError } from "../cleanup-error.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { UIMessageChunk } from "ai";
+import { captureApproval } from "../approval.ts";
 import { CodexEvents } from "../codex-events.ts";
 import {
   checkpointCodex,
@@ -8,7 +14,7 @@ import {
   ContainerLost,
   type CodexSandbox,
 } from "../codex.ts";
-import { forwardOpenAI } from "../outbound.ts";
+import { forwardOpenAI, forwardGitHub } from "../outbound.ts";
 import type { ThreadItem } from "../protocol.ts";
 
 const text: ThreadItem = {
@@ -69,6 +75,61 @@ test("recovery never starts or restores a missing container", async () => {
     ContainerLost,
   );
 });
+test("startup sanitizes errors without guessing from capacity error text", async () => {
+  const sandbox = {
+    exists: async () => {
+      throw new Error(
+        "Maximum number of running container instances exceeded. private-test-key",
+      );
+    },
+  } as unknown as CodexSandbox;
+  await assert.rejects(connectCodex(sandbox, {}), (error: Error) => {
+    assert.match(error.message, /Sandbox startup failed/);
+    assert.match(error.message, /Check Worker and container logs/);
+    assert.doesNotMatch(error.message, /private-test-key/);
+    return true;
+  });
+});
+
+test("startup sanitizes backup failures without exposing arbitrary SDK output", async () => {
+  const sandbox = {
+    exists: async () => ({ exists: false }),
+    restoreBackup: async () => {
+      throw new Error("private-test-key");
+    },
+  } as unknown as CodexSandbox;
+  await assert.rejects(
+    connectCodex(sandbox, {
+      checkpoint: { backup: { id: "backup", dir: "/workspace" } },
+    }),
+    (error: Error) => {
+      assert.match(error.message, /Sandbox startup failed/);
+      assert.doesNotMatch(error.message, /private-test-key/);
+      return true;
+    },
+  );
+});
+
+test("startup bounds app-server readiness and reports its timeout", async () => {
+  const sandbox = {
+    exists: async () => ({ exists: true }),
+    getProcess: async () => ({
+      status: "starting",
+      waitForPort: async (port: number, options: unknown) => {
+        assert.equal(port, 4500);
+        assert.deepEqual(options, { path: "/readyz", timeout: 60_000 });
+        throw Object.assign(new Error("private timeout details"), {
+          name: "ProcessReadyTimeoutError",
+        });
+      },
+    }),
+  } as unknown as CodexSandbox;
+  await assert.rejects(
+    connectCodex(sandbox, {}),
+    /Sandbox startup failed.*timed out/,
+  );
+});
+
 test("credential handler injects only into allowed OpenAI requests", async () => {
   let calls = 0;
   const send: typeof fetch = async (request) => {
@@ -224,4 +285,265 @@ test("steering splits live text and reasoning without duplicating completion sna
   const marker = chunks.findIndex((c) => c.type === "data-steering");
   assert.ok(chunks.slice(0, marker).some((c) => c.type === "reasoning-end"));
   assert.ok(chunks.slice(marker + 1).some((c) => c.type === "text-start"));
+});
+
+test("Git credential injection only permits configured repository reads and blocks redirects", async () => {
+  let calls = 0;
+  const env = {
+    GITHUB_TOKEN: "private-token",
+  };
+  const send: typeof fetch = async (input) => {
+    calls++;
+    assert.ok(input instanceof Request);
+    assert.equal(
+      input.url,
+      "https://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-upload-pack",
+    );
+    assert.equal(
+      input.headers.get("Authorization"),
+      `Basic ${btoa("x-access-token:private-token")}`,
+    );
+    assert.equal(input.headers.has("cookie"), false);
+    return new Response("refs");
+  };
+  for (const scheme of ["http", "https"]) {
+    assert.equal(
+      (
+        await forwardGitHub(
+          new Request(
+            `${scheme}://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-upload-pack`,
+            { headers: { cookie: "untrusted" } },
+          ),
+          env,
+          send,
+        )
+      ).status,
+      200,
+    );
+  }
+  for (const url of [
+    "https://github.com/other/repo.git/info/refs?service=git-upload-pack",
+    "https://github.com/miguelaenlle/course-agent-push-sync-test.git/git-receive-pack",
+    "https://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-receive-pack",
+    "https://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-upload-pack&other=1",
+  ]) {
+    assert.equal(
+      (await forwardGitHub(new Request(url), env, send)).status,
+      403,
+    );
+  }
+  assert.equal(calls, 2);
+  assert.equal(
+    (
+      await forwardGitHub(
+        new Request(
+          "https://github.com/miguelaenlle/course-agent-push-sync-test.git/info/refs?service=git-upload-pack",
+        ),
+        env,
+        async () =>
+          new Response(null, {
+            status: 302,
+            headers: { Location: "https://evil.test" },
+          }),
+      )
+    ).status,
+    502,
+  );
+});
+
+test("approval capture preserves file bytes even when exec stdout is trimmed", async () => {
+  const diff = "diff --git a/a b/a\n+é  \n\\ No newline at end of file\n";
+  let path = "";
+  let deleted = "";
+  const sandbox = {
+    exec: async (command: string) => {
+      path = command.match(/(\/tmp\/approval-[\w-]+\.json)/)![1]!;
+      return { success: true, stdout: diff.trimEnd() };
+    },
+    readFile: async (requested: string) => {
+      assert.equal(requested, path);
+      return {
+        content: JSON.stringify({
+          diff,
+          files: [
+            {
+              path: "a",
+              content: "é  ",
+              mode: "100644",
+              previousMode: "100644",
+            },
+          ],
+        }),
+      };
+    },
+    deleteFile: async (requested: string) => {
+      deleted = requested;
+    },
+  } as unknown as CodexSandbox;
+  const result = await captureApproval(sandbox, {
+    baseSha: "0".repeat(40),
+    proposedSha: "a".repeat(40),
+  });
+  assert.equal(result.diff, diff);
+  assert.equal(deleted, path);
+  assert.match(path, /^\/tmp\/approval-[\w-]+\.json$/);
+});
+
+test("cleanup diagnostics classify failures without retaining credentials or signed URLs", () => {
+  for (const text of [
+    "403 AccessDenied secret",
+    "curl: (60) SSL certificate failure",
+    "Failed to connect",
+    "Stop timed out",
+  ])
+    assert.equal(
+      cleanupError("backup", new Error(text)),
+      "backup failed. Check Worker and container logs for this stage.",
+    );
+  for (const stage of ["stop", "backup", "destroy"] as const)
+    assert.doesNotMatch(
+      cleanupError(stage, new Error("https://r2.test?signature=secret")),
+      /secret|signature|https/,
+    );
+});
+
+for (const name of ["BackupNotFoundError", "BackupExpiredError"]) {
+  test(`${name} discards the unavailable checkpoint before fresh initialization`, async () => {
+    let warning = "";
+    let initialized = false;
+    const sandbox = {
+      exists: async () => ({ exists: false }),
+      restoreBackup: async () => {
+        throw Object.assign(new Error("unavailable"), { name });
+      },
+      exec: async () => {
+        assert.match(warning, /missing or expired/);
+        initialized = true;
+        throw new Error("Stop before process launch");
+      },
+    } as unknown as CodexSandbox;
+    await assert.rejects(
+      connectCodex(
+        sandbox,
+        {
+          checkpoint: {
+            backup: { id: "gone", dir: "/workspace" },
+            threadId: "old-thread",
+          },
+        },
+        {
+          onCheckpointUnavailable: (value) => {
+            warning = value;
+          },
+        },
+      ),
+      /Sandbox startup failed/,
+    );
+    assert.equal(initialized, true);
+    assert.match(warning, /uncommitted files and Codex session context/);
+  });
+}
+
+test("transient restore failure never discards the checkpoint or initializes fresh files", async () => {
+  const sandbox = {
+    exists: async () => ({ exists: false }),
+    restoreBackup: async () => {
+      throw new Error("503 unavailable");
+    },
+    exec: async () => {
+      assert.fail("Must preserve the existing checkpoint");
+    },
+  } as unknown as CodexSandbox;
+  await assert.rejects(
+    connectCodex(
+      sandbox,
+      {
+        checkpoint: { backup: { id: "recoverable", dir: "/workspace" } },
+      },
+      { onCheckpointUnavailable: () => assert.fail("Must not discard") },
+    ),
+    /Sandbox startup failed/,
+  );
+});
+
+// Execute the actual capture script: a mocked exec cannot detect a missing runtime dependency.
+test("Node capture reads committed additions, edits and deletions from real Git", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "node-capture-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", directory, ...args], {
+      encoding: "utf8",
+    }).trim();
+  try {
+    git("init", "--quiet");
+    git("config", "user.name", "Capture test");
+    git("config", "user.email", "capture@example.com");
+    await writeFile(join(directory, "edit.txt"), "old\n");
+    await writeFile(join(directory, "delete.txt"), "delete me\n");
+    git("add", ".");
+    git("commit", "--quiet", "-m", "Base");
+    const baseSha = git("rev-parse", "HEAD");
+    await writeFile(join(directory, "edit.txt"), "é  ");
+    await writeFile(join(directory, "space name.txt"), "new\n");
+    await rm(join(directory, "delete.txt"));
+    git("add", "-A");
+    git("commit", "--quiet", "-m", "Proposed");
+    const proposedSha = git("rev-parse", "HEAD");
+    await writeFile(join(directory, "edit.txt"), "uncommitted newer edit");
+    const sandbox = {
+      exec: async (command: string) => {
+        assert.ok(command.startsWith("node - <<'CAPTURE'"));
+        execFileSync("/bin/sh", [
+          "-c",
+          command.replace("/workspace/repo", directory),
+        ]);
+        return { success: true };
+      },
+      readFile: async (path: string) => ({
+        content: await readFile(path, "utf8"),
+      }),
+      deleteFile: async (path: string) => {
+        await rm(path);
+      },
+    } as unknown as CodexSandbox;
+    const result = await captureApproval(sandbox, { baseSha, proposedSha });
+    assert.deepEqual(result.files, [
+      {
+        path: "delete.txt",
+        content: null,
+        mode: "000000",
+        previousMode: "100644",
+      },
+      {
+        path: "edit.txt",
+        content: "é  ",
+        mode: "100644",
+        previousMode: "100644",
+      },
+      {
+        path: "space name.txt",
+        content: "new\n",
+        mode: "100644",
+        previousMode: "000000",
+      },
+    ]);
+    assert.equal(
+      result.diff,
+      execFileSync(
+        "git",
+        [
+          "-C",
+          directory,
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--no-renames",
+          baseSha,
+          proposedSha,
+        ],
+        { encoding: "utf8" },
+      ),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

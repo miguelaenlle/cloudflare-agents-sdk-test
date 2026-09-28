@@ -1,4 +1,3 @@
-// Public entry point: authenticate and route to the named conversation DO.
 import { ContainerProxy } from "@cloudflare/sandbox";
 import { routeAgentRequest } from "agents";
 import type { Env } from "./agent.ts";
@@ -7,6 +6,7 @@ export { Chat } from "./agent.ts";
 export { Sandbox } from "./sandbox.ts";
 export { ContainerProxy };
 
+// Public ingress only: authenticate the relay and route the conversation name to its Chat DO.
 export default {
   async fetch(request, env) {
     // Only the chat is public; the Sandbox binding is an internal execution API.

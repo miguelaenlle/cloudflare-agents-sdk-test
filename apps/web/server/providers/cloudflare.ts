@@ -114,7 +114,11 @@ export function createCloudflareProvider(
         messages,
         blocked: value.blocked,
         revision: z.number().int().nonnegative().parse(value.revision),
+        pendingTool: value.pendingTool,
       };
+    },
+    async deliverToolResult(input, signal) {
+      await request("tool-result", "POST", signal, input);
     },
     async getDiagnostics(signal) {
       const response = await request("diagnostics", "GET", signal);

@@ -3,9 +3,15 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import {
   ChatError,
+  approvalDisplaySchema,
+  type ApprovalDecision,
+  type ApprovalDisplay,
   type ChatSnapshot,
+  type ChatProvider,
   type SendRequest,
 } from "@playground/chat-contract";
+import { prepareTool, historicalApprovals } from "./tools.ts";
+
 const blocks = (
   await readFile(new URL("./conversations.sql", import.meta.url), "utf8")
 )
@@ -75,6 +81,17 @@ export async function reserve(
     await client.query(sql("begin"));
     const row = (await client.query(sql("lock_conversation"), [id])).rows[0];
     if (!row) throw new ChatError(404, "Conversation not found.");
+    if (
+      typeof payload === "object" &&
+      payload !== null &&
+      "kind" in payload &&
+      payload.kind === "message" &&
+      (await client.query(sql("pending_publication"), [id])).rowCount
+    )
+      throw new ChatError(
+        409,
+        "Resolve the pending publication before sending another message.",
+      );
     const existing = (
       await client.query(sql("select_operation"), [id, operation])
     ).rows[0];
@@ -125,13 +142,132 @@ export async function admit(id: string, input: SendRequest) {
     input.expectedRevision,
   );
 }
-/** Combine provider-owned chat state with the relay's admission revision. */
-export async function conversationSnapshot(
+async function row(id: string) {
+  return (await db.query(sql("select_publication"), [id])).rows[0];
+}
+
+/** The DO transports a generic immutable payload; PL stores the proposal and owns its user decision. */
+export async function publicationSnapshot(
   id: string,
   snapshot: ChatSnapshot,
 ): Promise<ChatSnapshot> {
+  const tool = snapshot.pendingTool;
+  if (tool) {
+    const job = prepareTool(tool);
+    await db.query(sql("insert_publication"), [
+      job.id,
+      id,
+      JSON.stringify(job),
+    ]);
+  }
+  const jobs = (await db.query(sql("list_publications"), [id])).rows;
+  const currentApprovals: ApprovalDisplay[] = jobs.map((r) => ({
+    ...approvalDisplaySchema.parse(r.job.approval),
+    status: r.decision
+      ? r.decision.approved
+        ? "approved"
+        : "denied"
+      : "pending",
+    result: r.outcome?.result,
+  }));
+  const approvals = [
+    ...historicalApprovals(snapshot.messages).filter(
+      (old) => !currentApprovals.some((a) => a.id === old.id),
+    ),
+    ...currentApprovals,
+  ];
+  const current = jobs.find((r) => r.id === tool?.id) ?? jobs.at(-1);
+  let publication: ChatSnapshot["publication"];
+  if (current && !current.delivered) {
+    let error: string | undefined;
+
+    publication = {
+      ...current.job.destination,
+      status: current.decision ? "publishing" : error ? "invalid" : "ready",
+      decision: current.decision?.approved,
+      error,
+    };
+  }
   const revision = Number(
     (await db.query(sql("select_revision"), [id])).rows[0]?.revision ?? 0,
   );
-  return { ...snapshot, revision };
+  return {
+    ...snapshot,
+    revision,
+    approval: approvals.find((a) => a.id === current?.id),
+    approvals,
+    publication,
+  };
+}
+
+/** A session advisory lock serializes Retry across webservers and is released when a crashed connection closes. */
+export async function recordDecision(
+  id: string,
+  input: ApprovalDecision,
+  chat: ChatProvider,
+) {
+  const client = await db.connect();
+  const key = `publication:${input.id}`;
+  let locked = false;
+  try {
+    locked = (await client.query(sql("claim_publication"), [key])).rows[0]
+      .locked;
+    if (!locked)
+      throw new ChatError(
+        409,
+        "This decision is still processing. Retry shortly.",
+      );
+    let saved = await row(input.id);
+    if (
+      !saved ||
+      saved.conversation_id !== id ||
+      saved.job.approval.digest !== input.digest
+    )
+      throw new ChatError(409, "Proposal changed. Refresh before deciding.");
+    await reserve(
+      id,
+      `decision:${input.id}`,
+      { digest: input.digest, approved: input.approved },
+      input.expectedRevision,
+    );
+    if (saved.decision && saved.decision.approved !== input.approved)
+      throw new ChatError(409, "A different decision is already recorded.");
+    await db.query(sql("save_decision"), [input.id, JSON.stringify(input)]);
+    await notify(id);
+    saved = await row(input.id);
+    if (!saved.outcome) {
+      let result: string;
+      if (!input.approved)
+        result = "The user denied this proposal. No changes were published.";
+      else
+        result =
+          "Approved. sync would go here. SIMULATION ONLY: no commit was published and no sync ran.";
+      await db.query(sql("save_outcome"), [
+        input.id,
+        JSON.stringify({ id: input.id, result }),
+      ]);
+      saved = await row(input.id);
+    }
+    if (!saved.delivered) {
+      await chat.deliverToolResult(
+        {
+          ...saved.outcome,
+          display: {
+            name: "push_sync",
+            value: {
+              ...approvalDisplaySchema.parse(saved.job.approval),
+              status: saved.decision.approved ? "approved" : "denied",
+              result: saved.outcome.result,
+            },
+          },
+        },
+        AbortSignal.timeout(30_000),
+      );
+      await db.query(sql("mark_delivered"), [input.id]);
+    }
+    await notify(id);
+  } finally {
+    if (locked) await client.query(sql("release_publication"), [key]);
+    client.release();
+  }
 }
